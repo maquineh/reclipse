@@ -47,5 +47,15 @@ fn main() {
                 .map(|method| &method.signature)
                 .collect::<Vec<_>>()
         );
+        if let Some(location) = index.source_location("java.lang.String") {
+            println!(
+                "String source: {} :: {}",
+                location.archive.display(),
+                location.entry
+            );
+            if let Ok(source) = reclipse_classpath::read_source(&location) {
+                println!("String source lines: {}", source.lines().count());
+            }
+        }
     }
 }

@@ -5,4 +5,6 @@ pub mod parse;
 pub mod semantic;
 
 pub use index::{build_index, IndexStats, IndexedProblem, ProjectIndex, SymbolLocation};
-pub use parse::{parse_source, parse_source_with, FileSymbols, JavaSymbol, ParseError, SymbolKind};
+pub use parse::{
+    parse_source, parse_source_with, FileSymbols, JavaReference, JavaSymbol, ParseError, SymbolKind,
+};

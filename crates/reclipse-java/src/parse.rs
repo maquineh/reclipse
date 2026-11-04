@@ -84,12 +84,26 @@ pub struct ParseError {
 }
 
 #[derive(Debug, Clone)]
+pub struct JavaReference {
+    pub name: String,
+    /// 1-based line.
+    pub line: usize,
+    /// 1-based column.
+    pub column: usize,
+    /// Byte offsets in the original source.
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct FileSymbols {
     pub path: PathBuf,
     pub package: Option<String>,
     pub imports: Vec<String>,
     pub import_lines: Vec<usize>,
     pub symbols: Vec<JavaSymbol>,
+    /// Type-identifier occurrences (including declarations) for semantic refs.
+    pub type_refs: Vec<JavaReference>,
     pub errors: Vec<ParseError>,
     pub line_count: usize,
     /// Set when the file could not be read or the parser itself failed.
@@ -104,6 +118,7 @@ impl FileSymbols {
             imports: Vec::new(),
             import_lines: Vec::new(),
             symbols: Vec::new(),
+            type_refs: Vec::new(),
             errors: Vec::new(),
             line_count: 0,
             parse_error: None,
@@ -136,6 +151,7 @@ pub fn parse_source_with(parser: &mut Parser, path: &Path, source: &str) -> File
     let root = tree.root_node();
     let mut container = Vec::new();
     visit_children(root, source.as_bytes(), &mut file, &mut container, 0);
+    visit_type_refs(root, source.as_bytes(), &mut file);
 
     if file.errors.len() > 200 {
         file.errors.truncate(200);
@@ -155,6 +171,42 @@ fn visit_children(
     for child in node.children(&mut cursor) {
         visit_node(child, source, file, container, depth);
     }
+}
+
+fn visit_type_refs(node: Node<'_>, source: &[u8], file: &mut FileSymbols) {
+    if node.kind() == "type_identifier" {
+        push_type_ref(node, source, file);
+    } else if matches!(
+        node.kind(),
+        "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
+    ) {
+        if let Some(name) = node.child_by_field_name("name") {
+            push_type_ref(name, source, file);
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_type_refs(child, source, file);
+    }
+}
+
+fn push_type_ref(node: Node<'_>, source: &[u8], file: &mut FileSymbols) {
+    let name = text(node, source);
+    if name.is_empty() {
+        return;
+    }
+    let position = node.start_position();
+    file.type_refs.push(JavaReference {
+        name,
+        line: position.row + 1,
+        column: position.column + 1,
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+    });
 }
 
 fn visit_node(
@@ -467,6 +519,30 @@ public class App {
             "public class Broken { void x( { }",
         );
         assert!(!file.errors.is_empty());
+    }
+
+    #[test]
+    fn collects_type_identifier_references_inside_bodies() {
+        let source = r#"
+package com.acme;
+import java.util.List;
+class App {
+    List<String> items;
+    void run() { new User(); }
+}
+class User {}
+"#;
+        let file = parse_source(Path::new("App.java"), source);
+        let names: Vec<&str> = file
+            .type_refs
+            .iter()
+            .map(|reference| reference.name.as_str())
+            .collect();
+        assert!(names.contains(&"App"));
+        assert!(names.contains(&"List"));
+        assert!(names.contains(&"String"));
+        assert!(names.contains(&"User"));
+        assert!(names.iter().filter(|name| **name == "User").count() >= 2);
     }
 
     #[test]

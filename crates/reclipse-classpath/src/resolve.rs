@@ -1,6 +1,6 @@
 //! Project classpath resolution: Eclipse, Maven, Gradle, plain folders and JDK.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -182,15 +182,37 @@ fn resolve_gradle(project: &Project, jars: &mut Vec<PathBuf>, warnings: &mut Vec
             text.push('\n');
         }
     }
+    let catalog = parse_version_catalog(&project.root);
 
     let mut coordinates = Vec::new();
+    let mut boms = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("//") {
             continue;
         }
+        let platform = is_platform(trimmed);
         if let Some(coordinate) = gradle_map_coordinate(trimmed) {
-            coordinates.push(coordinate);
+            if platform {
+                boms.push(coordinate);
+            } else {
+                coordinates.push(coordinate);
+            }
+            continue;
+        }
+        if let Some(alias) = catalog_accessor(trimmed) {
+            match lookup_catalog(&catalog, &alias) {
+                Some(coordinate) => {
+                    if platform {
+                        boms.push(coordinate);
+                    } else {
+                        coordinates.push(coordinate);
+                    }
+                }
+                None => warnings.push(format!(
+                    "alias de version catalog não resolvido: libs.{alias}"
+                )),
+            }
             continue;
         }
         for quote in ['\'', '"'] {
@@ -215,21 +237,31 @@ fn resolve_gradle(project: &Project, jars: &mut Vec<PathBuf>, warnings: &mut Vec
                 ));
                 continue;
             }
-            coordinates.push(Coordinate {
+            let coordinate = Coordinate {
                 group: group.to_owned(),
                 artifact: artifact.to_owned(),
                 version: version.to_owned(),
                 classifier: parts.get(3).map(|value| (*value).to_owned()),
-            });
+            };
+            if platform {
+                boms.push(coordinate);
+            } else {
+                coordinates.push(coordinate);
+            }
         }
     }
     dedup_coordinates(&mut coordinates);
-    if coordinates.is_empty() {
+    dedup_coordinates(&mut boms);
+    if coordinates.is_empty() && boms.is_empty() {
         return;
     }
-    let resolution = maven::resolve_coordinates(&repo, &coordinates);
+    let resolution = maven::resolve_gradle(&repo, &coordinates, &boms);
     jars.extend(resolution.jars);
     warnings.extend(resolution.warnings);
+}
+
+fn is_platform(line: &str) -> bool {
+    line.contains("platform(") || line.contains("enforcedPlatform(")
 }
 
 fn gradle_map_coordinate(line: &str) -> Option<Coordinate> {
@@ -248,6 +280,162 @@ fn gradle_map_coordinate(line: &str) -> Option<Coordinate> {
         version,
         classifier: None,
     })
+}
+
+fn catalog_accessor(line: &str) -> Option<String> {
+    let start = line.find("libs.")? + "libs.".len();
+    let rest = &line[start..];
+    let end = rest
+        .find(|character: char| {
+            !(character.is_alphanumeric()
+                || character == '.'
+                || character == '_'
+                || character == '-')
+        })
+        .unwrap_or(rest.len());
+    let accessor = &rest[..end];
+    if accessor.is_empty() || accessor.starts_with("bundles.") {
+        return None;
+    }
+    Some(accessor.to_owned())
+}
+
+#[derive(Debug, Default)]
+struct GradleCatalog {
+    libraries: HashMap<String, Coordinate>,
+}
+
+fn lookup_catalog(catalog: &GradleCatalog, accessor: &str) -> Option<Coordinate> {
+    catalog
+        .libraries
+        .get(accessor)
+        .or_else(|| catalog.libraries.get(&accessor.replace('.', "-")))
+        .or_else(|| catalog.libraries.get(&accessor.replace('.', "_")))
+        .cloned()
+}
+
+fn parse_version_catalog(root: &Path) -> GradleCatalog {
+    let path = [
+        root.join("gradle/libs.versions.toml"),
+        root.join("libs.versions.toml"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file());
+    let Some(path) = path else {
+        return GradleCatalog::default();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return GradleCatalog::default();
+    };
+
+    let mut versions = HashMap::new();
+    let mut raw_libraries: Vec<(String, String, String, Option<String>)> = Vec::new();
+    let mut section = String::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or(line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].trim().to_owned();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match section.as_str() {
+            "versions" => {
+                versions.insert(key.to_owned(), unquote(value));
+            }
+            "libraries" => {
+                if let Some((group, artifact, version)) = parse_catalog_library(value, &versions) {
+                    raw_libraries.push((key.to_owned(), group, artifact, version));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut catalog = GradleCatalog::default();
+    for (alias, group, artifact, version) in raw_libraries {
+        let coordinate = Coordinate {
+            group,
+            artifact,
+            version: version.unwrap_or_default(),
+            classifier: None,
+        };
+        for key in [
+            alias.clone(),
+            alias.replace('-', "."),
+            alias.replace('_', "."),
+            alias.replace('.', "-"),
+        ] {
+            catalog.libraries.insert(key, coordinate.clone());
+        }
+    }
+    catalog
+}
+
+fn parse_catalog_library(
+    value: &str,
+    versions: &HashMap<String, String>,
+) -> Option<(String, String, Option<String>)> {
+    if value.starts_with('"') || value.starts_with('\'') {
+        let coordinate = unquote(value);
+        let parts: Vec<&str> = coordinate.split(':').collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        return Some((
+            parts[0].to_owned(),
+            parts[1].to_owned(),
+            parts.get(2).map(|version| (*version).to_owned()),
+        ));
+    }
+    if !value.starts_with('{') {
+        return None;
+    }
+    let mut module = None;
+    let mut group = None;
+    let mut name = None;
+    let mut explicit_version = None;
+    let mut version_ref = None;
+    for part in value.trim_matches(['{', '}']).split(',') {
+        let Some((key, raw)) = part.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let raw = raw.trim();
+        match key {
+            "module" => module = Some(unquote(raw)),
+            "group" => group = Some(unquote(raw)),
+            "name" => name = Some(unquote(raw)),
+            "version" => {
+                if raw.starts_with('{') {
+                    version_ref = quoted_after(raw, "ref");
+                } else {
+                    explicit_version = Some(unquote(raw));
+                }
+            }
+            "version.ref" => version_ref = Some(unquote(raw)),
+            _ => {}
+        }
+    }
+    let (group, artifact) = if let Some(module) = module {
+        let (group, artifact) = module.split_once(':')?;
+        (group.to_owned(), artifact.to_owned())
+    } else {
+        (group?, name?)
+    };
+    let version = explicit_version
+        .or_else(|| version_ref.and_then(|reference| versions.get(&reference).cloned()));
+    Some((group, artifact, version))
+}
+
+fn unquote(value: &str) -> String {
+    value.trim().trim_matches('"').trim_matches('\'').to_owned()
 }
 
 fn quoted_after(line: &str, key: &str) -> Option<String> {
@@ -665,6 +853,52 @@ mod tests {
                 .major,
             25
         );
+    }
+
+    #[test]
+    fn parses_gradle_version_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("gradle")).unwrap();
+        fs::write(
+            dir.path().join("gradle/libs.versions.toml"),
+            r#"
+[versions]
+guava = "33.0.0-jre"
+bom = "2.0"
+
+[libraries]
+guava-core = { module = "com.google.guava:guava", version.ref = "guava" }
+inline = "com.acme:inline:1.2.3"
+platform-bom = { module = "com.acme:bom", version.ref = "bom" }
+"#,
+        )
+        .unwrap();
+        let catalog = parse_version_catalog(dir.path());
+        let guava = lookup_catalog(&catalog, "guava.core").unwrap();
+        assert_eq!(guava.full(), "com.google.guava:guava:33.0.0-jre");
+        let inline = lookup_catalog(&catalog, "inline").unwrap();
+        assert_eq!(inline.full(), "com.acme:inline:1.2.3");
+        let bom = lookup_catalog(&catalog, "platform.bom").unwrap();
+        assert_eq!(bom.full(), "com.acme:bom:2.0");
+        assert!(lookup_catalog(&catalog, "missing").is_none());
+    }
+
+    #[test]
+    fn detects_platform_dependencies() {
+        assert!(is_platform(
+            "implementation(platform(\"com.acme:bom:1.0\"))"
+        ));
+        assert!(is_platform("implementation(enforcedPlatform(libs.bom))"));
+        assert!(!is_platform("implementation(\"com.acme:app:1.0\")"));
+        assert_eq!(
+            catalog_accessor("implementation(libs.guava.core)").as_deref(),
+            Some("guava.core")
+        );
+        assert_eq!(catalog_accessor("implementation(libs.bundles.net)"), None);
+        let mapped =
+            gradle_map_coordinate("implementation group: 'com.acme', name: 'app', version: '1.0'")
+                .unwrap();
+        assert_eq!(mapped.full(), "com.acme:app:1.0");
     }
 
     #[test]

@@ -29,11 +29,11 @@ Este repositório contém o **MVP 0.1.0**, o **M1** do editor e a **fundação d
   - posição do cursor na barra de status
 - **Busca e substituição** no arquivo (`Ctrl+F`/`Ctrl+H`) com regex (incluindo grupos `$1`), palavra inteira, destaques e navegação.
 - **Busca no projeto** (`Ctrl+Shift+F`) em thread separada, com resultados clicáveis e substituição no projeto.
-- **Classpath nativo** Eclipse/Maven/Gradle + JDK, com dependências transitivas e índice de classes de JARs/JMODs; o JDK é escolhido pelo target do projeto.
-- **Open Type** inclui tipos do projeto e do classpath; **F3** em tipo externo abre o visualizador de metadados.
+- **Classpath nativo** Eclipse/Maven/Gradle + JDK, com dependências transitivas, BOM/platform, version catalogs e watch de `pom.xml`/`.classpath`/`build.gradle`; o JDK é escolhido pelo target do projeto.
+- **Open Type** inclui tipos do projeto e do classpath; **F3** em tipo externo abre o visualizador de metadados e, quando há `-sources.jar`/`src.zip`, o código-fonte.
 - **Completion inline** de membros (`Ctrl+Space` ou após `.`), com herança do classpath, filtro incremental e aceite por Enter/Tab.
 - **Hover semântico** de tipos, variáveis e símbolos.
-- **Referências textuais** no projeto (`Ctrl+Shift+G`).
+- **Referências** no projeto (`Ctrl+Shift+G`): semânticas para tipos, textuais para os demais identificadores.
 - Diagnóstico de **imports não resolvidos** no painel de problemas.
 - **File watcher**: recarga automática de arquivos limpos alterados no disco e banner de conflito para buffers sujos.
 - **Recuperação de buffers sujos** após fechar/crash, com diálogo de recuperação.
@@ -75,8 +75,8 @@ Recuperação de buffers após uma sessão anterior:
 Este MVP é deliberadamente honesto sobre o escopo:
 
 - Não compila, não roda testes e não depura projetos Java ainda.
-- A semântica Java já cobre imports/tipos, completion de membros e hover, mas ainda não tem generics/overloads completos, find references semântico, rename ou refactors.
-- Maven/Gradle resolvem dependências transitivas do repositório local; não há download, perfis Maven nem Tooling API/BOM completo do Gradle.
+- A semântica Java cobre imports/tipos, completion de membros, hover e referências semânticas de tipos, mas ainda não tem generics/overloads completos, referências de membros ou rename.
+- Maven/Gradle resolvem dependências transitivas do repositório local; não há download, perfis Maven nem Tooling API/bundles avançados do Gradle.
 - Multi-cursor agrupa undo de digitação, mas backspace/delete multi ainda são por tecla.
 - Não é um substituto completo do Eclipse para projetos corporativos.
 - Plugins Eclipse/OSGi/SWT **não** são carregados ainda. A compatibilidade headless está no roadmap.
@@ -121,7 +121,7 @@ Também é possível abrir a IDE sem argumentos e escolher **Arquivo → Abrir p
 | `Ctrl+Shift+F` | Buscar no projeto |
 | `Ctrl+K` / `Ctrl+Shift+K` | Próxima / anterior ocorrência |
 | `Ctrl+Space` | Completion de tipos/membros |
-| `Ctrl+Shift+G` | Referências textuais no projeto |
+| `Ctrl+Shift+G` | Referências (semânticas para tipos; textuais para o resto) |
 | `Ctrl+Shift+L` | Ajuda de atalhos |
 | `F3` | Ir para definição |
 | `F5` | Reindexar |
@@ -194,7 +194,7 @@ Detalhes técnicos, métricas e limitações: [docs/M1.md](docs/M1.md).
 
 O M2 cobre classpath Eclipse/Maven/Gradle/JDK com dependências transitivas, escolha de JDK pelo target, índice nativo de classes de JARs/JMODs, Open Type com tipos externos, F3 abrindo metadados do classpath e diagnóstico de imports não resolvidos.
 
-A camada semântica adiciona inferência de variáveis (inclusive generics e arrays), completion de membros inline com herança do classpath, hover de tipos/variáveis e referências textuais. Ainda faltam rename seguro, referências semânticas, generics/overloads completos e diagnósticos do javac/JDT. Plano e limitações: [docs/M2.md](docs/M2.md).
+A camada semântica adiciona inferência de variáveis (inclusive generics e arrays), completion de membros inline com herança do classpath, hover de tipos/variáveis, referências semânticas de tipos e leitura de fontes de JARs/JDK. Ainda faltam rename, referências de membros, generics/overloads completos e diagnósticos do javac/JDT. Plano e limitações: [docs/M2.md](docs/M2.md).
 
 ![Classpath e índice de tipos](docs/screenshot-classpath.png)
 
@@ -205,6 +205,14 @@ Completion de membros de `MessageService` após `app.service.`:
 Hover semântico de um tipo do projeto:
 
 ![Hover semântico](docs/screenshot-hover.png)
+
+Referências semânticas de `MessageService`:
+
+![Referências semânticas](docs/screenshot-references.png)
+
+Código-fonte de `java.lang.String` lido do `src.zip` do JDK:
+
+![Código-fonte do JDK](docs/screenshot-source.png)
 
 Open Type com a query `java.lang.String` e tipos do classpath:
 

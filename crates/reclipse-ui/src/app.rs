@@ -14,8 +14,9 @@ use reclipse_classpath::{ClasspathIndex, ClasspathStats};
 use reclipse_core::{discover_project, Project, IGNORED_DIRS};
 use reclipse_editor::{Document, SearchMatcher, SearchOptions};
 use reclipse_java::semantic::{
-    completion_context, infer_variable_type, resolve_type as resolve_semantic_type,
-    unresolved_imports, CompletionItem, CompletionKind, ProjectTypes, ResolvedType,
+    completion_context, find_type_references, infer_variable_type,
+    resolve_type as resolve_semantic_type, unresolved_imports, CompletionItem, CompletionKind,
+    ProjectTypes, ResolvedType,
 };
 use reclipse_java::{build_index, IndexedProblem, ProjectIndex, SymbolKind};
 use reclipse_plugin_api::InvokeContext;
@@ -24,7 +25,7 @@ use reclipse_plugin_host::{PluginCommand, PluginHost};
 use crate::editor_view::Tab;
 use crate::keymap::{KeyAction, Keymap};
 use crate::palette::{rank, Action, Palette, PaletteEntry, PaletteMode};
-use crate::search::{project_files, FileSearch, ProjectSearch};
+use crate::search::{project_files, FileSearch, ProjectMatch, ProjectSearch};
 use crate::session::Keybindings;
 use crate::theme;
 use crate::tree::FileTree;
@@ -104,6 +105,9 @@ struct ScreenshotState {
     completion_trigger: Option<String>,
     completion_done: bool,
     hover_word: Option<String>,
+    source_class: Option<String>,
+    references_word: Option<String>,
+    references_done: bool,
     search_query: Option<String>,
     project_search_query: Option<String>,
 }
@@ -131,6 +135,8 @@ pub struct ReclipseApp {
     project_types: Option<ProjectTypes>,
     semantic_problems: Vec<SemanticProblem>,
     classpath_view: Option<String>,
+    classpath_source: Option<(String, String)>,
+    classpath_reload_at: Option<Instant>,
     completion: Option<CompletionState>,
     last_completion_revision: Option<(PathBuf, u64)>,
     egui_ctx: Context,
@@ -186,6 +192,8 @@ impl ReclipseApp {
             project_types: None,
             semantic_problems: Vec::new(),
             classpath_view: None,
+            classpath_source: None,
+            classpath_reload_at: None,
             completion: None,
             last_completion_revision: None,
             egui_ctx: cc.egui_ctx.clone(),
@@ -251,6 +259,9 @@ impl ReclipseApp {
                 completion_trigger: std::env::var("RECLIPSE_SCREENSHOT_COMPLETION").ok(),
                 completion_done: false,
                 hover_word: std::env::var("RECLIPSE_SCREENSHOT_HOVER").ok(),
+                source_class: std::env::var("RECLIPSE_SCREENSHOT_SOURCE").ok(),
+                references_word: std::env::var("RECLIPSE_SCREENSHOT_REFERENCES").ok(),
+                references_done: false,
                 search_query: std::env::var("RECLIPSE_SCREENSHOT_SEARCH").ok(),
                 project_search_query: std::env::var("RECLIPSE_SCREENSHOT_PROJECT_SEARCH").ok(),
             },
@@ -327,6 +338,8 @@ impl ReclipseApp {
         self.project_types = None;
         self.semantic_problems.clear();
         self.classpath_view = None;
+        self.classpath_source = None;
+        self.classpath_reload_at = None;
         self.completion = None;
         self.last_completion_revision = None;
         self.tabs.clear();
@@ -491,6 +504,11 @@ impl ReclipseApp {
             if self.watch_ignored.contains_key(&raw_path)
                 || self.watch_ignored.contains_key(&canonical)
             {
+                continue;
+            }
+
+            if is_classpath_config(&canonical) {
+                self.classpath_reload_at = Some(now + Duration::from_millis(500));
                 continue;
             }
 
@@ -716,6 +734,21 @@ impl ReclipseApp {
         }
     }
 
+    fn maybe_reload_classpath(&mut self) {
+        let Some(at) = self.classpath_reload_at else {
+            return;
+        };
+        if Instant::now() < at || matches!(self.classpath_status, ClasspathStatus::Indexing { .. })
+        {
+            return;
+        }
+        self.classpath_reload_at = None;
+        if let Some(project) = self.project.clone() {
+            self.start_classpath(project);
+            self.toast("Classpath recarregado");
+        }
+    }
+
     fn open_folder_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Abrir projeto")
@@ -916,6 +949,65 @@ impl ReclipseApp {
             self.toast("Coloque o cursor sobre um identificador");
             return;
         };
+        let path = self.tabs[active].doc.path.clone();
+
+        let semantic = {
+            let file = self
+                .index
+                .as_ref()
+                .and_then(|index| index.symbols_for(&path));
+            let types = self.project_types.as_ref();
+            let classpath = self.classpath_index.as_ref();
+            match (file, types, classpath) {
+                (Some(file), Some(types), Some(classpath)) => {
+                    resolve_semantic_type(&word, file, types, classpath)
+                        .map(|resolved| resolved.name().to_owned())
+                }
+                _ => None,
+            }
+        };
+
+        if let Some(fqn) = semantic {
+            if let (Some(index), Some(types), Some(classpath)) = (
+                self.index.as_ref(),
+                self.project_types.as_ref(),
+                self.classpath_index.as_ref(),
+            ) {
+                let references = find_type_references(&fqn, types, index, classpath);
+                if !references.is_empty() {
+                    let count = references.len();
+                    let mut cache: HashMap<PathBuf, String> = HashMap::new();
+                    let matches: Vec<ProjectMatch> = references
+                        .into_iter()
+                        .map(|reference| {
+                            let text = cache.entry(reference.file.clone()).or_insert_with(|| {
+                                fs::read_to_string(&reference.file).unwrap_or_default()
+                            });
+                            let preview = text
+                                .split('\n')
+                                .nth(reference.line.saturating_sub(1))
+                                .unwrap_or_default()
+                                .trim()
+                                .chars()
+                                .take(160)
+                                .collect();
+                            ProjectMatch {
+                                file: reference.file,
+                                line: reference.line,
+                                column: reference.column,
+                                start: 0,
+                                end: reference.name.chars().count(),
+                                preview,
+                            }
+                        })
+                        .collect();
+                    self.project_search.show_results(word.clone(), matches);
+                    self.toast(format!("{count} referência(s) semânticas de {fqn}"));
+                    return;
+                }
+            }
+        }
+
         self.project_search.query = word.clone();
         self.project_search.case_sensitive = true;
         self.project_search.whole_word = true;
@@ -2564,6 +2656,7 @@ impl ReclipseApp {
         if self.completion.is_some()
             || self.palette.open
             || self.classpath_view.is_some()
+            || self.classpath_source.is_some()
             || self.about_open
             || self.shortcuts_open
             || self.close_confirm.is_some()
@@ -3598,6 +3691,13 @@ impl ReclipseApp {
             self.classpath_view = None;
             return;
         };
+        let source = self
+            .classpath_index
+            .as_ref()
+            .and_then(|index| index.source_location(&name))
+            .and_then(|location| reclipse_classpath::read_source(&location).ok());
+        let has_source = source.is_some();
+        let mut open_source = false;
         let mut open = true;
         egui::Window::new(format!("Tipo externo — {}", class.display_name))
             .open(&mut open)
@@ -3637,10 +3737,21 @@ impl ReclipseApp {
                     );
                 }
                 ui.separator();
+                if has_source && ui.button("Ver código-fonte").clicked() {
+                    open_source = true;
+                }
                 ui.label(
-                    RichText::new("Metadados do classpath; código-fonte não disponível.")
-                        .small()
-                        .color(theme::YELLOW),
+                    RichText::new(if has_source {
+                        "Fontes anexados disponíveis."
+                    } else {
+                        "Metadados do classpath; código-fonte não disponível."
+                    })
+                    .small()
+                    .color(if has_source {
+                        theme::GREEN
+                    } else {
+                        theme::YELLOW
+                    }),
                 );
                 egui::ScrollArea::vertical()
                     .max_height(420.0)
@@ -3676,6 +3787,43 @@ impl ReclipseApp {
             });
         if !open {
             self.classpath_view = None;
+        }
+        if open_source {
+            if let Some(source) = source {
+                self.classpath_source = Some((class.name.clone(), source));
+            }
+        }
+    }
+
+    fn show_classpath_source(&mut self, ctx: &Context) {
+        let Some((name, _)) = self.classpath_source.as_ref() else {
+            return;
+        };
+        let name = name.clone();
+        let Some((_, source)) = self.classpath_source.as_mut() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new(format!("Código-fonte — {name}"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(egui::vec2(900.0, 620.0))
+            .show(ctx, |ui| {
+                egui::ScrollArea::both()
+                    .id_salt("reclipse_classpath_source")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(source)
+                                .code_editor()
+                                .desired_width(1600.0)
+                                .desired_rows(36),
+                        );
+                    });
+            });
+        if !open {
+            self.classpath_source = None;
         }
     }
 
@@ -4110,6 +4258,39 @@ impl ReclipseApp {
                             }
                         }
                     }
+                    if !self.screenshot.references_done {
+                        if let Some(word) = self.screenshot.references_word.clone() {
+                            if let Some(active) = self.active_tab {
+                                let text = self.tabs[active].doc.text();
+                                if let Some(position) = text.find(&word) {
+                                    let inside = position
+                                        + word
+                                            .chars()
+                                            .next()
+                                            .map(|character| character.len_utf8())
+                                            .unwrap_or(0);
+                                    let character = text[..inside].chars().count();
+                                    self.tabs[active].doc.set_cursor(character, false);
+                                    self.tabs[active].pending_cursor = Some(character);
+                                    self.find_references();
+                                    self.screenshot.references_done = true;
+                                }
+                            }
+                        }
+                    }
+                    if self.classpath_source.is_none() {
+                        if let Some(name) = self.screenshot.source_class.clone() {
+                            if let Some(location) = self
+                                .classpath_index
+                                .as_ref()
+                                .and_then(|index| index.source_location(&name))
+                            {
+                                if let Ok(source) = reclipse_classpath::read_source(&location) {
+                                    self.classpath_source = Some((name, source));
+                                }
+                            }
+                        }
+                    }
                     if self.screenshot.ready_frames == 5 && self.screenshot.open_type {
                         self.palette.open(PaletteMode::Types);
                         if let Some(query) = self.screenshot.palette_query.clone() {
@@ -4169,6 +4350,7 @@ impl eframe::App for ReclipseApp {
         self.poll_index();
         self.poll_classpath();
         self.poll_watcher();
+        self.maybe_reload_classpath();
         if self.project_search.poll() {
             let count = self.project_search.results.len();
             if count > 0 {
@@ -4191,6 +4373,7 @@ impl eframe::App for ReclipseApp {
         self.show_palette(ctx);
         self.show_shortcuts(ctx);
         self.show_classpath_view(ctx);
+        self.show_classpath_source(ctx);
         self.show_about(ctx);
         self.show_project_replace_confirm(ctx);
         self.show_recovery(ctx);
@@ -4201,6 +4384,7 @@ impl eframe::App for ReclipseApp {
 
         if matches!(self.index_status, IndexStatus::Indexing { .. })
             || matches!(self.classpath_status, ClasspathStatus::Indexing { .. })
+            || self.classpath_reload_at.is_some()
             || self.project_search.running
         {
             ctx.request_repaint_after(Duration::from_millis(80));
@@ -4245,6 +4429,24 @@ fn short_file(path: &str) -> &str {
 
 fn is_completion_identifier(character: char) -> bool {
     character.is_alphanumeric() || character == '_' || character == '$'
+}
+
+fn is_classpath_config(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches!(
+        name,
+        "pom.xml"
+            | ".classpath"
+            | "build.gradle"
+            | "build.gradle.kts"
+            | "settings.gradle"
+            | "settings.gradle.kts"
+            | "gradle.properties"
+            | "libs.versions.toml"
+            | "org.eclipse.jdt.core.prefs"
+    )
 }
 
 fn truncate_detail(detail: &str, limit: usize) -> String {
@@ -4429,4 +4631,20 @@ fn spawn_index(root: PathBuf) -> Receiver<IndexMessage> {
         }
     });
     receiver
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_classpath_configuration_files() {
+        assert!(is_classpath_config(Path::new("project/pom.xml")));
+        assert!(is_classpath_config(Path::new("project/.classpath")));
+        assert!(is_classpath_config(Path::new("project/build.gradle.kts")));
+        assert!(is_classpath_config(Path::new(
+            "project/gradle/libs.versions.toml"
+        )));
+        assert!(!is_classpath_config(Path::new("project/App.java")));
+    }
 }

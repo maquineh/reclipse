@@ -86,6 +86,11 @@ impl ClasspathIndex {
             .map(|member| member.name.clone())
             .collect()
     }
+
+    pub fn source_location(&self, name: &str) -> Option<crate::source::SourceLocation> {
+        let class = self.get_loose(name)?;
+        crate::source::source_location(class)
+    }
 }
 
 pub fn build(

@@ -151,13 +151,15 @@ O M1 está concluído; o foco atual é o motor semântico Java (M2).
 
 - **Eclipse**: `<classpathentry kind="src">`, `kind="lib"` (JAR ou diretório), container JRE detectado à parte e avisos para entradas não resolvidas.
 - **Maven**: dependências diretas e transitivas do `pom.xml`, propriedades (`${...}`, `project.*`, parent), `dependencyManagement`/BOMs importados, escopos compile/runtime/provided, `optional` e exclusions; repositório local (`M2_REPO` ou `~/.m2/repository`); `sourceDirectory`/`testSourceDirectory`.
-- **Gradle**: coordenadas `group:artifact:version` (incluindo sintaxe de mapa) em `build.gradle`/`.kts`, com transitivas via POMs do repositório Maven local.
+- **Gradle**: coordenadas `group:artifact:version` (incluindo sintaxe de mapa) em `build.gradle`/`.kts`, com transitivas via POMs do repositório Maven local, `platform(...)`/BOM e version catalogs (`libs.versions.toml`).
 - **JDK**: `RECLIPSE_JDK`, `JAVA_HOME` e instalações comuns; JDK 9+ via `jmods/*.jmod`, JDK 8 via `rt.jar`; target detectado em Maven/Gradle/Eclipse e JDK exato (ou menor >= target) escolhido.
+- **Watch**: mudanças em `pom.xml`, `.classpath`, `build.gradle(.kts)`, `libs.versions.toml` e prefs do JDT disparam recarga do classpath com debounce.
+- **Fontes**: `source.rs` resolve `-sources.jar`/`src.zip` sob demanda; o visualizador lê o fonte do ZIP.
 - **Fallback**: JARs em `lib/` e `libs/`.
 
 O índice lê `.class` sem JVM (`classfile.rs`): constant pool, acesso, superclasse, interfaces, campos e métodos públicos/protegidos. Descritores são formatados para assinaturas legíveis e tipos FQN são expostos para o resolvedor. JARs usam `zip`; JMODs descartam o header `JM\x01\x00` e leem o ZIP interno. Classes duplicadas são deduplicadas, com preferência pela versão pública.
 
-`reclipse-java::semantic` implementa a camada de consulta: `ProjectTypes`, resolução por import/pacote/wildcard/`java.lang`, diagnóstico de imports, inferência reversa de variáveis (inclusive generics/arrays), completion de membros com herança do classpath e hover de tipos/variáveis/símbolos. A UI abre completion automaticamente após `.` ou com `Ctrl+Space` e mostra tooltips semânticos.
+`reclipse-java::semantic` implementa a camada de consulta: `ProjectTypes`, resolução por import/pacote/wildcard/`java.lang`, diagnóstico de imports, inferência reversa de variáveis (inclusive generics/arrays), completion de membros com herança do classpath e hover de tipos/variáveis/símbolos. O parser também coleta `type_identifier` em uma segunda passada (inclusive dentro de corpos) para um índice de referências semânticas de tipos; a UI usa esse índice no `Ctrl+Shift+G` e cai para busca textual quando o símbolo não é um tipo.
 
 `reclipse-java::semantic` consulta os dois índices:
 
@@ -166,9 +168,9 @@ O índice lê `.class` sem JVM (`classfile.rs`): constant pool, acesso, supercla
 - `unresolved_imports` gera diagnósticos com linha;
 - `completion_type_names` alimenta o Open Type/completion de tipos.
 
-Na UI, o status do classpath mostra archives/classes/tempo; Open Type inclui tipos externos; F3 sobre um tipo do classpath abre um visualizador de metadados (campos, métodos e origem).
+Na UI, o status do classpath mostra archives/classes/tempo e o target; Open Type inclui tipos externos; F3 sobre um tipo do classpath abre um visualizador de metadados, com código-fonte quando `-sources.jar`/`src.zip` estão disponíveis.
 
-Limitações: sem dependências transitivas/exclusions/BOM/perfis, sem download, sem sources/Javadoc, sem escolha de JDK pelo target do projeto e sem watch de `pom.xml`/`.classpath`.
+Limitações: sem download, perfis Maven, Tooling API do Gradle, Javadoc HTML ou rename; referências semânticas cobrem tipos, não membros.
 
 ### Descoberta de fontes
 
@@ -194,7 +196,7 @@ Entradas de workspace como `/OutroProjeto/src` são ignoradas de propósito: abr
 1. **Classpath**: Eclipse/Maven/Gradle/JDK, JARs/JMODs e transitivas existem; faltam download, perfis Maven, Tooling API/version catalogs do Gradle e observação em tempo real.
 2. **Resolução**: imports/tipos básicos existem; faltam escopos, herança, generics e overloads. É um compilador frontal, não um parser.
 3. **Diagnósticos**: erros semânticos incrementais ou fallback controlado para `javac`/JDT.
-4. **Completion/refactor**: completion de membros e hover existem; find references é textual e rename seguro ainda falta.
+4. **Completion/refactor**: completion de membros, hover e referências semânticas de tipos existem; rename e referências de membros ainda faltam.
 5. **Build/test/debug**: integrar Maven/Gradle, JUnit e JDI/DAP.
 
 A estratégia é construir L2/L3 nativos para o caminho quente e oferecer um **modo de precisão** opcional via JDT Language Server (LSP) enquanto o motor nativo amadurece. O modo de precisão é opt-in porque reidrata o custo de JVM que motivou o projeto.
@@ -308,7 +310,9 @@ Nada disso substitui aconselhamento jurídico.
 | Índice de JARs/JMODs | ✅ |
 | Resolução de imports/tipos + Open Type externo | ✅ |
 | Inferência/completion/hover | 🔶 básicos |
-| Find references/rename | 🔶 refs textuais; sem rename |
+| Referências semânticas de tipos | ✅ |
+| Rename / referências de membros | ❌ |
+| Fontes de JARs/JDK | ✅ |
 | Build/test/debug | ❌ |
 | LSP/JDT | ❌ |
 | Equinox sidecar | ❌ |

@@ -85,6 +85,29 @@ pub fn resolve_pom(pom_path: &Path, repo: &Path) -> MavenResolution {
 
 /// Resolve a list of Gradle-style coordinates (direct roots) transitively.
 pub fn resolve_coordinates(repo: &Path, coordinates: &[Coordinate]) -> MavenResolution {
+    resolve_gradle(repo, coordinates, &[])
+}
+
+/// Resolve Gradle coordinates, applying dependency management from platform BOMs.
+pub fn resolve_gradle(
+    repo: &Path,
+    coordinates: &[Coordinate],
+    boms: &[Coordinate],
+) -> MavenResolution {
+    let mut resolver = Resolver::new(repo);
+    let mut management = HashMap::new();
+    for bom in boms {
+        if let Some(pom) = resolver.load_pom_coordinate(bom, 0) {
+            for (key, managed) in pom.management {
+                management.insert(key, managed);
+            }
+        } else {
+            resolver.warn(format!(
+                "BOM Gradle não encontrado no repositório local: {}",
+                bom.full()
+            ));
+        }
+    }
     let root = Pom {
         packaging: "jar".to_owned(),
         dependencies: coordinates
@@ -98,9 +121,10 @@ pub fn resolve_coordinates(repo: &Path, coordinates: &[Coordinate]) -> MavenReso
                 exclusions: Vec::new(),
             })
             .collect(),
+        management,
         ..Pom::default()
     };
-    Resolver::new(repo).resolve_from_root(&root)
+    resolver.resolve_from_root(&root)
 }
 
 struct Resolver {
@@ -918,6 +942,38 @@ mod tests {
 
         let resolution = resolve_pom(&root, &repo);
         assert_eq!(resolution.dependencies, vec!["com.acme:a:1.0".to_owned()]);
+        assert_eq!(resolution.jars.len(), 1);
+    }
+
+    #[test]
+    fn resolves_gradle_platform_management() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        write_jar(&repo, "com.acme", "dep", "1.0");
+        write_pom(&repo, "com.acme", "dep", "1.0", "");
+        write_pom(
+            &repo,
+            "com.acme",
+            "bom",
+            "2.0",
+            "<packaging>pom</packaging><dependencyManagement><dependencies>\
+             <dependency><groupId>com.acme</groupId><artifactId>dep</artifactId>\
+             <version>1.0</version></dependency></dependencies></dependencyManagement>",
+        );
+        let coordinates = vec![Coordinate {
+            group: "com.acme".to_owned(),
+            artifact: "dep".to_owned(),
+            version: String::new(),
+            classifier: None,
+        }];
+        let boms = vec![Coordinate {
+            group: "com.acme".to_owned(),
+            artifact: "bom".to_owned(),
+            version: "2.0".to_owned(),
+            classifier: None,
+        }];
+        let resolution = resolve_gradle(&repo, &coordinates, &boms);
+        assert_eq!(resolution.dependencies, vec!["com.acme:dep:1.0".to_owned()]);
         assert_eq!(resolution.jars.len(), 1);
     }
 

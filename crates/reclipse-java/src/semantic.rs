@@ -213,6 +213,57 @@ pub fn import_type_path(import: &str) -> Option<String> {
     Some(path.to_owned())
 }
 
+#[derive(Debug, Clone)]
+pub struct TypeReference {
+    pub file: PathBuf,
+    pub name: String,
+    pub line: usize,
+    pub column: usize,
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+/// Find syntactic type-identifier occurrences that resolve to `fqn`.
+///
+/// This is a semantic type reference index: identifier resolution uses imports,
+/// package, wildcard and classpath rules, so comments/strings and unrelated
+/// same-named types are not included.
+pub fn find_type_references(
+    fqn: &str,
+    project: &ProjectTypes,
+    index: &ProjectIndex,
+    classpath: &ClasspathIndex,
+) -> Vec<TypeReference> {
+    let mut references = Vec::new();
+    for (path, file) in &index.files {
+        for reference in &file.type_refs {
+            let Some(resolved) = resolve_type(&reference.name, file, project, classpath) else {
+                continue;
+            };
+            if resolved.name() != fqn {
+                continue;
+            }
+            references.push(TypeReference {
+                file: path.clone(),
+                name: reference.name.clone(),
+                line: reference.line,
+                column: reference.column,
+                start_byte: reference.start_byte,
+                end_byte: reference.end_byte,
+            });
+        }
+    }
+    references.sort_by(|left, right| {
+        left.file
+            .cmp(&right.file)
+            .then(left.line.cmp(&right.line))
+            .then(left.column.cmp(&right.column))
+    });
+    references
+        .dedup_by(|left, right| left.file == right.file && left.start_byte == right.start_byte);
+    references
+}
+
 pub fn unresolved_imports(
     file: &FileSymbols,
     project: &ProjectTypes,
@@ -793,6 +844,7 @@ mod tests {
             imports: Vec::new(),
             import_lines: Vec::new(),
             symbols: Vec::new(),
+            type_refs: Vec::new(),
             errors: Vec::new(),
             line_count: 1,
             parse_error: None,
@@ -828,6 +880,7 @@ mod tests {
             imports: vec!["com.acme.User".to_owned()],
             import_lines: vec![3],
             symbols: Vec::new(),
+            type_refs: Vec::new(),
             errors: Vec::new(),
             line_count: 1,
             parse_error: None,
@@ -841,6 +894,65 @@ mod tests {
     }
 
     #[test]
+    fn finds_semantic_type_references() {
+        let user_path = PathBuf::from("User.java");
+        let app_path = PathBuf::from("App.java");
+        let user = crate::parse_source(&user_path, "package com.acme; public class User {}");
+        let app = crate::parse_source(
+            &app_path,
+            "package com.acme; class App { User user; void f() { new User(); } }",
+        );
+        let project = reclipse_core::Project {
+            root: PathBuf::from("."),
+            name: "test".to_owned(),
+            build_system: reclipse_core::BuildSystem::Plain,
+            source_roots: Vec::new(),
+            java_files: vec![user_path.clone(), app_path.clone()],
+            all_files: vec![user_path.clone(), app_path.clone()],
+        };
+        let index = ProjectIndex::from_files(project, vec![user, app], 0);
+        let types = ProjectTypes::build(&index);
+        let references =
+            find_type_references("com.acme.User", &types, &index, &ClasspathIndex::default());
+        assert!(references
+            .iter()
+            .any(|reference| reference.file == user_path));
+        assert!(
+            references
+                .iter()
+                .filter(|reference| reference.file == app_path)
+                .count()
+                >= 2
+        );
+    }
+
+    #[test]
+    fn finds_semantic_type_references_through_import() {
+        let user_path = PathBuf::from("com/acme/User.java");
+        let app_path = PathBuf::from("com/other/App.java");
+        let user = crate::parse_source(&user_path, "package com.acme; public class User {}");
+        let app = crate::parse_source(
+            &app_path,
+            "package com.other; import com.acme.User; class App { User user; }",
+        );
+        let project = reclipse_core::Project {
+            root: PathBuf::from("."),
+            name: "test".to_owned(),
+            build_system: reclipse_core::BuildSystem::Plain,
+            source_roots: Vec::new(),
+            java_files: vec![user_path, app_path.clone()],
+            all_files: vec![app_path.clone()],
+        };
+        let index = ProjectIndex::from_files(project, vec![user, app], 0);
+        let types = ProjectTypes::build(&index);
+        let references =
+            find_type_references("com.acme.User", &types, &index, &ClasspathIndex::default());
+        assert!(references
+            .iter()
+            .any(|reference| reference.file == app_path));
+    }
+
+    #[test]
     fn reports_unresolved_import_with_line() {
         let project = ProjectTypes::default();
         let file = FileSymbols {
@@ -849,6 +961,7 @@ mod tests {
             imports: vec!["java.util.List".to_owned()],
             import_lines: vec![4],
             symbols: Vec::new(),
+            type_refs: Vec::new(),
             errors: Vec::new(),
             line_count: 1,
             parse_error: None,
@@ -950,6 +1063,7 @@ mod tests {
             imports: Vec::new(),
             import_lines: Vec::new(),
             symbols: Vec::new(),
+            type_refs: Vec::new(),
             errors: Vec::new(),
             line_count: 2,
             parse_error: None,
@@ -1009,6 +1123,7 @@ mod tests {
                     detail: Some("public String getName()".to_owned()),
                 },
             ],
+            type_refs: Vec::new(),
             errors: Vec::new(),
             line_count: 3,
             parse_error: None,
@@ -1039,6 +1154,7 @@ mod tests {
             imports: Vec::new(),
             import_lines: Vec::new(),
             symbols: Vec::new(),
+            type_refs: Vec::new(),
             errors: Vec::new(),
             line_count: 2,
             parse_error: None,

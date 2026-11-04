@@ -146,6 +146,18 @@ impl ProjectSearch {
         self.focus_pending = false;
     }
 
+    pub fn show_results(&mut self, query: String, results: Vec<ProjectMatch>) {
+        self.open = true;
+        self.query = query;
+        self.results = results;
+        self.selected = 0;
+        self.running = false;
+        self.searched = true;
+        self.error = None;
+        self.focus_pending = false;
+        self.rx = None;
+    }
+
     pub fn start(&mut self, files: Vec<PathBuf>) {
         let query = self.query.trim().to_owned();
         self.searched = true;
