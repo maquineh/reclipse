@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/reclipse-core",
+    "crates/reclipse-java",
+    "crates/reclipse-classpath",
+    "crates/reclipse-editor",
+    "crates/reclipse-plugin-api",
+    "crates/reclipse-plugin-host",
+    "crates/reclipse-ui",
+    "plugins/hello-plugin",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://example.invalid/reclipse"
+rust-version = "1.87"
+
+[workspace.dependencies]
+anyhow = "1.0"
+dunce = "1.0"
+eframe = "0.31.1"
+egui = "0.31.1"
+libloading = "0.8"
+notify = "8"
+rayon = "1.10"
+rfd = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tree-sitter = "0.25.10"
+tree-sitter-java = "0.23.5"
+walkdir = "2.5"
+
+reclipse-core = { path = "crates/reclipse-core" }
+reclipse-classpath = { path = "crates/reclipse-classpath" }
+reclipse-java = { path = "crates/reclipse-java" }
+reclipse-editor = { path = "crates/reclipse-editor" }
+reclipse-plugin-api = { path = "crates/reclipse-plugin-api" }
+reclipse-plugin-host = { path = "crates/reclipse-plugin-host" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

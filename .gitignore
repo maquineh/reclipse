@@ -1,0 +1,11 @@
+/target/
+**/*.rs.bk
+*.pdb
+*.dll
+*.so
+*.dylib
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+hs_err_pid*.log

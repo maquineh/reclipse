@@ -1,0 +1,33 @@
+[package]
+name = "reclipse-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+screenshot = ["dep:image"]
+frame-bench = []
+
+[[bin]]
+name = "reclipse"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+dunce.workspace = true
+eframe.workspace = true
+egui.workspace = true
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+notify.workspace = true
+reclipse-core.workspace = true
+reclipse-classpath.workspace = true
+reclipse-editor.workspace = true
+reclipse-java.workspace = true
+reclipse-plugin-api.workspace = true
+reclipse-plugin-host.workspace = true
+rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

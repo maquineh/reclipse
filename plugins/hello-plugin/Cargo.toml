@@ -1,0 +1,13 @@
+[package]
+name = "reclipse-plugin-hello"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "reclipse_plugin_hello"
+crate-type = ["cdylib"]
+
+[dependencies]
+reclipse-plugin-api.workspace = true
+serde_json.workspace = true

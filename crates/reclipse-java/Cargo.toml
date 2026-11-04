@@ -1,0 +1,16 @@
+[package]
+name = "reclipse-java"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rayon.workspace = true
+reclipse-core.workspace = true
+reclipse-classpath.workspace = true
+tree-sitter.workspace = true
+tree-sitter-java.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

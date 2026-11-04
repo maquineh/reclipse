@@ -1,0 +1,11 @@
+[package]
+name = "reclipse-plugin-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+libloading.workspace = true
+reclipse-plugin-api.workspace = true
+serde_json.workspace = true
