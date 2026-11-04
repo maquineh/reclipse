@@ -1,15 +1,18 @@
 //! Project classpath resolution: Eclipse, Maven, Gradle, plain folders and JDK.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use reclipse_core::{BuildSystem, Project};
 
+use crate::maven::{self, Coordinate};
+
 #[derive(Debug, Clone)]
 pub struct Jdk {
     pub home: PathBuf,
     pub version: String,
+    pub major: u32,
     pub jmods: Vec<PathBuf>,
     pub rt_jar: Option<PathBuf>,
 }
@@ -19,6 +22,7 @@ pub struct ClasspathResolution {
     pub sources: Vec<PathBuf>,
     pub jars: Vec<PathBuf>,
     pub jdk: Option<Jdk>,
+    pub jdk_target: Option<u32>,
     pub warnings: Vec<String>,
     pub build_system: BuildSystem,
 }
@@ -40,7 +44,16 @@ pub fn resolve(project: &Project) -> Result<ClasspathResolution> {
         }
         BuildSystem::Plain => {}
     }
-    let jdk = find_jdk();
+    let jdk_target = detect_jdk_target(project);
+    let jdk = find_jdk_for_target(jdk_target);
+    if let (Some(target), Some(jdk)) = (jdk_target, &jdk) {
+        if jdk.major < target {
+            warnings.push(format!(
+                "JDK {} é menor que o target Java {target}; usando o maior JDK disponível",
+                jdk.version
+            ));
+        }
+    }
 
     for dir in ["lib", "libs"] {
         collect_jars_from_dir(&project.root.join(dir), &mut jars, false);
@@ -53,6 +66,7 @@ pub fn resolve(project: &Project) -> Result<ClasspathResolution> {
         sources,
         jars,
         jdk,
+        jdk_target,
         warnings,
         build_system: project.build_system,
     })
@@ -128,7 +142,8 @@ fn resolve_maven(
     jars: &mut Vec<PathBuf>,
     warnings: &mut Vec<String>,
 ) {
-    let Ok(text) = std::fs::read_to_string(project.root.join("pom.xml")) else {
+    let pom = project.root.join("pom.xml");
+    let Ok(text) = std::fs::read_to_string(&pom) else {
         return;
     };
     let Some(repo) = maven_repository() else {
@@ -136,52 +151,15 @@ fn resolve_maven(
         return;
     };
 
-    let mut properties = parse_xml_properties(&text);
-    let project_group = element_text(&text, "groupId").unwrap_or_default();
-    let project_artifact = element_text(&text, "artifactId").unwrap_or_default();
-    let project_version = element_text(&text, "version").unwrap_or_default();
-    properties
-        .entry("project.groupId".to_owned())
-        .or_insert(project_group);
-    properties
-        .entry("project.artifactId".to_owned())
-        .or_insert(project_artifact);
-    properties
-        .entry("project.version".to_owned())
-        .or_insert(project_version);
+    let resolution = maven::resolve_pom(&pom, &repo);
+    jars.extend(resolution.jars);
+    warnings.extend(resolution.warnings);
 
-    for dependency in dependency_blocks(&text) {
-        let group = element_text(&dependency, "groupId").unwrap_or_default();
-        let artifact = element_text(&dependency, "artifactId").unwrap_or_default();
-        let version = element_text(&dependency, "version").unwrap_or_default();
-        if group.is_empty() || artifact.is_empty() {
-            continue;
-        }
-        let version = substitute(&version, &properties);
-        if version.is_empty() || version.contains("${") {
-            warnings.push(format!(
-                "dependência Maven sem versão resolvida: {group}:{artifact}:{version}"
-            ));
-            continue;
-        }
-        let classifier = element_text(&dependency, "classifier")
-            .map(|value| substitute(&value, &properties))
-            .filter(|value| !value.is_empty());
-        match locate_maven_jar(&repo, &group, &artifact, &version, classifier.as_deref()) {
-            Some(jar) => jars.push(jar),
-            None => warnings.push(format!(
-                "JAR Maven não encontrado: {group}:{artifact}:{version}"
-            )),
-        }
-    }
-
-    // A sourceDirectory outside the conventional layout.
     for (tag, fallback) in [
         ("sourceDirectory", "src/main/java"),
         ("testSourceDirectory", "src/test/java"),
     ] {
         if let Some(path) = element_text(&text, tag) {
-            let path = substitute(&path, &properties);
             let candidate = project.root.join(path);
             if candidate.is_dir() {
                 sources.push(candidate);
@@ -190,131 +168,6 @@ fn resolve_maven(
             }
         }
     }
-}
-
-fn dependency_blocks(xml: &str) -> Vec<String> {
-    let management = block_ranges(xml, "dependencyManagement");
-    let mut blocks = Vec::new();
-    let mut position = 0;
-    while let Some(start) = xml[position..].find("<dependency>") {
-        let start = position + start;
-        if management
-            .iter()
-            .any(|(from, to)| start >= *from && start < *to)
-        {
-            position = start + "<dependency>".len();
-            continue;
-        }
-        let Some(end) = xml[start..].find("</dependency>") else {
-            break;
-        };
-        let end = start + end + "</dependency>".len();
-        blocks.push(xml[start..end].to_owned());
-        position = end;
-    }
-    blocks
-}
-
-fn block_ranges(xml: &str, tag: &str) -> Vec<(usize, usize)> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let mut ranges = Vec::new();
-    let mut position = 0;
-    while let Some(start) = xml[position..].find(&open) {
-        let start = position + start;
-        let Some(end) = xml[start..].find(&close) else {
-            break;
-        };
-        let end = start + end + close.len();
-        ranges.push((start, end));
-        position = end;
-    }
-    ranges
-}
-
-fn parse_xml_properties(xml: &str) -> HashMap<String, String> {
-    let mut properties = HashMap::new();
-    let Some(start) = xml.find("<properties>") else {
-        return properties;
-    };
-    let Some(end) = xml[start..].find("</properties>") else {
-        return properties;
-    };
-    let block = &xml[start + "<properties>".len()..start + end];
-    let mut position = 0;
-    while let Some(open) = block[position..].find('<') {
-        let open = position + open;
-        let Some(close) = block[open..].find('>') else {
-            break;
-        };
-        let close = open + close;
-        let name = block[open + 1..close].trim();
-        if name.starts_with('/') || name.starts_with('?') || name.starts_with('!') {
-            position = close + 1;
-            continue;
-        }
-        let Some(end_tag) = block[close..].find(&format!("</{name}>")) else {
-            position = close + 1;
-            continue;
-        };
-        let value = block[close + 1..close + end_tag].trim().to_owned();
-        properties.insert(name.to_owned(), value);
-        position = close + end_tag + name.len() + 3;
-    }
-    properties
-}
-
-fn substitute(value: &str, properties: &HashMap<String, String>) -> String {
-    let mut result = value.to_owned();
-    for _ in 0..5 {
-        let Some(start) = result.find("${") else {
-            break;
-        };
-        let Some(end) = result[start..].find('}') else {
-            break;
-        };
-        let key = &result[start + 2..start + end];
-        let Some(replacement) = properties.get(key) else {
-            break;
-        };
-        result.replace_range(start..start + end + 1, replacement);
-    }
-    result
-}
-
-fn locate_maven_jar(
-    repo: &Path,
-    group: &str,
-    artifact: &str,
-    version: &str,
-    classifier: Option<&str>,
-) -> Option<PathBuf> {
-    let base = repo
-        .join(group.replace('.', "/"))
-        .join(artifact)
-        .join(version);
-    if let Some(classifier) = classifier {
-        let path = base.join(format!("{artifact}-{version}-{classifier}.jar"));
-        return path.is_file().then_some(path);
-    }
-    let primary = base.join(format!("{artifact}-{version}.jar"));
-    if primary.is_file() {
-        return Some(primary);
-    }
-    let entries = std::fs::read_dir(&base).ok()?;
-    let mut fallback = None;
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        let name = path.file_name()?.to_string_lossy();
-        if name.ends_with(".jar")
-            && !name.ends_with("-sources.jar")
-            && !name.ends_with("-javadoc.jar")
-            && fallback.is_none()
-        {
-            fallback = Some(path);
-        }
-    }
-    fallback
 }
 
 fn resolve_gradle(project: &Project, jars: &mut Vec<PathBuf>, warnings: &mut Vec<String>) {
@@ -329,36 +182,89 @@ fn resolve_gradle(project: &Project, jars: &mut Vec<PathBuf>, warnings: &mut Vec
             text.push('\n');
         }
     }
+
+    let mut coordinates = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("//") {
             continue;
         }
-        let Some(quote) = trimmed.find(['\'', '"']) else {
-            continue;
-        };
-        let value = &trimmed[quote + 1..];
-        let Some(end) = value.find(['\'', '"']) else {
-            continue;
-        };
-        let coordinate = &value[..end];
-        let parts: Vec<&str> = coordinate.split(':').collect();
-        if parts.len() != 3 && parts.len() != 4 {
+        if let Some(coordinate) = gradle_map_coordinate(trimmed) {
+            coordinates.push(coordinate);
             continue;
         }
-        let (group, artifact, version) = (parts[0], parts[1], parts[2]);
-        let classifier = parts.get(3).copied();
-        if group.is_empty() || artifact.is_empty() || version.is_empty() {
-            continue;
-        }
-        if let Some(jar) = locate_maven_jar(&repo, group, artifact, version, classifier) {
-            jars.push(jar);
-        } else {
-            warnings.push(format!(
-                "JAR Gradle não encontrado: {group}:{artifact}:{version}"
-            ));
+        for quote in ['\'', '"'] {
+            let Some(start) = trimmed.find(quote) else {
+                continue;
+            };
+            let Some(end) = trimmed[start + 1..].find(quote) else {
+                continue;
+            };
+            let value = &trimmed[start + 1..start + 1 + end];
+            let parts: Vec<&str> = value.split(':').collect();
+            if parts.len() != 3 && parts.len() != 4 {
+                continue;
+            }
+            let (group, artifact, version) = (parts[0], parts[1], parts[2]);
+            if group.is_empty() || artifact.is_empty() || version.is_empty() {
+                continue;
+            }
+            if version.contains("${") || version.contains("$(") {
+                warnings.push(format!(
+                    "versão Gradle dinâmica não resolvida: {group}:{artifact}:{version}"
+                ));
+                continue;
+            }
+            coordinates.push(Coordinate {
+                group: group.to_owned(),
+                artifact: artifact.to_owned(),
+                version: version.to_owned(),
+                classifier: parts.get(3).map(|value| (*value).to_owned()),
+            });
         }
     }
+    dedup_coordinates(&mut coordinates);
+    if coordinates.is_empty() {
+        return;
+    }
+    let resolution = maven::resolve_coordinates(&repo, &coordinates);
+    jars.extend(resolution.jars);
+    warnings.extend(resolution.warnings);
+}
+
+fn gradle_map_coordinate(line: &str) -> Option<Coordinate> {
+    if !line.contains("group:") || !line.contains("name:") || !line.contains("version:") {
+        return None;
+    }
+    let group = quoted_after(line, "group:")?;
+    let artifact = quoted_after(line, "name:")?;
+    let version = quoted_after(line, "version:")?;
+    if version.contains("${") || version.contains("$(") {
+        return None;
+    }
+    Some(Coordinate {
+        group,
+        artifact,
+        version,
+        classifier: None,
+    })
+}
+
+fn quoted_after(line: &str, key: &str) -> Option<String> {
+    let start = line.find(key)? + key.len();
+    let rest = line[start..].trim_start();
+    let quote = rest
+        .chars()
+        .next()
+        .filter(|value| *value == '\'' || *value == '"')?;
+    let rest = &rest[quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_owned())
+}
+
+fn dedup_coordinates(coordinates: &mut Vec<Coordinate>) {
+    let mut seen = HashSet::new();
+    coordinates.retain(|coordinate| seen.insert(coordinate.full()));
 }
 
 fn collect_jars_from_dir(dir: &Path, jars: &mut Vec<PathBuf>, recursive: bool) {
@@ -420,7 +326,142 @@ fn dedup(paths: &mut Vec<PathBuf>) {
     paths.retain(|path| seen.insert(path.clone()));
 }
 
-pub fn find_jdk() -> Option<Jdk> {
+/// Detect the Java target used by the project (Maven, Gradle or Eclipse).
+pub fn detect_jdk_target(project: &Project) -> Option<u32> {
+    match project.build_system {
+        BuildSystem::Maven => maven_target(&project.root.join("pom.xml")),
+        BuildSystem::Gradle => gradle_target(&project.root),
+        BuildSystem::Eclipse => eclipse_target(&project.root),
+        BuildSystem::Plain => None,
+    }
+}
+
+fn maven_target(pom: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(pom).ok()?;
+    for tag in [
+        "maven.compiler.release",
+        "maven.compiler.target",
+        "maven.compiler.source",
+        "release",
+        "target",
+        "source",
+    ] {
+        if let Some(value) = element_text(&text, tag) {
+            let value = resolve_property(&text, &value);
+            if let Some(major) = parse_java_version(&value) {
+                return Some(major);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_property(text: &str, value: &str) -> String {
+    let trimmed = value.trim();
+    if let Some(key) = trimmed
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    {
+        return element_text(text, key).unwrap_or_else(|| trimmed.to_owned());
+    }
+    trimmed.to_owned()
+}
+
+fn gradle_target(root: &Path) -> Option<u32> {
+    let mut text = String::new();
+    for name in ["build.gradle", "build.gradle.kts"] {
+        if let Ok(contents) = std::fs::read_to_string(root.join(name)) {
+            text.push_str(&contents);
+            text.push('\n');
+        }
+    }
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if trimmed.contains("languageVersion") || trimmed.contains("toolchain") {
+            if let Some(major) = version_in(trimmed) {
+                return Some(major);
+            }
+        }
+        if trimmed.contains("options.release")
+            || trimmed.contains("sourceCompatibility")
+            || trimmed.contains("targetCompatibility")
+            || trimmed.contains("JavaVersion.VERSION_")
+        {
+            if let Some(major) = version_in(trimmed) {
+                return Some(major);
+            }
+        }
+    }
+    None
+}
+
+fn eclipse_target(root: &Path) -> Option<u32> {
+    if let Ok(prefs) = std::fs::read_to_string(root.join(".settings/org.eclipse.jdt.core.prefs")) {
+        for key in [
+            "org.eclipse.jdt.core.compiler.release",
+            "org.eclipse.jdt.core.compiler.compliance",
+            "org.eclipse.jdt.core.compiler.codegen.targetPlatform",
+            "org.eclipse.jdt.core.compiler.source",
+        ] {
+            if let Some(value) = prefs
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            {
+                if let Some(major) = parse_java_version(value) {
+                    return Some(major);
+                }
+            }
+        }
+    }
+    if let Ok(classpath) = std::fs::read_to_string(root.join(".classpath")) {
+        if let Some(start) = classpath.find("JavaSE-") {
+            let value = &classpath[start + "JavaSE-".len()..];
+            let digits: String = value
+                .chars()
+                .take_while(|character| character.is_ascii_digit() || *character == '.')
+                .collect();
+            if let Some(major) = parse_java_version(&digits) {
+                return Some(major);
+            }
+        }
+    }
+    None
+}
+
+fn version_in(line: &str) -> Option<u32> {
+    let mut token = String::new();
+    for character in line.chars() {
+        if character.is_ascii_digit() || character == '.' {
+            token.push(character);
+        } else if !token.is_empty() {
+            if let Some(major) = parse_java_version(&token) {
+                return Some(major);
+            }
+            token.clear();
+        }
+    }
+    parse_java_version(&token)
+}
+
+pub fn parse_java_version(value: &str) -> Option<u32> {
+    let value = value.trim().trim_matches(['"', '\'']);
+    let numbers: Vec<u32> = value
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse().ok())
+        .collect();
+    match numbers.as_slice() {
+        [] => None,
+        [1, second, ..] => Some(*second),
+        [first, ..] => Some(*first),
+    }
+}
+
+/// Find the best installed JDK, preferring one compatible with `target`.
+pub fn find_jdk_for_target(target: Option<u32>) -> Option<Jdk> {
     let mut candidates = Vec::new();
     for env in ["RECLIPSE_JDK", "JAVA_HOME"] {
         if let Some(value) = std::env::var_os(env) {
@@ -437,11 +478,36 @@ pub fn find_jdk() -> Option<Jdk> {
         candidates.extend(scan_jdk_dirs(Path::new("/usr/lib/jvm")));
     }
 
-    let mut jdks: Vec<Jdk> = candidates
+    let jdks: Vec<Jdk> = candidates
         .into_iter()
         .filter_map(|home| jdk_from_home(&home))
         .collect();
-    jdks.sort_by_key(|jdk| std::cmp::Reverse(version_key(&jdk.version)));
+    select_jdk(jdks, target)
+}
+
+/// Kept for callers that just need the newest installed JDK.
+pub fn find_jdk() -> Option<Jdk> {
+    find_jdk_for_target(None)
+}
+
+fn select_jdk(mut jdks: Vec<Jdk>, target: Option<u32>) -> Option<Jdk> {
+    if jdks.is_empty() {
+        return None;
+    }
+    jdks.sort_by_key(|jdk| std::cmp::Reverse(jdk.major));
+    let Some(target) = target else {
+        return jdks.into_iter().next();
+    };
+    if let Some(exact) = jdks.iter().find(|jdk| jdk.major == target) {
+        return Some(exact.clone());
+    }
+    if let Some(next) = jdks
+        .iter()
+        .filter(|jdk| jdk.major > target)
+        .min_by_key(|jdk| jdk.major)
+    {
+        return Some(next.clone());
+    }
     jdks.into_iter().next()
 }
 
@@ -494,19 +560,14 @@ fn jdk_from_home(home: &Path) -> Option<Jdk> {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default()
         });
+    let major = parse_java_version(&version).unwrap_or(0);
     Some(Jdk {
         home: home.to_path_buf(),
         version,
+        major,
         jmods,
         rt_jar,
     })
-}
-
-fn version_key(version: &str) -> Vec<u32> {
-    version
-        .split(['.', '_', '-'])
-        .filter_map(|part| part.parse::<u32>().ok())
-        .collect()
 }
 
 #[cfg(test)]
@@ -541,37 +602,86 @@ mod tests {
     }
 
     #[test]
-    fn resolves_maven_property_version_and_jar() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        let jar_dir = repo.join("com/acme/app/1.2.3");
-        fs::create_dir_all(&jar_dir).unwrap();
-        fs::write(jar_dir.join("app-1.2.3.jar"), b"jar").unwrap();
-        assert!(locate_maven_jar(&repo, "com.acme", "app", "1.2.3", None).is_some());
-
-        let xml = r#"<project>
-            <properties><app.version>1.2.3</app.version></properties>
-            <dependencies>
-              <dependency>
-                <groupId>com.acme</groupId><artifactId>app</artifactId>
-                <version>${app.version}</version>
-              </dependency>
-            </dependencies>
-        </project>"#;
-        let mut properties = parse_xml_properties(xml);
-        assert_eq!(substitute("${app.version}", &properties), "1.2.3");
-        properties.insert("project.version".to_owned(), "1.2.3".to_owned());
-        assert_eq!(dependency_blocks(xml).len(), 1);
+    fn detects_java_versions() {
+        assert_eq!(parse_java_version("1.8"), Some(8));
+        assert_eq!(parse_java_version("17"), Some(17));
+        assert_eq!(parse_java_version("VERSION_21"), Some(21));
+        assert_eq!(parse_java_version("25.0.2+10"), Some(25));
+        assert_eq!(parse_java_version("nope"), None);
     }
 
     #[test]
-    fn ignores_dependency_management_blocks() {
-        let xml = r#"<project>
-            <dependencyManagement><dependencies><dependency><groupId>a</groupId></dependency></dependencies></dependencyManagement>
-            <dependencies><dependency><groupId>b</groupId></dependency></dependencies>
-        </project>"#;
-        let blocks = dependency_blocks(xml);
-        assert_eq!(blocks.len(), 1);
-        assert!(blocks[0].contains("<groupId>b</groupId>"));
+    fn detects_maven_and_gradle_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("pom.xml"),
+            r#"<project><properties>
+              <maven.compiler.release>21</maven.compiler.release>
+            </properties></project>"#,
+        )
+        .unwrap();
+        let maven = reclipse_core::discover_project(root).unwrap();
+        assert_eq!(detect_jdk_target(&maven), Some(21));
+
+        fs::remove_file(root.join("pom.xml")).unwrap();
+        fs::write(
+            root.join("build.gradle.kts"),
+            "java { toolchain { languageVersion = JavaLanguageVersion.of(17) } }\n",
+        )
+        .unwrap();
+        let gradle = reclipse_core::discover_project(root).unwrap();
+        assert_eq!(detect_jdk_target(&gradle), Some(17));
+    }
+
+    #[test]
+    fn selects_closest_jdk_for_target() {
+        let jdk = |major: u32| Jdk {
+            home: PathBuf::from(format!("jdk-{major}")),
+            version: major.to_string(),
+            major,
+            jmods: Vec::new(),
+            rt_jar: None,
+        };
+        assert_eq!(
+            select_jdk(vec![jdk(8), jdk(17), jdk(21), jdk(25)], Some(17))
+                .unwrap()
+                .major,
+            17
+        );
+        assert_eq!(
+            select_jdk(vec![jdk(8), jdk(21), jdk(25)], Some(17))
+                .unwrap()
+                .major,
+            21
+        );
+        assert_eq!(
+            select_jdk(vec![jdk(8), jdk(11)], Some(17)).unwrap().major,
+            11
+        );
+        assert_eq!(
+            select_jdk(vec![jdk(8), jdk(21), jdk(25)], None)
+                .unwrap()
+                .major,
+            25
+        );
+    }
+
+    #[test]
+    fn detects_eclipse_compliance() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join(".settings");
+        fs::create_dir_all(&settings).unwrap();
+        fs::write(
+            settings.join("org.eclipse.jdt.core.prefs"),
+            "org.eclipse.jdt.core.compiler.compliance=17\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".classpath"),
+            r#"<classpath><classpathentry kind="con" path="org.eclipse.jdt.launching.JRE_CONTAINER/org.eclipse.jdt.internal.debug.ui.launcher.StandardVMType/JavaSE-17"/></classpath>"#,
+        )
+        .unwrap();
+        assert_eq!(eclipse_target(dir.path()), Some(17));
     }
 }

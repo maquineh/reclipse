@@ -20,6 +20,7 @@ fn main() {
         sources: Vec::new(),
         jars: Vec::new(),
         jdk: Some(jdk),
+        jdk_target: None,
         warnings: Vec::new(),
         build_system: reclipse_core::BuildSystem::Plain,
     };

@@ -29,8 +29,11 @@ Este repositório contém o **MVP 0.1.0**, o **M1** do editor e a **fundação d
   - posição do cursor na barra de status
 - **Busca e substituição** no arquivo (`Ctrl+F`/`Ctrl+H`) com regex (incluindo grupos `$1`), palavra inteira, destaques e navegação.
 - **Busca no projeto** (`Ctrl+Shift+F`) em thread separada, com resultados clicáveis e substituição no projeto.
-- **Classpath nativo** Eclipse/Maven/Gradle + JDK, com índice de classes de JARs/JMODs.
+- **Classpath nativo** Eclipse/Maven/Gradle + JDK, com dependências transitivas e índice de classes de JARs/JMODs; o JDK é escolhido pelo target do projeto.
 - **Open Type** inclui tipos do projeto e do classpath; **F3** em tipo externo abre o visualizador de metadados.
+- **Completion inline** de membros (`Ctrl+Space` ou após `.`), com herança do classpath, filtro incremental e aceite por Enter/Tab.
+- **Hover semântico** de tipos, variáveis e símbolos.
+- **Referências textuais** no projeto (`Ctrl+Shift+G`).
 - Diagnóstico de **imports não resolvidos** no painel de problemas.
 - **File watcher**: recarga automática de arquivos limpos alterados no disco e banner de conflito para buffers sujos.
 - **Recuperação de buffers sujos** após fechar/crash, com diálogo de recuperação.
@@ -72,8 +75,8 @@ Recuperação de buffers após uma sessão anterior:
 Este MVP é deliberadamente honesto sobre o escopo:
 
 - Não compila, não roda testes e não depura projetos Java ainda.
-- A semântica Java é uma fundação: resolução de imports/tipos e Open Type, mas sem inferência completa, completion de membros inline, find references ou refactors.
-- Maven/Gradle resolvem apenas dependências diretas; não há download nem resolução transitiva.
+- A semântica Java já cobre imports/tipos, completion de membros e hover, mas ainda não tem generics/overloads completos, find references semântico, rename ou refactors.
+- Maven/Gradle resolvem dependências transitivas do repositório local; não há download, perfis Maven nem Tooling API/BOM completo do Gradle.
 - Multi-cursor agrupa undo de digitação, mas backspace/delete multi ainda são por tecla.
 - Não é um substituto completo do Eclipse para projetos corporativos.
 - Plugins Eclipse/OSGi/SWT **não** são carregados ainda. A compatibilidade headless está no roadmap.
@@ -117,6 +120,8 @@ Também é possível abrir a IDE sem argumentos e escolher **Arquivo → Abrir p
 | `Ctrl+H` | Substituir no arquivo |
 | `Ctrl+Shift+F` | Buscar no projeto |
 | `Ctrl+K` / `Ctrl+Shift+K` | Próxima / anterior ocorrência |
+| `Ctrl+Space` | Completion de tipos/membros |
+| `Ctrl+Shift+G` | Referências textuais no projeto |
 | `Ctrl+Shift+L` | Ajuda de atalhos |
 | `F3` | Ir para definição |
 | `F5` | Reindexar |
@@ -185,13 +190,21 @@ O marco M1 substituiu o `TextEdit` por um editor próprio com rope, virtualizaç
 
 Detalhes técnicos, métricas e limitações: [docs/M1.md](docs/M1.md).
 
-## M2 — Motor Java (fundação entregue)
+## M2 — Motor Java (completion e hover entregues)
 
-O M2 começou pelo classpath: resolução Eclipse/Maven/Gradle/JDK, índice nativo de classes de JARs/JMODs, Open Type com tipos externos, F3 abrindo metadados de tipos do classpath e diagnóstico de imports não resolvidos.
+O M2 cobre classpath Eclipse/Maven/Gradle/JDK com dependências transitivas, escolha de JDK pelo target, índice nativo de classes de JARs/JMODs, Open Type com tipos externos, F3 abrindo metadados do classpath e diagnóstico de imports não resolvidos.
 
-Ainda faltam dependências transitivas, inferência de tipos completa, completion de membros inline, find references, rename e diagnósticos semânticos. Plano e limitações: [docs/M2.md](docs/M2.md).
+A camada semântica adiciona inferência de variáveis (inclusive generics e arrays), completion de membros inline com herança do classpath, hover de tipos/variáveis e referências textuais. Ainda faltam rename seguro, referências semânticas, generics/overloads completos e diagnósticos do javac/JDT. Plano e limitações: [docs/M2.md](docs/M2.md).
 
 ![Classpath e índice de tipos](docs/screenshot-classpath.png)
+
+Completion de membros de `MessageService` após `app.service.`:
+
+![Completion de membros](docs/screenshot-completion.png)
+
+Hover semântico de um tipo do projeto:
+
+![Hover semântico](docs/screenshot-hover.png)
 
 Open Type com a query `java.lang.String` e tipos do classpath:
 
@@ -231,7 +244,7 @@ Medição local de referência (Windows 10, i5-4590, 4 núcleos, build release):
 
 O frame benchmark usa uma janela focada e mede o `update` completo do egui; wall time inclui vsync. CPU p95 é a métrica de trabalho da UI.
 
-Reproduza com `cargo run --release -p reclipse-editor --example bench_editor` e `cargo run --release -p reclipse-java --example bench_index -- <pasta>`. Esses números medem o núcleo (rope, lexer e documentos), não o frame time da UI; uma sessão com 100 abas foi aberta e validada por screenshot.
+Reproduza com `cargo run --release -p reclipse-editor --example bench_editor` e `cargo run --release -p reclipse-java --example bench_index -- <pasta>`. Esses números medem o núcleo (rope, lexer e documentos); o frame benchmark da UI está descrito em [docs/M1.md](docs/M1.md). Uma sessão com 100 abas foi aberta e validada por screenshot.
 
 ## Licença
 

@@ -142,7 +142,7 @@ O M1 está concluído; o foco atual é o motor semântico Java (M2).
 | L0 | lexer, highlight, erros de sintaxe | ✅ MVP |
 | L1 | índice de pacotes/tipos/membros, outline, go-to-def sintático | ✅ MVP |
 | L2 | resolução de imports, classpath Maven/Gradle/Eclipse, tipos | 🔶 fundação M2 |
-| L3 | inferência de tipos, generics, overload resolution, completion | 🔜 M2.1/M3 |
+| L3 | inferência de tipos, generics, overload resolution, completion | 🔶 completion/hover básicos |
 | L4 | análise incremental de projeto, refactors seguros | 🔜 M4+ |
 
 ### Classpath e índice de classes (M2)
@@ -150,12 +150,14 @@ O M1 está concluído; o foco atual é o motor semântico Java (M2).
 `reclipse-classpath` resolve o classpath fora da UI thread:
 
 - **Eclipse**: `<classpathentry kind="src">`, `kind="lib"` (JAR ou diretório), container JRE detectado à parte e avisos para entradas não resolvidas.
-- **Maven**: dependências diretas do `pom.xml`, propriedades (`${...}`), `project.*`, repositório local (`M2_REPO` ou `~/.m2/repository`), `sourceDirectory`/`testSourceDirectory`.
-- **Gradle**: coordenadas `group:artifact:version` em `build.gradle`/`.kts`, buscadas no repositório Maven local.
-- **JDK**: `RECLIPSE_JDK`, `JAVA_HOME` e instalações comuns; JDK 9+ via `jmods/*.jmod`, JDK 8 via `rt.jar`; maior versão instalada vence.
+- **Maven**: dependências diretas e transitivas do `pom.xml`, propriedades (`${...}`, `project.*`, parent), `dependencyManagement`/BOMs importados, escopos compile/runtime/provided, `optional` e exclusions; repositório local (`M2_REPO` ou `~/.m2/repository`); `sourceDirectory`/`testSourceDirectory`.
+- **Gradle**: coordenadas `group:artifact:version` (incluindo sintaxe de mapa) em `build.gradle`/`.kts`, com transitivas via POMs do repositório Maven local.
+- **JDK**: `RECLIPSE_JDK`, `JAVA_HOME` e instalações comuns; JDK 9+ via `jmods/*.jmod`, JDK 8 via `rt.jar`; target detectado em Maven/Gradle/Eclipse e JDK exato (ou menor >= target) escolhido.
 - **Fallback**: JARs em `lib/` e `libs/`.
 
-O índice lê `.class` sem JVM (`classfile.rs`): constant pool, acesso, superclasse, interfaces, campos e métodos públicos/protegidos. Descritores são formatados para assinaturas legíveis. JARs usam `zip`; JMODs descartam o header `JM\x01\x00` e leem o ZIP interno. Classes duplicadas são deduplicadas, com preferência pela versão pública.
+O índice lê `.class` sem JVM (`classfile.rs`): constant pool, acesso, superclasse, interfaces, campos e métodos públicos/protegidos. Descritores são formatados para assinaturas legíveis e tipos FQN são expostos para o resolvedor. JARs usam `zip`; JMODs descartam o header `JM\x01\x00` e leem o ZIP interno. Classes duplicadas são deduplicadas, com preferência pela versão pública.
+
+`reclipse-java::semantic` implementa a camada de consulta: `ProjectTypes`, resolução por import/pacote/wildcard/`java.lang`, diagnóstico de imports, inferência reversa de variáveis (inclusive generics/arrays), completion de membros com herança do classpath e hover de tipos/variáveis/símbolos. A UI abre completion automaticamente após `.` ou com `Ctrl+Space` e mostra tooltips semânticos.
 
 `reclipse-java::semantic` consulta os dois índices:
 
@@ -189,10 +191,10 @@ Entradas de workspace como `/OutroProjeto/src` são ignoradas de propósito: abr
 
 ### O que falta para “Java IDE de verdade”
 
-1. **Classpath**: a fundação existe (Eclipse/Maven/Gradle/JDK + JARs/JMODs), mas faltam dependências transitivas, BOM/perfis e download.
+1. **Classpath**: Eclipse/Maven/Gradle/JDK, JARs/JMODs e transitivas existem; faltam download, perfis Maven, Tooling API/version catalogs do Gradle e observação em tempo real.
 2. **Resolução**: imports/tipos básicos existem; faltam escopos, herança, generics e overloads. É um compilador frontal, não um parser.
 3. **Diagnósticos**: erros semânticos incrementais ou fallback controlado para `javac`/JDT.
-4. **Completion/refactor**: completion inline, hover, find references e rename vêm depois de L3.
+4. **Completion/refactor**: completion de membros e hover existem; find references é textual e rename seguro ainda falta.
 5. **Build/test/debug**: integrar Maven/Gradle, JUnit e JDI/DAP.
 
 A estratégia é construir L2/L3 nativos para o caminho quente e oferecer um **modo de precisão** opcional via JDT Language Server (LSP) enquanto o motor nativo amadurece. O modo de precisão é opt-in porque reidrata o custo de JVM que motivou o projeto.
@@ -304,8 +306,9 @@ Nada disso substitui aconselhamento jurídico.
 | Plugins Rust nativos (ABI v1) | ✅ |
 | Classpath Eclipse/Maven/Gradle/JDK | 🔶 fundação |
 | Índice de JARs/JMODs | ✅ |
-| Resolução de imports/tipos + Open Type externo | 🔶 fundação |
-| Inferência/completion/find refs/rename | ❌ |
+| Resolução de imports/tipos + Open Type externo | ✅ |
+| Inferência/completion/hover | 🔶 básicos |
+| Find references/rename | 🔶 refs textuais; sem rename |
 | Build/test/debug | ❌ |
 | LSP/JDT | ❌ |
 | Equinox sidecar | ❌ |

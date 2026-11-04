@@ -230,6 +230,43 @@ pub fn format_field_descriptor(descriptor: &str) -> String {
     parse_type(descriptor.as_bytes(), &mut index)
 }
 
+/// Return the fully qualified field type (`java.lang.String`) when the
+/// descriptor refers to a class. Primitive and array descriptors return the
+/// readable form.
+pub fn field_type_name(descriptor: &str) -> Option<String> {
+    let mut index = 0;
+    let name = parse_full_type(descriptor.as_bytes(), &mut index);
+    if name.is_empty() || name == "?" {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Return the fully qualified return type of a method descriptor.
+pub fn method_return_type_name(descriptor: &str) -> Option<String> {
+    let bytes = descriptor.as_bytes();
+    let mut index = 0;
+    if bytes.get(index) == Some(&b'(') {
+        index += 1;
+    }
+    while index < bytes.len() && bytes[index] != b')' {
+        let _ = parse_full_type(bytes, &mut index);
+    }
+    if bytes.get(index) == Some(&b')') {
+        index += 1;
+    }
+    if index >= bytes.len() {
+        return None;
+    }
+    let name = parse_full_type(bytes, &mut index);
+    if name.is_empty() || name == "void" || name == "?" {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// Return `(arguments, return_type)` for a method descriptor.
 pub fn format_method_descriptor(descriptor: &str) -> (String, String) {
     let bytes = descriptor.as_bytes();
@@ -322,6 +359,72 @@ fn parse_type(bytes: &[u8], index: &mut usize) -> String {
         _ => {
             *index += 1;
             "?".to_owned()
+        }
+    }
+}
+
+/// Like `parse_type`, but keeps the fully qualified class name. Used by the
+/// semantic layer to follow member types.
+fn parse_full_type(bytes: &[u8], index: &mut usize) -> String {
+    if *index >= bytes.len() {
+        return String::new();
+    }
+    match bytes[*index] {
+        b'[' => {
+            *index += 1;
+            format!("{}[]", parse_full_type(bytes, index))
+        }
+        b'L' => {
+            *index += 1;
+            let start = *index;
+            while *index < bytes.len() && bytes[*index] != b';' {
+                *index += 1;
+            }
+            let name = String::from_utf8_lossy(&bytes[start..*index]).replace('/', ".");
+            if bytes.get(*index) == Some(&b';') {
+                *index += 1;
+            }
+            name
+        }
+        b'B' => {
+            *index += 1;
+            "byte".to_owned()
+        }
+        b'C' => {
+            *index += 1;
+            "char".to_owned()
+        }
+        b'D' => {
+            *index += 1;
+            "double".to_owned()
+        }
+        b'F' => {
+            *index += 1;
+            "float".to_owned()
+        }
+        b'I' => {
+            *index += 1;
+            "int".to_owned()
+        }
+        b'J' => {
+            *index += 1;
+            "long".to_owned()
+        }
+        b'S' => {
+            *index += 1;
+            "short".to_owned()
+        }
+        b'Z' => {
+            *index += 1;
+            "boolean".to_owned()
+        }
+        b'V' => {
+            *index += 1;
+            "void".to_owned()
+        }
+        _ => {
+            *index += 1;
+            String::new()
         }
     }
 }

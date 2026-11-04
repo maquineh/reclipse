@@ -303,6 +303,34 @@ impl Document {
         identifier_at(&self.text(), self.cursor_char)
     }
 
+    /// Identifier at an arbitrary character index using rope slices instead of
+    /// materializing the whole document.
+    pub fn identifier_at(&self, char_index: usize) -> Option<(String, usize, usize)> {
+        let len = self.len_chars();
+        if len == 0 {
+            return None;
+        }
+        let mut index = char_index.min(len - 1);
+        if !is_identifier_char(Some(self.rope.char(index))) {
+            if index > 0 && is_identifier_char(Some(self.rope.char(index - 1))) {
+                index -= 1;
+            } else if index + 1 < len && is_identifier_char(Some(self.rope.char(index + 1))) {
+                index += 1;
+            } else {
+                return None;
+            }
+        }
+        let mut start = index;
+        while start > 0 && is_identifier_char(Some(self.rope.char(start - 1))) {
+            start -= 1;
+        }
+        let mut end = index + 1;
+        while end < len && is_identifier_char(Some(self.rope.char(end))) {
+            end += 1;
+        }
+        Some((self.rope.slice(start..end).to_string(), start, end))
+    }
+
     pub fn word_range_at(&self, char_index: usize) -> Option<(usize, usize)> {
         identifier_at(&self.text(), char_index).map(|(_, start, end)| (start, end))
     }

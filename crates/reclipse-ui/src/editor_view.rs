@@ -38,6 +38,8 @@ pub struct Tab {
     focus_pending: bool,
     scroll_to_cursor: bool,
     content_width: f32,
+    cursor_screen_rect: Option<Rect>,
+    hovered_identifier: Option<(String, Pos2, usize)>,
     last_status_cursor: usize,
     galleys: HashMap<usize, Arc<egui::Galley>>,
     galley_revision: u64,
@@ -64,6 +66,8 @@ impl Tab {
             focus_pending: true,
             scroll_to_cursor: false,
             content_width: 0.0,
+            cursor_screen_rect: None,
+            hovered_identifier: None,
             last_status_cursor: usize::MAX,
             galleys: HashMap::new(),
             galley_revision: u64::MAX,
@@ -127,6 +131,16 @@ impl Tab {
             .iter()
             .map(|(start, end)| (*start, *end))
             .collect()
+    }
+
+    pub fn cursor_screen_rect(&self) -> Option<Rect> {
+        self.cursor_screen_rect
+    }
+
+    pub fn hovered_identifier(&self) -> Option<(&str, Pos2, usize)> {
+        self.hovered_identifier
+            .as_ref()
+            .map(|(word, position, start)| (word.as_str(), *position, *start))
     }
 
     pub fn restore_folds(&mut self, ranges: &[(usize, usize)]) {
@@ -193,6 +207,7 @@ impl Tab {
         if !clip.is_positive() {
             return;
         }
+        self.cursor_screen_rect = None;
 
         if let Some(index) = self.pending_cursor.take() {
             self.doc.set_cursor(index, false);
@@ -497,11 +512,12 @@ impl Tab {
                 let cursor_x = text_left + visual_col(&cursor_text, cursor_col) as f32 * char_width;
                 let cursor_y =
                     rect.top() + TOP_PAD + self.doc_to_visual(cursor_line) as f32 * row_height;
-                text_painter.rect_filled(
-                    Rect::from_min_size(Pos2::new(cursor_x, cursor_y), Vec2::new(2.0, row_height)),
-                    0.0,
-                    theme::ACCENT,
-                );
+                let cursor_rect =
+                    Rect::from_min_size(Pos2::new(cursor_x, cursor_y), Vec2::new(2.0, row_height));
+                if cursor.cursor == self.doc.cursor_char {
+                    self.cursor_screen_rect = Some(cursor_rect);
+                }
+                text_painter.rect_filled(cursor_rect, 0.0, theme::ACCENT);
             }
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(500));
@@ -521,6 +537,21 @@ impl Tab {
             );
             self.scroll_to_cursor = false;
         }
+
+        let hovered = if response.dragged() {
+            None
+        } else {
+            ui.ctx()
+                .pointer_hover_pos()
+                .filter(|position| rect.contains(*position))
+                .and_then(|position| {
+                    let index = self.pos_to_char(position, rect, text_left, row_height, char_width);
+                    self.doc
+                        .identifier_at(index)
+                        .map(|(word, start, _)| (word, position, start))
+                })
+        };
+        self.hovered_identifier = hovered;
     }
 
     #[allow(clippy::too_many_lines)]

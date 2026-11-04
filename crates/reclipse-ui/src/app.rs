@@ -14,7 +14,8 @@ use reclipse_classpath::{ClasspathIndex, ClasspathStats};
 use reclipse_core::{discover_project, Project, IGNORED_DIRS};
 use reclipse_editor::{Document, SearchMatcher, SearchOptions};
 use reclipse_java::semantic::{
-    resolve_type as resolve_semantic_type, unresolved_imports, ProjectTypes, ResolvedType,
+    completion_context, infer_variable_type, resolve_type as resolve_semantic_type,
+    unresolved_imports, CompletionItem, CompletionKind, ProjectTypes, ResolvedType,
 };
 use reclipse_java::{build_index, IndexedProblem, ProjectIndex, SymbolKind};
 use reclipse_plugin_api::InvokeContext;
@@ -55,6 +56,15 @@ struct SemanticProblem {
     message: String,
 }
 
+struct CompletionState {
+    path: PathBuf,
+    start: usize,
+    items: Vec<CompletionItem>,
+    selected: usize,
+    anchor: egui::Pos2,
+    receiver: Option<String>,
+}
+
 struct IndexPayload {
     project: Project,
     index: ProjectIndex,
@@ -91,6 +101,9 @@ struct ScreenshotState {
     open_type: bool,
     palette_query: Option<String>,
     classpath_view: Option<String>,
+    completion_trigger: Option<String>,
+    completion_done: bool,
+    hover_word: Option<String>,
     search_query: Option<String>,
     project_search_query: Option<String>,
 }
@@ -118,6 +131,8 @@ pub struct ReclipseApp {
     project_types: Option<ProjectTypes>,
     semantic_problems: Vec<SemanticProblem>,
     classpath_view: Option<String>,
+    completion: Option<CompletionState>,
+    last_completion_revision: Option<(PathBuf, u64)>,
     egui_ctx: Context,
     watcher: Option<RecommendedWatcher>,
     watch_rx: Option<Receiver<PathBuf>>,
@@ -171,6 +186,8 @@ impl ReclipseApp {
             project_types: None,
             semantic_problems: Vec::new(),
             classpath_view: None,
+            completion: None,
+            last_completion_revision: None,
             egui_ctx: cc.egui_ctx.clone(),
             watcher: None,
             watch_rx: None,
@@ -231,6 +248,9 @@ impl ReclipseApp {
                 open_type: std::env::var_os("RECLIPSE_SCREENSHOT_OPEN_TYPE").is_some(),
                 palette_query: std::env::var("RECLIPSE_SCREENSHOT_PALETTE_QUERY").ok(),
                 classpath_view: std::env::var("RECLIPSE_SCREENSHOT_CLASSPATH_VIEW").ok(),
+                completion_trigger: std::env::var("RECLIPSE_SCREENSHOT_COMPLETION").ok(),
+                completion_done: false,
+                hover_word: std::env::var("RECLIPSE_SCREENSHOT_HOVER").ok(),
                 search_query: std::env::var("RECLIPSE_SCREENSHOT_SEARCH").ok(),
                 project_search_query: std::env::var("RECLIPSE_SCREENSHOT_PROJECT_SEARCH").ok(),
             },
@@ -307,6 +327,8 @@ impl ReclipseApp {
         self.project_types = None;
         self.semantic_problems.clear();
         self.classpath_view = None;
+        self.completion = None;
+        self.last_completion_revision = None;
         self.tabs.clear();
         self.active_tab = None;
         self.file_search.close();
@@ -883,6 +905,25 @@ impl ReclipseApp {
                 "Definição de '{word}' não encontrada no índice sintático/classpath"
             )),
         }
+    }
+
+    fn find_references(&mut self) {
+        let Some(active) = self.active_tab else {
+            self.toast("Nenhum arquivo ativo");
+            return;
+        };
+        let Some((word, _, _)) = self.tabs[active].doc.identifier_at_cursor() else {
+            self.toast("Coloque o cursor sobre um identificador");
+            return;
+        };
+        self.project_search.query = word.clone();
+        self.project_search.case_sensitive = true;
+        self.project_search.whole_word = true;
+        self.project_search.regex = false;
+        self.completion = None;
+        self.project_search.open();
+        self.run_project_search();
+        self.toast(format!("Referências textuais de '{word}'"));
     }
 
     fn undo_active(&mut self) {
@@ -2050,7 +2091,7 @@ impl ReclipseApp {
                             continue;
                         }
                         entries.push(PaletteEntry::new(
-                            name.clone(),
+                            name.replace('$', "."),
                             "classpath",
                             Action::OpenClasspathType(name.clone()),
                         ));
@@ -2097,6 +2138,68 @@ impl ReclipseApp {
 
     fn handle_shortcuts(&mut self, ctx: &Context) {
         if self.palette.open || self.close_confirm.is_some() {
+            return;
+        }
+
+        if self.completion.is_some() {
+            if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.last_completion_revision = self.active_tab.map(|active| {
+                    (
+                        self.tabs[active].doc.path.clone(),
+                        self.tabs[active].doc.revision,
+                    )
+                });
+                self.completion = None;
+                return;
+            }
+            let visible = self.completion_visible();
+            if visible.is_empty() {
+                if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter)) {
+                    self.last_completion_revision = self.active_tab.map(|active| {
+                        (
+                            self.tabs[active].doc.path.clone(),
+                            self.tabs[active].doc.revision,
+                        )
+                    });
+                    self.completion = None;
+                    return;
+                }
+            } else {
+                if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+                    if let Some(state) = &mut self.completion {
+                        state.selected = (state.selected + 1).min(visible.len() - 1);
+                    }
+                    return;
+                }
+                if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+                    if let Some(state) = &mut self.completion {
+                        state.selected = state.selected.saturating_sub(1);
+                    }
+                    return;
+                }
+                let accept = ctx.input_mut(|input| {
+                    input.consume_key(Modifiers::NONE, Key::Enter)
+                        || input.consume_key(Modifiers::NONE, Key::Tab)
+                });
+                if accept {
+                    let index = visible[self.completion.as_ref().map_or(0, |state| state.selected)];
+                    self.accept_completion(index);
+                    return;
+                }
+            }
+        }
+
+        if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::Space)) {
+            self.open_completion(true);
+            return;
+        }
+
+        let modifiers = ctx.input(|input| input.modifiers);
+        if modifiers.ctrl
+            && modifiers.shift
+            && ctx.input_mut(|input| input.consume_key(modifiers, Key::G))
+        {
+            self.find_references();
             return;
         }
 
@@ -2186,6 +2289,380 @@ impl ReclipseApp {
         }
         if self.keymap.consume(ctx, KeyAction::GoToDefinition) {
             self.goto_definition();
+        }
+    }
+
+    fn completion_visible(&self) -> Vec<usize> {
+        let Some(state) = &self.completion else {
+            return Vec::new();
+        };
+        let Some(tab) = self.tabs.iter().find(|tab| tab.doc.path == state.path) else {
+            return Vec::new();
+        };
+        let cursor = tab.doc.cursor_char;
+        if cursor < state.start {
+            return Vec::new();
+        }
+        let prefix = tab.doc.slice(state.start, cursor);
+        if !prefix.chars().all(is_completion_identifier) {
+            return Vec::new();
+        }
+        let query = prefix.to_lowercase();
+        let mut matches: Vec<(u8, usize)> = state
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                let label = item.label.to_lowercase();
+                if label.starts_with(&query) {
+                    Some((0, index))
+                } else if query.len() > 1 && label.contains(&query) {
+                    Some((1, index))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        matches.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        matches
+            .into_iter()
+            .map(|(_, index)| index)
+            .take(80)
+            .collect()
+    }
+
+    fn open_completion(&mut self, manual: bool) {
+        let Some(active) = self.active_tab else {
+            if manual {
+                self.toast("Nenhum arquivo ativo");
+            }
+            return;
+        };
+        let Some(project_types) = self.project_types.as_ref() else {
+            if manual {
+                self.toast("Índice ainda construindo");
+            }
+            return;
+        };
+        let path = self.tabs[active].doc.path.clone();
+        let cursor = self.tabs[active].doc.cursor_char;
+        let window_start = cursor.saturating_sub(100_000);
+        let source = self.tabs[active].doc.slice(window_start, cursor);
+        let window_cursor = source.chars().count();
+        let anchor = self.tabs[active]
+            .cursor_screen_rect()
+            .map(|rect| rect.right_bottom())
+            .unwrap_or_else(|| egui::Pos2::new(320.0, 120.0));
+        let file = self
+            .index
+            .as_ref()
+            .and_then(|index| index.symbols_for(&path))
+            .cloned()
+            .unwrap_or_else(|| {
+                let full = self.tabs[active].doc.text();
+                reclipse_java::parse_source(&path, &full)
+            });
+        let empty = ClasspathIndex::default();
+        let classpath = self.classpath_index.as_ref().unwrap_or(&empty);
+        let context = completion_context(
+            &source,
+            window_cursor,
+            &file,
+            project_types,
+            self.index.as_ref(),
+            classpath,
+        );
+        if context.items.is_empty() {
+            if manual {
+                self.toast(if context.receiver.is_some() {
+                    "Sem sugestões para este receptor"
+                } else {
+                    "Sem sugestões"
+                });
+            }
+            self.completion = None;
+            return;
+        }
+        self.completion = Some(CompletionState {
+            path,
+            start: window_start + context.start,
+            items: context.items,
+            selected: 0,
+            anchor,
+            receiver: context.receiver,
+        });
+    }
+
+    fn maybe_auto_complete(&mut self) {
+        let Some(active) = self.active_tab else {
+            return;
+        };
+        let path = self.tabs[active].doc.path.clone();
+        let revision = self.tabs[active].doc.revision;
+        let changed =
+            self.last_completion_revision
+                .as_ref()
+                .is_none_or(|(known_path, known_revision)| {
+                    known_path != &path || *known_revision != revision
+                });
+        if !changed {
+            return;
+        }
+        self.last_completion_revision = Some((path, revision));
+        let cursor = self.tabs[active].doc.cursor_char;
+        if cursor == 0 || self.tabs[active].doc.slice(cursor - 1, cursor) != "." {
+            return;
+        }
+        self.open_completion(false);
+    }
+
+    fn accept_completion(&mut self, index: usize) {
+        let Some(state) = self.completion.take() else {
+            return;
+        };
+        let Some(active) = self.active_tab else {
+            return;
+        };
+        let Some(item) = state.items.get(index) else {
+            return;
+        };
+        let insert = item.insert_text.clone();
+        let inserted_len = insert.chars().count();
+        let tab = &mut self.tabs[active];
+        if tab.doc.path != state.path {
+            return;
+        }
+        tab.doc.edit(state.start, tab.doc.cursor_char, &insert);
+        let cursor = state.start + inserted_len;
+        tab.doc.set_cursor(cursor, false);
+        tab.pending_cursor = Some(cursor);
+        self.last_completion_revision = Some((state.path, tab.doc.revision));
+    }
+
+    fn show_completion(&mut self, ctx: &Context) {
+        let Some(state) = &self.completion else {
+            return;
+        };
+        let active_path = self
+            .active_tab
+            .and_then(|active| self.tabs.get(active))
+            .map(|tab| tab.doc.path.as_path());
+        if active_path != Some(state.path.as_path()) {
+            self.completion = None;
+            return;
+        }
+        let Some(tab) = self.tabs.iter().find(|tab| tab.doc.path == state.path) else {
+            self.completion = None;
+            return;
+        };
+        let cursor = tab.doc.cursor_char;
+        if cursor < state.start {
+            self.completion = None;
+            return;
+        }
+        let prefix = tab.doc.slice(state.start, cursor);
+        if !prefix.chars().all(is_completion_identifier) {
+            self.completion = None;
+            return;
+        }
+        let visible = self.completion_visible();
+        if visible.is_empty() {
+            self.completion = None;
+            return;
+        }
+        let (anchor, receiver, selected) = {
+            let state = self.completion.as_mut().unwrap();
+            state.selected = state.selected.min(visible.len() - 1);
+            let live_anchor = self
+                .tabs
+                .iter()
+                .find(|tab| tab.doc.path == state.path)
+                .and_then(|tab| tab.cursor_screen_rect())
+                .map(|rect| rect.right_bottom())
+                .unwrap_or(state.anchor);
+            state.anchor = live_anchor;
+            (live_anchor, state.receiver.clone(), state.selected)
+        };
+        let screen = ctx.screen_rect();
+        let mut position = anchor + egui::vec2(4.0, 2.0);
+        if position.y + 280.0 > screen.bottom() {
+            position.y = (anchor.y - 280.0).max(screen.top() + 8.0);
+        }
+        position.x = position.x.clamp(
+            screen.left() + 8.0,
+            (screen.right() - 360.0).max(screen.left() + 8.0),
+        );
+
+        let mut clicked = None;
+        {
+            let items = &self.completion.as_ref().unwrap().items;
+            egui::Area::new(egui::Id::new("reclipse_completion"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(position)
+                .show(ctx, |ui| {
+                    egui::Frame::NONE
+                        .fill(theme::PANEL)
+                        .stroke(egui::Stroke::new(1.0_f32, theme::ACCENT))
+                        .inner_margin(6.0)
+                        .show(ui, |ui| {
+                            ui.set_min_width(320.0);
+                            ui.set_max_width(620.0);
+                            let title = match &receiver {
+                                Some(receiver) => {
+                                    format!("Completion · {receiver} · {} sugestões", visible.len())
+                                }
+                                None => format!("Completion · {} sugestões", visible.len()),
+                            };
+                            ui.label(RichText::new(title).small().color(theme::MUTED));
+                            egui::ScrollArea::vertical()
+                                .max_height(230.0)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for (rank, index) in visible.iter().enumerate() {
+                                        let item = &items[*index];
+                                        let glyph = match item.kind {
+                                            CompletionKind::Type => "T",
+                                            CompletionKind::Field => "f",
+                                            CompletionKind::Method => "m",
+                                        };
+                                        let color = match item.kind {
+                                            CompletionKind::Type => theme::CLR_TYPE,
+                                            CompletionKind::Field => theme::MUTED,
+                                            CompletionKind::Method => theme::YELLOW,
+                                        };
+                                        let detail = truncate_detail(&item.detail, 72);
+                                        let response = ui.selectable_label(
+                                            rank == selected,
+                                            RichText::new(format!(
+                                                "{glyph}  {}    {detail}",
+                                                item.label
+                                            ))
+                                            .color(color)
+                                            .size(12.5),
+                                        );
+                                        if response.clicked() {
+                                            clicked = Some(*index);
+                                        }
+                                        response.on_hover_text(&item.detail);
+                                    }
+                                });
+                            ui.label(
+                                RichText::new("Ctrl+Space · Enter/Tab aceitar · Esc fechar")
+                                    .small()
+                                    .color(theme::MUTED),
+                            );
+                        });
+                });
+        }
+
+        if let Some(index) = clicked {
+            self.accept_completion(index);
+        }
+    }
+
+    fn show_hover(&mut self, ctx: &Context) {
+        if self.completion.is_some()
+            || self.palette.open
+            || self.classpath_view.is_some()
+            || self.about_open
+            || self.shortcuts_open
+            || self.close_confirm.is_some()
+        {
+            return;
+        }
+        let Some(active) = self.active_tab else {
+            return;
+        };
+        let (word, position, start, path) = if let Some(word) = self.screenshot.hover_word.clone() {
+            let tab = &self.tabs[active];
+            let path = tab.doc.path.clone();
+            let source = tab.doc.text();
+            let Some(byte_position) = source.find(&word) else {
+                return;
+            };
+            let start = source[..byte_position].chars().count();
+            (word, egui::Pos2::new(620.0, 300.0), start, path)
+        } else {
+            let tab = &self.tabs[active];
+            let Some((word, position, start)) = tab.hovered_identifier() else {
+                return;
+            };
+            (word.to_owned(), position, start, tab.doc.path.clone())
+        };
+        if word.chars().count() < 2 {
+            return;
+        }
+        let Some(project_types) = self.project_types.as_ref() else {
+            return;
+        };
+        let Some(file) = self
+            .index
+            .as_ref()
+            .and_then(|index| index.symbols_for(&path))
+            .cloned()
+        else {
+            return;
+        };
+        let empty = ClasspathIndex::default();
+        let classpath = self.classpath_index.as_ref().unwrap_or(&empty);
+
+        if let Some(resolved) = resolve_semantic_type(&word, &file, project_types, classpath) {
+            let (title, lines) = hover_resolved(&word, &resolved, classpath);
+            show_hover_popup(ctx, position, &title, &lines);
+            return;
+        }
+
+        let prefix_start = start.saturating_sub(20_000);
+        let mut prefix = self.tabs[active].doc.slice(prefix_start, start);
+        prefix.push_str(&word);
+        let cursor = prefix.chars().count();
+        if let Some(type_name) = infer_variable_type(&prefix, cursor, &word) {
+            let mut lines = Vec::new();
+            let mut title = format!("{word} : {type_name}");
+            if let Some(resolved) =
+                resolve_semantic_type(&type_name, &file, project_types, classpath)
+            {
+                let (resolved_title, mut resolved_lines) =
+                    hover_resolved(&type_name, &resolved, classpath);
+                title = format!("{word} : {resolved_title}");
+                lines.append(&mut resolved_lines);
+            }
+            show_hover_popup(ctx, position, &title, &lines);
+            return;
+        }
+
+        if let Some(symbol) = file.symbols.iter().find(|symbol| symbol.name == word) {
+            let title = format!("{word} · {}", symbol.kind.label());
+            let lines = symbol.detail.clone().into_iter().collect::<Vec<_>>();
+            show_hover_popup(ctx, position, &title, &lines);
+            return;
+        }
+        if let Some(location) = self
+            .index
+            .as_ref()
+            .and_then(|index| index.find_best(&word, &path))
+        {
+            let title = format!("{word} · {}", location.symbol.kind.label());
+            let relative = self
+                .root
+                .as_ref()
+                .map(|root| {
+                    location
+                        .file
+                        .strip_prefix(root)
+                        .unwrap_or(&location.file)
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .unwrap_or_else(|| location.file.display().to_string());
+            let mut lines = location
+                .symbol
+                .detail
+                .clone()
+                .into_iter()
+                .collect::<Vec<_>>();
+            lines.push(relative);
+            show_hover_popup(ctx, position, &title, &lines);
         }
     }
 
@@ -2380,6 +2857,16 @@ impl ReclipseApp {
                             ui.close_menu();
                             self.goto_definition();
                         }
+                        if ui
+                            .add(
+                                egui::Button::new("Referências (texto)")
+                                    .shortcut_text("Ctrl+Shift+G"),
+                            )
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.find_references();
+                        }
                     });
 
                     ui.menu_button("Projeto", |ui| {
@@ -2548,20 +3035,26 @@ impl ReclipseApp {
                 ui.label(RichText::new(label).small().color(theme::MUTED));
             }
             ClasspathStatus::Ready(stats) => {
+                let target = stats
+                    .jdk_target
+                    .map(|target| format!(" · Java {target}"))
+                    .unwrap_or_default();
                 ui.label(
                     RichText::new(format!(
-                        "cp: {} archives · {} classes · {} ms",
-                        stats.archives, stats.classes, stats.elapsed_ms
+                        "cp: {} archives · {} classes · {} ms{}",
+                        stats.archives, stats.classes, stats.elapsed_ms, target
                     ))
                     .small()
                     .color(theme::MUTED),
                 )
-                .on_hover_text(
+                .on_hover_text(format!(
+                    "JDK: {} · {} warning(s) de classpath",
+                    stats.jdk_version.as_deref().unwrap_or("não encontrado"),
                     self.classpath_index
                         .as_ref()
-                        .map(|index| format!("{} warning(s) de classpath", index.warnings.len()))
-                        .unwrap_or_default(),
-                );
+                        .map(|index| index.warnings.len())
+                        .unwrap_or(0)
+                ));
             }
             ClasspathStatus::Failed(error) => {
                 ui.label(RichText::new("classpath falhou").small().color(theme::RED))
@@ -2977,7 +3470,7 @@ impl ReclipseApp {
             ui.add_space(12.0);
             ui.label(
                 RichText::new(
-                    "Ctrl+Shift+R  abrir recurso     Ctrl+3  quick access     F3  definição     F5  reindexar",
+                    "Ctrl+Shift+R  abrir recurso     Ctrl+Shift+T  abrir tipo     Ctrl+Space  completion     F3  definição",
                 )
                 .small()
                 .color(theme::MUTED),
@@ -3254,6 +3747,18 @@ impl ReclipseApp {
                     )
                     .small()
                     .color(theme::MUTED),
+                );
+                ui.label(
+                    RichText::new(
+                        "Completion: Ctrl+Space abre sugestões · digitar após `.` abre membros · Enter/Tab aceita",
+                    )
+                    .small()
+                    .color(theme::MUTED),
+                );
+                ui.label(
+                    RichText::new("Referências textuais no projeto: Ctrl+Shift+G")
+                        .small()
+                        .color(theme::MUTED),
                 );
                 ui.label(
                     RichText::new(
@@ -3568,6 +4073,12 @@ impl ReclipseApp {
             }
 
             if !self.screenshot.requested {
+                if self.project.is_some()
+                    && matches!(self.classpath_status, ClasspathStatus::Indexing { .. })
+                {
+                    ctx.request_repaint_after(Duration::from_millis(60));
+                    return;
+                }
                 if matches!(self.index_status, IndexStatus::Ready { .. }) {
                     self.screenshot.ready_frames += 1;
                     if let Some(name) = self.screenshot.classpath_view.clone() {
@@ -3578,6 +4089,25 @@ impl ReclipseApp {
                                 .is_some_and(|index| index.contains(&name))
                         {
                             self.classpath_view = Some(name);
+                        }
+                    }
+                    if !self.screenshot.completion_done {
+                        if let Some(marker) = self.screenshot.completion_trigger.clone() {
+                            if self.classpath_index.is_some() {
+                                let trigger = self.active_tab.and_then(|active| {
+                                    let text = self.tabs[active].doc.text();
+                                    text.find(&marker)
+                                        .map(|position| (active, position + marker.len()))
+                                });
+                                if let Some((active, byte_position)) = trigger {
+                                    let text = self.tabs[active].doc.text();
+                                    let character = text[..byte_position].chars().count();
+                                    self.tabs[active].doc.set_cursor(character, false);
+                                    self.tabs[active].pending_cursor = Some(character);
+                                    self.open_completion(false);
+                                    self.screenshot.completion_done = true;
+                                }
+                            }
                         }
                     }
                     if self.screenshot.ready_frames == 5 && self.screenshot.open_type {
@@ -3655,6 +4185,9 @@ impl eframe::App for ReclipseApp {
         self.search_panel(ctx);
         self.left_panel(ctx);
         self.central_panel(ctx);
+        self.maybe_auto_complete();
+        self.show_completion(ctx);
+        self.show_hover(ctx);
         self.show_palette(ctx);
         self.show_shortcuts(ctx);
         self.show_classpath_view(ctx);
@@ -3708,6 +4241,89 @@ fn section_header(ui: &mut Ui, title: &str) {
 
 fn short_file(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+fn is_completion_identifier(character: char) -> bool {
+    character.is_alphanumeric() || character == '_' || character == '$'
+}
+
+fn truncate_detail(detail: &str, limit: usize) -> String {
+    let count = detail.chars().count();
+    if count <= limit {
+        return detail.to_owned();
+    }
+    let mut result: String = detail.chars().take(limit.saturating_sub(3)).collect();
+    result.push_str("...");
+    result
+}
+
+fn hover_resolved(
+    word: &str,
+    resolved: &ResolvedType,
+    classpath: &ClasspathIndex,
+) -> (String, Vec<String>) {
+    match resolved {
+        ResolvedType::Project(location) => {
+            let title = format!("{word} · {}", location.kind.label());
+            let lines = vec![
+                location.fqn.clone(),
+                format!("{}:{}", location.path.display(), location.line),
+            ];
+            (title, lines)
+        }
+        ResolvedType::Classpath(name) => {
+            let Some(class) = classpath.get_loose(name) else {
+                return (word.to_owned(), vec![name.clone()]);
+            };
+            let title = format!("{word} · {}", class.kind.label());
+            let mut lines = vec![
+                class.name.clone(),
+                format!("pacote {} · {}", class.package, class.origin),
+            ];
+            if let Some(super_name) = &class.super_name {
+                lines.push(format!("extends {super_name}"));
+            }
+            if !class.interfaces.is_empty() {
+                lines.push(format!("implements {}", class.interfaces.join(", ")));
+            }
+            (title, lines)
+        }
+    }
+}
+
+fn show_hover_popup(ctx: &Context, position: egui::Pos2, title: &str, lines: &[String]) {
+    let screen = ctx.screen_rect();
+    let mut position = position + egui::vec2(14.0, 18.0);
+    position.x = position.x.clamp(
+        screen.left() + 8.0,
+        (screen.right() - 440.0).max(screen.left() + 8.0),
+    );
+    position.y = position.y.clamp(
+        screen.top() + 8.0,
+        (screen.bottom() - 160.0).max(screen.top() + 8.0),
+    );
+    egui::Area::new(egui::Id::new(("reclipse_hover", title)))
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .fixed_pos(position)
+        .show(ctx, |ui| {
+            egui::Frame::NONE
+                .fill(theme::PANEL)
+                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                .inner_margin(7.0)
+                .show(ui, |ui| {
+                    ui.set_max_width(420.0);
+                    ui.label(
+                        RichText::new(title)
+                            .monospace()
+                            .strong()
+                            .color(theme::ACCENT),
+                    );
+                    for line in lines {
+                        ui.label(RichText::new(line).small().color(theme::MUTED));
+                    }
+                });
+        });
 }
 
 fn is_java_path(path: &Path) -> bool {

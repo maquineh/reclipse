@@ -16,6 +16,8 @@ pub struct ClasspathStats {
     pub archives: usize,
     pub classes: usize,
     pub elapsed_ms: u128,
+    pub jdk_target: Option<u32>,
+    pub jdk_version: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -93,6 +95,8 @@ pub fn build(
     let start = Instant::now();
     let mut index = ClasspathIndex::default();
     index.warnings.extend(resolution.warnings.iter().cloned());
+    index.stats.jdk_target = resolution.jdk_target;
+    index.stats.jdk_version = resolution.jdk.as_ref().map(|jdk| jdk.version.clone());
 
     let mut archives: Vec<(std::path::PathBuf, bool)> = resolution
         .jars
@@ -227,6 +231,7 @@ mod tests {
                 sources: Vec::new(),
                 jars: Vec::new(),
                 jdk: None,
+                jdk_target: None,
                 warnings: Vec::new(),
                 build_system: reclipse_core::BuildSystem::Plain,
             },
@@ -246,6 +251,7 @@ mod tests {
                 sources: Vec::new(),
                 jars: Vec::new(),
                 jdk: Some(jdk),
+                jdk_target: None,
                 warnings: Vec::new(),
                 build_system: reclipse_core::BuildSystem::Plain,
             },

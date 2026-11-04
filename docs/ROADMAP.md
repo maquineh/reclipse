@@ -49,7 +49,7 @@ Aceite validado:
 - recuperação de buffer sujo exibida e exercitada;
 - folding (mouse, teclado e sessão) e multi-cursor cobertos por UI/testes;
 - frame benchmark: CPU p50 4,00 ms / p95 6,04 ms / p99 8,66 ms; wall p95 20,92 ms em 100k linhas;
-- 58 testes passando e clippy limpo.
+- 58 testes no fechamento do M1 (67 na suíte atual com M2) e clippy limpo.
 
 Limitações residuais (M1.1, sem bloquear M2):
 
@@ -57,24 +57,28 @@ Limitações residuais (M1.1, sem bloquear M2):
 - “select next occurrence” e column mode por teclado;
 - replace no projeto ignora buffers sujos.
 
-## M2 — Núcleo semântico Java (em andamento; fundação entregue)
+## M2 — Núcleo semântico Java (em andamento; completion/hover entregues)
 
 Entregue:
 
-- classpath Eclipse (`.classpath`), Maven (`pom.xml`, propriedades e repositório local), Gradle (coordenadas diretas) e JDK (`jmods`/`rt.jar`);
+- classpath Eclipse, Maven (direto + transitivo, parent, dependencyManagement/BOM, escopos, optional/exclusions) e Gradle (direto + transitivo);
+- JDK (`jmods`/`rt.jar`) escolhido pelo target do projeto (Maven/Gradle/Eclipse);
 - índice nativo de classes de JARs/JMODs, sem JVM, com campos, métodos, superclasse e interfaces;
 - Open Type com tipos externos; F3 em tipo do classpath abre o visualizador de metadados;
 - resolução de tipos por import, mesmo pacote, wildcard e `java.lang`;
 - diagnóstico de imports não resolvidos no painel Problemas;
-- base de inferência local e candidatos para completion de tipos.
+- inferência de variáveis (linhas anteriores, generics e arrays);
+- **completion de membros inline** por `.`/`Ctrl+Space`, com herança do classpath;
+- **hover semântico** de tipos, variáveis e símbolos;
+- referências textuais no projeto (`Ctrl+Shift+G`).
 
 Pendente:
 
-- dependências transitivas Maven/Gradle (grafo, escopos, exclusions, BOM);
-- escolha do JDK pelo `release`/`source`/`target` do projeto;
-- resolução completa de imports/escopos/herança/generics/overloads;
-- completion de membros inline, hover, find references e rename seguro;
-- diagnósticos semânticos nativos; fallback opcional para `javac`/JDT LS.
+- resolução completa de escopos/herança/generics/overloads e completion de retorno encadeado;
+- índice de referências semânticas e rename seguro;
+- diagnósticos semânticos nativos; fallback opcional para `javac`/JDT LS;
+- Gradle Tooling API, `platform(...)`/BOM e version catalogs;
+- watch de `pom.xml`/`.classpath`/`build.gradle` para recarregar classpath.
 
 Aceite final:
 
@@ -166,7 +170,7 @@ Aceite:
 |---|---:|---:|
 | M0 | concluído | — |
 | M1 | concluído | 3 |
-| M2 | em andamento (fundação entregue) | 15 |
+| M2 | em andamento (completion/hover entregues) | 15 |
 | M3 | 4–6 | 21 |
 | M4 | 4–6 | 27 |
 | M5 | 4–6 | 33 |
