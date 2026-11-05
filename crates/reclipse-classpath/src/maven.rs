@@ -346,6 +346,13 @@ impl Resolver {
         let mut dependencies = parent_pom
             .map(|pom| pom.dependencies.clone())
             .unwrap_or_default();
+        self.apply_active_profiles(
+            content,
+            &mut properties,
+            &mut management,
+            &mut dependencies,
+            depth,
+        );
         for dependencies_block in direct_children(content, "dependencies") {
             for dependency in direct_children(&dependencies_block, "dependency") {
                 let coordinate = coordinate_from_block(&dependency, &properties);
@@ -384,6 +391,175 @@ impl Resolver {
             management,
             dependencies,
         })
+    }
+
+    /// Evaluate `<profiles>` and merge the active ones into the model.
+    /// Activation supports `activeByDefault`, `jdk` ranges, `os` and
+    /// `property` (checked against effective properties, then env vars).
+    /// `RECLIPSE_JDK_VERSION` overrides the detected `java -version` major
+    /// (used by tests). Without a detectable JDK, `jdk` activation does not
+    /// match.
+    fn apply_active_profiles(
+        &mut self,
+        content: &str,
+        properties: &mut HashMap<String, String>,
+        management: &mut HashMap<String, Managed>,
+        dependencies: &mut Vec<Dependency>,
+        depth: usize,
+    ) {
+        let mut candidates: Vec<(String, bool, bool, String)> = Vec::new();
+        for profiles in direct_children(content, "profiles") {
+            for profile in direct_children(&profiles, "profile") {
+                let id = child_text(&profile, "id").unwrap_or_default();
+                let activation = direct_children(&profile, "activation")
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                let active_by_default = activation_block_flag(&activation, "activeByDefault");
+                let has_conditions = ["jdk", "os", "property", "file"]
+                    .iter()
+                    .any(|tag| activation.contains(&format!("<{tag}")));
+                let active = if has_conditions {
+                    self.profile_active(&activation, properties)
+                } else {
+                    // No explicit conditions: active only via activeByDefault.
+                    active_by_default
+                };
+                candidates.push((id, active, active_by_default, profile));
+            }
+        }
+        // JLS-ish `activeByDefault` rule: a default-active profile stays off
+        // when any sibling profile activates through other conditions.
+        let any_non_default_active = candidates
+            .iter()
+            .any(|(_, active, by_default, _)| *active && !by_default);
+        for (id, active, by_default, profile) in candidates {
+            if !active {
+                continue;
+            }
+            if by_default && any_non_default_active && !profile_has_conditions(&profile) {
+                continue;
+            }
+            // Profile properties win over inherited ones for substitution below.
+            for (key, value) in parse_properties(&profile) {
+                properties.insert(key, value);
+            }
+            let mut imported: HashMap<String, Managed> = HashMap::new();
+            let mut declared: HashMap<String, Managed> = HashMap::new();
+            for block in direct_children(&profile, "dependencyManagement") {
+                for dependencies_block in direct_children(&block, "dependencies") {
+                    for dependency in direct_children(&dependencies_block, "dependency") {
+                        let scope = child_text(&dependency, "scope").unwrap_or_default();
+                        let dependency_type =
+                            child_text(&dependency, "type").unwrap_or_else(|| "jar".to_owned());
+                        if scope == "import" && dependency_type == "pom" {
+                            let coordinate = coordinate_from_block(&dependency, properties);
+                            if let Some(bom) = self.load_pom_coordinate(&coordinate, depth + 1) {
+                                for (key, managed) in bom.management {
+                                    imported.insert(key, managed);
+                                }
+                            } else {
+                                self.warn(format!(
+                                    "BOM de perfil não encontrado no repositório local: {}",
+                                    coordinate.full()
+                                ));
+                            }
+                        } else if let Some((key, managed)) =
+                            managed_from_block(&dependency, properties)
+                        {
+                            declared.insert(key, managed);
+                        }
+                    }
+                }
+            }
+            for (key, managed) in imported {
+                management.insert(key, managed);
+            }
+            // Explicit entries (profile or main) win over imported BOMs.
+            management.extend(declared);
+            for dependencies_block in direct_children(&profile, "dependencies") {
+                for dependency in direct_children(&dependencies_block, "dependency") {
+                    let coordinate = coordinate_from_block(&dependency, properties);
+                    if coordinate.group.is_empty() || coordinate.artifact.is_empty() {
+                        continue;
+                    }
+                    dependencies.push(Dependency {
+                        coordinate,
+                        scope: child_text(&dependency, "scope")
+                            .map(|value| substitute(&value, properties))
+                            .unwrap_or_else(|| "compile".to_owned()),
+                        optional: child_text(&dependency, "optional")
+                            .is_some_and(|value| value == "true"),
+                        dependency_type: child_text(&dependency, "type")
+                            .unwrap_or_else(|| "jar".to_owned()),
+                        exclusions: parse_exclusions(&dependency, properties),
+                    });
+                }
+            }
+            let _ = id;
+        }
+    }
+
+    fn profile_active(&mut self, activation: &str, properties: &HashMap<String, String>) -> bool {
+        if activation.contains("<file>") {
+            // File-based activation (exists/missing) is relative to ad-hoc
+            // working directories here; conservatively not matched.
+            return false;
+        }
+        if let Some(jdk) = child_text(activation, "jdk") {
+            let Some(major) = self.jdk_major_for_profiles() else {
+                return false;
+            };
+            if !jdk_range_matches(jdk.trim(), major) {
+                return false;
+            }
+        }
+        if let Some(os) = direct_children(activation, "os").into_iter().next() {
+            if !os_matches(&os) {
+                return false;
+            }
+        }
+        if let Some(property) = direct_children(activation, "property").into_iter().next() {
+            let name = child_text(&property, "name").unwrap_or_default();
+            if name.is_empty() {
+                return false;
+            }
+            let expected = child_text(&property, "value");
+            let actual = properties
+                .get(&name)
+                .cloned()
+                .or_else(|| std::env::var(&name).ok());
+            match (actual, expected) {
+                (Some(actual), Some(expected)) => {
+                    if substitute(&actual, properties) != substitute(&expected, properties) {
+                        return false;
+                    }
+                }
+                (Some(_), None) => {}
+                (None, _) => return false,
+            }
+        }
+        true
+    }
+
+    fn jdk_major_for_profiles(&mut self) -> Option<u32> {
+        if let Ok(override_value) = std::env::var("RECLIPSE_JDK_VERSION") {
+            if let Some(major) = parse_java_major(&override_value) {
+                return Some(major);
+            }
+        }
+        let output = std::process::Command::new("java")
+            .arg("-version")
+            .output()
+            .ok()?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // `openjdk version "17.0.9" ...` or `java version "1.8.0_361"`.
+        let quoted = text.split('"').nth(1).unwrap_or("");
+        parse_java_major(quoted)
     }
 
     fn load_parent(
@@ -509,6 +685,96 @@ impl Pom {
         }
         result
     }
+}
+
+fn activation_block_flag(activation: &str, flag: &str) -> bool {
+    child_text(activation, flag).is_some_and(|value| value.trim() == "true")
+}
+
+fn profile_has_conditions(profile: &str) -> bool {
+    let Some(activation) = direct_children(profile, "activation").into_iter().next() else {
+        return false;
+    };
+    ["jdk", "os", "property", "file"]
+        .iter()
+        .any(|tag| activation.contains(&format!("<{tag}")))
+}
+
+fn parse_java_major(version: &str) -> Option<u32> {
+    let numbers: Vec<u32> = version
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse().ok())
+        .collect();
+    match numbers.as_slice() {
+        [] => None,
+        [1, second, ..] => Some(*second),
+        [first, ..] => Some(*first),
+    }
+}
+
+/// Match Maven `jdk` activation ranges (`17`, `[17,)`, `[11,17)`, `1.8`).
+fn jdk_range_matches(range: &str, major: u32) -> bool {
+    let range = range.trim();
+    if range.is_empty() {
+        return false;
+    }
+    if !(range.starts_with('[') || range.starts_with('(')) {
+        return parse_java_major(range) == Some(major);
+    }
+    let lower_inclusive = range.starts_with('[');
+    let upper_inclusive = range.ends_with(']');
+    let inner = range
+        .trim_start_matches(['[', '('])
+        .trim_end_matches([']', ')']);
+    let (lower, upper) = match inner.split_once(',') {
+        Some((lower, upper)) => (lower.trim(), upper.trim()),
+        None => (inner.trim(), ""),
+    };
+    if !lower.is_empty() {
+        if let Some(low) = parse_java_major(lower) {
+            if major < low || (major == low && !lower_inclusive) {
+                return false;
+            }
+        }
+    }
+    if !upper.is_empty() {
+        if let Some(high) = parse_java_major(upper) {
+            if major > high || (major == high && !upper_inclusive) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn os_matches(os: &str) -> bool {
+    const OS: &str = std::env::consts::OS;
+    const ARCH: &str = std::env::consts::ARCH;
+    let family = if OS == "windows" { "windows" } else { "unix" };
+    let mut ok = true;
+    if let Some(name) = child_text(os, "name") {
+        ok &= OS.contains(&name.to_lowercase());
+    }
+    if let Some(family_expected) = child_text(os, "family") {
+        let expected = family_expected.to_lowercase();
+        ok &= family == expected
+            || (expected == "mac" && OS == "macos")
+            || (expected == "unix" && (OS == "linux" || OS == "macos"));
+    }
+    if let Some(arch) = child_text(os, "arch") {
+        let arch = arch.to_lowercase();
+        let normalized = ARCH.to_lowercase();
+        ok &= normalized.contains(&arch)
+            || (arch.contains("amd64") && normalized == "x86_64")
+            || (arch.contains("x86_64") && normalized == "amd64")
+            || (arch.contains("aarch64") && normalized == "aarch64");
+    }
+    if let Some(version) = child_text(os, "version") {
+        // Best-effort: only the OS family name is compared here.
+        ok &= OS.contains(&version.to_lowercase());
+    }
+    ok
 }
 
 fn coordinate_from_block(block: &str, properties: &HashMap<String, String>) -> Coordinate {
@@ -1009,5 +1275,81 @@ mod tests {
         let resolution = resolve_pom(&root, &repo);
         assert_eq!(resolution.dependencies, vec!["com.acme:dep:7.0".to_owned()]);
         assert_eq!(resolution.jars.len(), 1);
+    }
+
+    #[test]
+    fn applies_active_by_default_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let root = dir.path().join("pom.xml");
+        write_jar(&repo, "com.acme", "prof-dep", "1.0");
+        write_pom(&repo, "com.acme", "prof-dep", "1.0", "");
+        fs::write(
+            &root,
+            "<project><modelVersion>4.0.0</modelVersion>\
+             <groupId>local</groupId><artifactId>app</artifactId><version>1.0</version>\
+             <profiles><profile><id>extra</id>\
+             <activation><activeByDefault>true</activeByDefault></activation>\
+             <dependencies><dependency><groupId>com.acme</groupId>\
+             <artifactId>prof-dep</artifactId><version>1.0</version></dependency></dependencies>\
+             </profile></profiles></project>",
+        )
+        .unwrap();
+
+        let resolution = resolve_pom(&root, &repo);
+        assert_eq!(
+            resolution.dependencies,
+            vec!["com.acme:prof-dep:1.0".to_owned()]
+        );
+    }
+
+    #[test]
+    fn applies_jdk_and_property_profile_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let root = dir.path().join("pom.xml");
+        write_jar(&repo, "com.acme", "jdk-dep", "2.0");
+        write_jar(&repo, "com.acme", "prop-dep", "3.0");
+        write_pom(&repo, "com.acme", "jdk-dep", "2.0", "");
+        write_pom(&repo, "com.acme", "prop-dep", "3.0", "");
+        fs::write(
+            &root,
+            "<project><modelVersion>4.0.0</modelVersion>\
+             <groupId>local</groupId><artifactId>app</artifactId><version>1.0</version>\
+             <properties><db>postgres</db></properties>\
+             <profiles>\
+             <profile><id>on-jdk</id><activation><jdk>[17,)</jdk></activation>\
+             <dependencies><dependency><groupId>com.acme</groupId>\
+             <artifactId>jdk-dep</artifactId><version>2.0</version></dependency></dependencies>\
+             </profile>\
+             <profile><id>on-prop</id>\
+             <activation><property><name>db</name><value>postgres</value></property></activation>\
+             <properties><prop.version>3.0</prop.version></properties>\
+             <dependencies><dependency><groupId>com.acme</groupId>\
+             <artifactId>prop-dep</artifactId><version>${prop.version}</version></dependency></dependencies>\
+             </profile>\
+             <profile><id>never</id><activation><jdk>[99,)</jdk></activation>\
+             <dependencies><dependency><groupId>com.acme</groupId>\
+             <artifactId>nope</artifactId><version>9.9</version></dependency></dependencies>\
+             </profile>\
+             </profiles></project>",
+        )
+        .unwrap();
+
+        std::env::set_var("RECLIPSE_JDK_VERSION", "21");
+        let resolution = resolve_pom(&root, &repo);
+        std::env::remove_var("RECLIPSE_JDK_VERSION");
+        assert!(resolution
+            .dependencies
+            .iter()
+            .any(|dep| dep == "com.acme:jdk-dep:2.0"));
+        assert!(resolution
+            .dependencies
+            .iter()
+            .any(|dep| dep == "com.acme:prop-dep:3.0"));
+        assert!(!resolution
+            .dependencies
+            .iter()
+            .any(|dep| dep.contains("nope")));
     }
 }

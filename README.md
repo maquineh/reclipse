@@ -110,8 +110,8 @@ Dois editores lado a lado com abas arrastáveis:
 
 Este MVP é deliberadamente honesto sobre o escopo:
 
-- Compila e executa `main` via `javac`/`java`, mas ainda não roda testes JUnit, não depura (JDWP/JDI) e não executa ciclos de build Maven/Gradle completos.
-- A semântica Java cobre imports/tipos, completion de membros, hover, referências semânticas de tipos/membros e rename conservador, mas ainda não tem resolução completa de generics/overloads, desambiguação de static imports concorrentes ou rename de membros do classpath. Tipos locais são detectados; tipos anônimos ainda não são modelados.
+- Compila e executa `main` via `javac`/`java` com launch config, e roda `mvn test`/`gradle test` com parser, mas ainda não depura (JDWP/JDI) e não executa ciclos de build Maven/Gradle completos.
+- A semântica Java cobre imports/tipos, completion de membros, hover, referências semânticas de tipos/membros, rename conservador, overloads por tipo, type variables com substituição e diagnósticos nativos (tipos/membros não resolvidos, `@Override`, static ambíguo) além do `javac` em fundo; faltam apenas refinamentos (overloads finos por subtipo, Javadoc, modo JDT opt-in). Tipos locais são detectados; tipos anônimos ainda não são modelados.
 - Rename não reescreve Javadoc, strings, configuração por reflexão ou nomes em arquivos de recursos; overrides/implementações e locais sombreados são recusados por segurança, e o rename de workspace exige buffers Java salvos.
 - Maven/Gradle resolvem dependências transitivas do repositório local; não há download, perfis Maven nem Tooling API/bundles avançados do Gradle.
 - Multi-cursor agrupa undo de digitação, mas backspace/delete multi ainda são por tecla.
@@ -238,7 +238,7 @@ Detalhes técnicos, métricas e limitações: [docs/M1.md](docs/M1.md).
 
 O M2 cobre classpath Eclipse/Maven/Gradle/JDK com dependências transitivas, escolha de JDK pelo target, índice nativo de classes de JARs/JMODs, Open Type com tipos externos, F3 abrindo metadados do classpath e diagnóstico de imports não resolvidos.
 
-A camada semântica adiciona inferência de variáveis (inclusive generics, arrays e `var`), completion de membros inline com herança de tipos do projeto e do classpath, tipos de retorno encadeados, hover de tipos/variáveis, referências semânticas de tipos/métodos/campos (com static imports) e rename conservador com atualização de imports e arquivo. Ainda faltam generics/overloads completos, desambiguação de static imports concorrentes e diagnósticos do javac/JDT. Plano e limitações: [docs/M2.md](docs/M2.md).
+A camada semântica adiciona inferência de variáveis (inclusive generics, arrays e `var`), completion de membros inline com herança de tipos do projeto e do classpath, tipos de retorno encadeados com type arguments, hover de tipos/variáveis, referências semânticas de tipos/métodos/campos (com precedência de static imports) e rename conservador com atualização de imports e arquivo. Plano e limitações: [docs/M2.md](docs/M2.md).
 
 ![Classpath e índice de tipos](docs/screenshot-classpath.png)
 

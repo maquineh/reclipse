@@ -1,15 +1,17 @@
-//! Minimal M3 build/run layer: compile the project with `javac` and run a
-//! detected `main` class with `java`.
+//! M3 build/run/test layer: javac fallback, launch configs, cancellable
+//! processes, resources and Maven/Gradle test parsing.
 //!
 //! This is intentionally a *fallback*: it uses the resolved classpath and the
 //! project source files, does not interpret build lifecycles (Maven/Gradle
 //! plugins, resources, tests) and expects a JDK with `javac`/`java`.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use reclipse_classpath::ClasspathIndex;
 use reclipse_core::Project;
@@ -30,6 +32,72 @@ impl BuildEnv {
             jdk_target: index.stats.jdk_target,
         }
     }
+}
+
+/// Launch configuration: which main to run and with what args/env.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LaunchConfig {
+    pub main_class: String,
+    pub program_args: String,
+    pub jvm_args: String,
+    pub env_vars: String,
+}
+
+impl LaunchConfig {
+    pub fn program_args_list(&self) -> Vec<String> {
+        split_args(&self.program_args)
+    }
+
+    pub fn jvm_args_list(&self) -> Vec<String> {
+        split_args(&self.jvm_args)
+    }
+
+    pub fn env_map(&self) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        for line in self.env_vars.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                let key = key.trim();
+                if !key.is_empty() {
+                    map.insert(key.to_owned(), value.trim().to_owned());
+                }
+            }
+        }
+        map
+    }
+}
+
+pub fn split_args(raw: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut chars = raw.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    while let Some(character) = chars.next() {
+        match character {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '\\' if chars.peek().is_some() => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            character if character.is_whitespace() && !in_single && !in_double => {
+                if !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+            }
+            character => current.push(character),
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +125,44 @@ pub struct RunResult {
     pub elapsed_ms: u128,
 }
 
-pub fn compile(project: &Project, env: &BuildEnv) -> Result<CompileResult, String> {
+#[derive(Debug, Clone, Default)]
+pub struct TestFailure {
+    pub file: PathBuf,
+    pub line: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TestSummary {
+    pub total: usize,
+    pub failures: usize,
+    pub errors: usize,
+    pub skipped: usize,
+    pub failures_detail: Vec<TestFailure>,
+}
+
+#[derive(Debug)]
+pub struct TestResult {
+    pub success: bool,
+    pub tool: String,
+    pub summary: TestSummary,
+    pub output: String,
+    pub elapsed_ms: u128,
+}
+
+pub fn compile(
+    project: &Project,
+    env: &BuildEnv,
+    cancel: &AtomicBool,
+) -> Result<CompileResult, String> {
+    compile_inner(project, env, cancel)
+}
+
+fn compile_inner(
+    project: &Project,
+    env: &BuildEnv,
+    cancel: &AtomicBool,
+) -> Result<CompileResult, String> {
     let started = Instant::now();
     let javac = jdk_binary(env.jdk_home.as_deref(), "javac")?;
     let classes_dir = tempfile::Builder::new()
@@ -86,6 +191,9 @@ pub fn compile(project: &Project, env: &BuildEnv) -> Result<CompileResult, Strin
         .iter()
         .filter(|source| !is_test_source(source))
     {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("compilação cancelada".to_owned());
+        }
         args.push(quote_path(source));
         source_count += 1;
     }
@@ -96,49 +204,188 @@ pub fn compile(project: &Project, env: &BuildEnv) -> Result<CompileResult, Strin
     }
     fs::write(&argfile, args.join("\n"))
         .map_err(|error| format!("não foi possível escrever argumentos do javac: {error}"))?;
-    let output = Command::new(&javac)
-        .arg(format!("@{}", argfile.display()))
-        .output()
-        .map_err(|error| format!("falha ao executar {}: {error}", javac.display()))?;
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(CompileResult {
-        success: output.status.success(),
+    let output = run_piped(
+        &javac,
+        &[format!("@{}", argfile.display())],
+        &HashMap::new(),
+        &project.root,
+        cancel,
+    )
+    .map_err(|error| format!("falha ao executar {}: {error}", javac.display()))?;
+    if cancel.load(Ordering::SeqCst) {
+        return Err("compilação cancelada".to_owned());
+    }
+    let copied = copy_resources(project, classes_dir.path()).unwrap_or(0);
+    let combined = output.combined;
+    let mut result = CompileResult {
+        success: output.status_success,
         diagnostics: parse_javac_output(&combined),
-        output: combined,
+        output: if copied > 0 {
+            format!("{combined}\nresources: {copied} arquivo(s) copiado(s)")
+        } else {
+            combined
+        },
         elapsed_ms: started.elapsed().as_millis(),
         classes_dir,
-    })
+    };
+    if cancel.load(Ordering::SeqCst) {
+        result.success = false;
+        result.output.push_str("\ncompilação cancelada");
+        return Err("compilação cancelada".to_owned());
+    }
+    Ok(result)
+}
+
+/// Resource roots copied next to compiled classes (`src/main/resources`).
+pub fn resource_roots(project: &Project) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for candidate in ["src/main/resources", "src/test/resources", "resources"] {
+        let path = project.root.join(candidate);
+        if path.is_dir() {
+            roots.push(path);
+        }
+    }
+    roots
+}
+
+/// Copy `src/main/resources` into `classes_dir`, preserving relative paths.
+pub fn copy_resources(project: &Project, classes_dir: &Path) -> Result<usize, String> {
+    let mut copied = 0;
+    for root in resource_roots(project) {
+        if !root.ends_with("src/test/resources") && !root.ends_with("resources") {
+            // Copy main resources; test resources only matter for tests.
+        }
+        if root.ends_with("src/test/resources") {
+            continue;
+        }
+        let entries = walkdir_files(&root);
+        for file in entries {
+            let Ok(relative) = file.strip_prefix(&root) else {
+                continue;
+            };
+            let target = classes_dir.join(relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("falha ao criar {}: {error}", parent.display()))?;
+            }
+            fs::copy(&file, &target)
+                .map_err(|error| format!("falha ao copiar {}: {error}", file.display()))?;
+            copied += 1;
+        }
+    }
+    Ok(copied)
+}
+
+fn walkdir_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    out
 }
 
 pub fn run_main(
     main_class: &str,
+    launch: &LaunchConfig,
     env: &BuildEnv,
     compiled: &CompileResult,
+    project_root: &Path,
+    cancel: &AtomicBool,
 ) -> Result<RunResult, String> {
     let started = Instant::now();
     let java = jdk_binary(env.jdk_home.as_deref(), "java")?;
-    let mut entries = Vec::with_capacity(env.jars.len() + 1);
+    let mut entries = Vec::with_capacity(env.jars.len() + 2);
     entries.push(compiled.classes_dir.path().to_path_buf());
+    let target_classes = project_root.join("target/classes");
+    if target_classes.is_dir() {
+        entries.push(target_classes);
+    }
     entries.extend(env.jars.iter().cloned());
-    let output = Command::new(&java)
-        .arg("-cp")
-        .arg(join_classpath(&entries))
-        .arg(main_class)
-        .output()
+    let mut args = vec![
+        "-cp".to_owned(),
+        join_classpath(&entries).display().to_string(),
+    ];
+    args.extend(launch.jvm_args_list());
+    args.push(main_class.to_owned());
+    args.extend(launch.program_args_list());
+    let output = run_piped(&java, &args, &launch.env_map(), project_root, cancel)
         .map_err(|error| format!("falha ao executar {}: {error}", java.display()))?;
     Ok(RunResult {
-        success: output.status.success(),
-        output: format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ),
+        success: output.status_success && !cancel.load(Ordering::SeqCst),
+        output: output.combined,
         elapsed_ms: started.elapsed().as_millis(),
     })
+}
+
+struct PipedOutput {
+    status_success: bool,
+    combined: String,
+}
+
+fn run_piped(
+    program: &Path,
+    args: &[String],
+    env: &HashMap<String, String>,
+    workdir: &Path,
+    cancel: &AtomicBool,
+) -> Result<PipedOutput, String> {
+    let out_file = tempfile::Builder::new()
+        .prefix("reclipse-out-")
+        .tempfile()
+        .map_err(|error| format!("falha ao criar arquivo de saída: {error}"))?;
+    let out_path = out_file.path().to_path_buf();
+    // Keep the handle alive until the child exits.
+    let _keep = out_file;
+    let stdout = std::fs::File::create(&out_path)
+        .map_err(|error| format!("falha ao criar saída: {error}"))?;
+    let stderr = stdout
+        .try_clone()
+        .map_err(|error| format!("falha ao clonar saída: {error}"))?;
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(workdir)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("falha ao iniciar {}: {error}", program.display()))?;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let combined = fs::read_to_string(&out_path).unwrap_or_default();
+            return Ok(PipedOutput {
+                status_success: false,
+                combined: format!("{combined}\nexecução cancelada"),
+            });
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let combined = fs::read_to_string(&out_path).unwrap_or_default();
+                return Ok(PipedOutput {
+                    status_success: status.success(),
+                    combined,
+                });
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(error) => return Err(format!("falha ao aguardar processo: {error}")),
+        }
+    }
 }
 
 /// Discover fully-qualified `main` classes from the syntax index.
@@ -207,6 +454,70 @@ pub fn parse_javac_output(output: &str) -> Vec<JavacDiagnostic> {
     diagnostics
 }
 
+/// Try to find `File.java:123` inside a log line for clickable hyperlinks.
+pub fn parse_file_link(line: &str, project_root: Option<&Path>) -> Option<(PathBuf, usize)> {
+    let mut best: Option<(usize, PathBuf, usize)> = None;
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    while let Some(found) = line[index..].find(".java") {
+        let java_end = index + found + ".java".len();
+        let mut cursor = java_end;
+        let mut line_number: Option<usize> = None;
+        if bytes.get(cursor) == Some(&b':') {
+            cursor += 1;
+            let start = cursor;
+            while cursor < line.len() && bytes[cursor].is_ascii_digit() {
+                cursor += 1;
+            }
+            if start != cursor {
+                line_number = line[start..cursor].parse().ok();
+            }
+        }
+        let Some(line_number) = line_number else {
+            index = java_end;
+            continue;
+        };
+        let mut start = java_end.saturating_sub(".java".len());
+        while start > 0 {
+            let character = line.as_bytes()[start - 1] as char;
+            if character.is_whitespace() || matches!(character, '"' | '\'' | '(' | '[' | '<' | '|')
+            {
+                break;
+            }
+            start -= 1;
+        }
+        let mut file = line[start..java_end].trim().to_owned();
+        file = file
+            .trim_start_matches('[')
+            .trim_start_matches('(')
+            .to_owned();
+        if file.is_empty() {
+            index = cursor;
+            continue;
+        }
+        let path = PathBuf::from(&file);
+        let resolved = if path.is_absolute() {
+            path
+        } else if let Some(root) = project_root {
+            root.join(&path)
+        } else {
+            path
+        };
+        // Prefer the rightmost (most specific) match, like stack traces.
+        if best
+            .as_ref()
+            .is_none_or(|(position, _, _)| java_end >= *position)
+        {
+            best = Some((java_end, resolved, line_number));
+        }
+        index = cursor.max(java_end);
+        if index >= line.len() {
+            break;
+        }
+    }
+    best.map(|(_, path, line)| (path, line))
+}
+
 pub fn join_classpath(entries: &[PathBuf]) -> PathBuf {
     let separator = if cfg!(windows) { ";" } else { ":" };
     let mut joined = OsString::new();
@@ -231,7 +542,7 @@ fn jdk_binary(home: Option<&Path>, name: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(name))
 }
 
-fn is_test_source(path: &Path) -> bool {
+pub fn is_test_source(path: &Path) -> bool {
     let normalized = path.to_string_lossy().replace('\\', "/");
     normalized.contains("/src/test/") || normalized.contains("/src/test/java/")
 }
@@ -241,6 +552,214 @@ fn quote_path(path: &Path) -> String {
     // (accepted on Windows) and quote paths with spaces.
     let display = path.display().to_string().replace('\\', "/");
     format!("\"{display}\"")
+}
+
+// ---------------------------------------------------------------------------
+// Maven / Gradle tests
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestTool {
+    Maven,
+    Gradle,
+}
+
+pub fn detect_test_tool(project: &Project) -> Option<(TestTool, PathBuf)> {
+    if project.root.join("pom.xml").is_file() {
+        if let Some(binary) =
+            find_wrapper(&project.root, &["mvnw.cmd", "mvnw"], &["mvn.cmd", "mvn"])
+        {
+            return Some((TestTool::Maven, binary));
+        }
+        return Some((TestTool::Maven, PathBuf::from("mvn")));
+    }
+    if project.root.join("build.gradle").is_file()
+        || project.root.join("build.gradle.kts").is_file()
+    {
+        if let Some(binary) = find_wrapper(
+            &project.root,
+            &["gradlew.bat", "gradlew"],
+            &["gradle.bat", "gradle"],
+        ) {
+            return Some((TestTool::Gradle, binary));
+        }
+        return Some((TestTool::Gradle, PathBuf::from("gradle")));
+    }
+    None
+}
+
+fn find_wrapper(root: &Path, wrappers: &[&str], fallbacks: &[&str]) -> Option<PathBuf> {
+    for name in wrappers {
+        let candidate = root.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    for name in fallbacks {
+        let candidate = root.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+pub fn run_tests(
+    project: &Project,
+    env: &HashMap<String, String>,
+    cancel: &AtomicBool,
+) -> Result<TestResult, String> {
+    let started = Instant::now();
+    let Some((tool, binary)) = detect_test_tool(project) else {
+        return Err("nenhum pom.xml ou build.gradle encontrado para testes".to_owned());
+    };
+    let (args, label) = match tool {
+        TestTool::Maven => (
+            vec!["-B".to_owned(), "test".to_owned()],
+            "mvn test".to_owned(),
+        ),
+        TestTool::Gradle => (
+            vec![
+                "test".to_owned(),
+                "--console=plain".to_owned(),
+                "-q".to_owned(),
+            ],
+            "gradle test".to_owned(),
+        ),
+    };
+    let output = run_piped(&binary, &args, env, &project.root, cancel)
+        .map_err(|error| format!("falha ao executar {label}: {error}"))?;
+    let summary = parse_test_output(&output.combined);
+    Ok(TestResult {
+        success: output.status_success
+            && summary.errors == 0
+            && summary.failures == 0
+            && !cancel.load(Ordering::SeqCst),
+        tool: label,
+        summary,
+        output: output.combined,
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+#[derive(Debug)]
+pub struct ResolveResult {
+    pub success: bool,
+    pub tool: String,
+    pub output: String,
+    pub elapsed_ms: u128,
+}
+
+/// Download dependencies into the local repository using the project's own
+/// build tool (`mvn dependency:resolve` / `gradle dependencies`).
+/// Offline-first: this is the only operation that touches the network, and it
+/// only runs on explicit user request.
+pub fn resolve_dependencies(
+    project: &Project,
+    env: &HashMap<String, String>,
+    cancel: &AtomicBool,
+) -> Result<ResolveResult, String> {
+    let started = Instant::now();
+    let Some((tool, binary)) = detect_test_tool(project) else {
+        return Err("nenhum pom.xml ou build.gradle encontrado".to_owned());
+    };
+    let (args, label) = match tool {
+        TestTool::Maven => (
+            vec![
+                "-B".to_owned(),
+                "dependency:resolve".to_owned(),
+                "-q".to_owned(),
+            ],
+            "mvn dependency:resolve".to_owned(),
+        ),
+        TestTool::Gradle => (
+            vec![
+                "dependencies".to_owned(),
+                "--configuration".to_owned(),
+                "runtimeClasspath".to_owned(),
+                "--console=plain".to_owned(),
+                "-q".to_owned(),
+            ],
+            "gradle dependencies".to_owned(),
+        ),
+    };
+    let output = run_piped(&binary, &args, env, &project.root, cancel)
+        .map_err(|error| format!("falha ao executar {label}: {error}"))?;
+    Ok(ResolveResult {
+        success: output.status_success && !cancel.load(Ordering::SeqCst),
+        tool: label,
+        output: output.combined,
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+pub fn parse_test_output(output: &str) -> TestSummary {
+    let mut summary = TestSummary::default();
+    for line in output.lines() {
+        if let Some(parsed) = parse_surefire_summary(line) {
+            summary.total += parsed.0;
+            summary.failures += parsed.1;
+            summary.errors += parsed.2;
+            summary.skipped += parsed.3;
+        }
+        if let Some(failure) = parse_test_failure(line) {
+            summary.failures_detail.push(failure);
+        }
+        if summary.failures_detail.len() >= 200 {
+            break;
+        }
+    }
+    summary
+}
+
+fn parse_surefire_summary(line: &str) -> Option<(usize, usize, usize, usize)> {
+    let marker = line.find("Tests run:")?;
+    let rest = &line[marker + "Tests run:".len()..];
+    let mut numbers = Vec::new();
+    let mut current = String::new();
+    for character in rest.chars() {
+        if character.is_ascii_digit() {
+            current.push(character);
+        } else if !current.is_empty() {
+            if let Ok(value) = current.parse::<usize>() {
+                numbers.push(value);
+            }
+            current.clear();
+            if numbers.len() >= 4 {
+                break;
+            }
+        }
+    }
+    if !current.is_empty() {
+        if let Ok(value) = current.parse::<usize>() {
+            numbers.push(value);
+        }
+    }
+    if numbers.len() < 4 {
+        return None;
+    }
+    Some((numbers[0], numbers[1], numbers[2], numbers[3]))
+}
+
+fn parse_test_failure(line: &str) -> Option<TestFailure> {
+    let trimmed = line.trim();
+    let stripped = trimmed.strip_prefix("[ERROR]").unwrap_or(trimmed).trim();
+    // Maven surefire: `com.FooTest.test -- Time elapsed ... <<< FAILURE!`
+    // Gradle: `com.FooTest > test FAILED`
+    let candidate = if stripped.contains("FAILURE")
+        || stripped.contains("FAILED")
+        || stripped.starts_with("at ")
+    {
+        stripped.to_owned()
+    } else {
+        return None;
+    };
+    let (file, line_number) = parse_file_link(&candidate, None)?;
+    Some(TestFailure {
+        file,
+        line: line_number,
+        message: candidate.chars().take(240).collect(),
+    })
 }
 
 #[cfg(test)]
@@ -294,9 +813,11 @@ public class Hello {
             jdk_home: Some(jdk.home),
             jdk_target: None,
         };
-        let compiled = compile(&project, &env).unwrap();
+        let cancel = AtomicBool::new(false);
+        let compiled = compile(&project, &env, &cancel).unwrap();
         assert!(compiled.success, "javac output: {}", compiled.output);
-        let run = run_main("Hello", &env, &compiled).unwrap();
+        let launch = LaunchConfig::default();
+        let run = run_main("Hello", &launch, &env, &compiled, dir.path(), &cancel).unwrap();
         assert!(run.success, "java output: {}", run.output);
         assert!(run.output.contains("reclipse-ok"));
     }
@@ -321,5 +842,65 @@ public class Hello {
         };
         let index = ProjectIndex::from_files(project, vec![app, other], 0);
         assert_eq!(main_classes(&index), vec!["com.acme.App".to_owned()]);
+    }
+
+    #[test]
+    fn splits_launch_args_respecting_quotes() {
+        assert_eq!(
+            split_args(r#"--name "Ada Lovelace" -Dkey='a b'"#),
+            vec!["--name", "Ada Lovelace", "-Dkey=a b"]
+        );
+        assert!(split_args("").is_empty());
+    }
+
+    #[test]
+    fn parses_launch_env_map() {
+        let launch = LaunchConfig {
+            env_vars: "JAVA_OPTS=-Xmx1g\n# comment\nEMPTY=\nINVALID".to_owned(),
+            ..LaunchConfig::default()
+        };
+        let map = launch.env_map();
+        assert_eq!(map.get("JAVA_OPTS").map(String::as_str), Some("-Xmx1g"));
+        assert_eq!(map.get("EMPTY").map(String::as_str), Some(""));
+        assert!(!map.contains_key("INVALID"));
+    }
+
+    #[test]
+    fn finds_file_hyperlinks_in_logs() {
+        let (file, line) = parse_file_link("at com.acme.App.main(App.java:42)", None).unwrap();
+        assert_eq!(file, PathBuf::from("App.java"));
+        assert_eq!(line, 42);
+        let (file, line) = parse_file_link(
+            r"C:\work\demo\src\App.java:12: error: cannot find symbol",
+            None,
+        )
+        .unwrap();
+        assert_eq!(line, 12);
+        assert!(file.ends_with("App.java"));
+    }
+
+    #[test]
+    fn parses_surefire_summary_and_failures() {
+        let output = r#"
+[INFO] Tests run: 5, Failures: 1, Errors: 0, Skipped: 1
+[ERROR]   com.acme.AppTest.shouldWork -- Time elapsed: 0.01 s <<< FAILURE!
+[ERROR] at com.acme.AppTest.shouldWork(AppTest.java:27)
+"#;
+        let summary = parse_test_output(output);
+        assert_eq!(summary.total, 5);
+        assert_eq!(summary.failures, 1);
+        assert_eq!(summary.skipped, 1);
+        assert!(!summary.failures_detail.is_empty());
+    }
+
+    #[test]
+    fn detects_maven_and_gradle_wrappers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pom.xml"), "<project/>").unwrap();
+        std::fs::write(dir.path().join("mvnw.cmd"), "mvnw").unwrap();
+        let project = reclipse_core::discover_project(dir.path()).unwrap();
+        let (tool, binary) = detect_test_tool(&project).unwrap();
+        assert_eq!(tool, TestTool::Maven);
+        assert!(binary.ends_with("mvnw.cmd"));
     }
 }

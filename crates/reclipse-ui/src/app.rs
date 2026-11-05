@@ -3,7 +3,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, TryRecvError},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -54,6 +58,14 @@ enum BuildMessage {
         run: build::RunResult,
         main: String,
     },
+    TestsFinished(Box<build::TestResult>),
+    External {
+        label: String,
+        success: bool,
+        output: String,
+        elapsed_ms: u128,
+        reindex_classpath: bool,
+    },
     Failed(String),
 }
 
@@ -69,6 +81,22 @@ enum ClasspathStatus {
 struct SemanticProblem {
     file: PathBuf,
     line: usize,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JdtlsStatus {
+    Disabled,
+    Starting,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct JdtProblem {
+    file: PathBuf,
+    line: usize,
+    column: usize,
     message: String,
 }
 
@@ -216,7 +244,23 @@ pub struct ReclipseApp {
     main_classes: Vec<String>,
     build_running: bool,
     build_rx: Option<Receiver<BuildMessage>>,
+    build_cancel: Option<Arc<AtomicBool>>,
+    build_label: Option<String>,
+    javac_diag_pending_at: Option<Instant>,
+    javac_diag_rx: Option<Receiver<build::CompileResult>>,
+    javac_diag_cancel: Option<Arc<AtomicBool>>,
+    javac_missing_warned: bool,
+    jdtls: Option<crate::jdtls::JdtlsHandle>,
+    jdtls_status: JdtlsStatus,
+    jdtls_status_message: Option<String>,
+    jdtls_problems: Vec<JdtProblem>,
+    jdtls_versions: HashMap<PathBuf, i32>,
+    jdtls_failed_notified: bool,
     last_build: Option<(bool, u128)>,
+    last_run_main: Option<String>,
+    launch: build::LaunchConfig,
+    launch_open: bool,
+    test_failures: Vec<build::TestFailure>,
     classpath_view: Option<String>,
     classpath_source: Option<(String, String)>,
     classpath_reload_at: Option<Instant>,
@@ -291,7 +335,23 @@ impl ReclipseApp {
             main_classes: Vec::new(),
             build_running: false,
             build_rx: None,
+            build_cancel: None,
+            build_label: None,
+            javac_diag_pending_at: None,
+            javac_diag_rx: None,
+            javac_diag_cancel: None,
+            javac_missing_warned: false,
+            jdtls: None,
+            jdtls_status: JdtlsStatus::Disabled,
+            jdtls_status_message: None,
+            jdtls_problems: Vec::new(),
+            jdtls_versions: HashMap::new(),
+            jdtls_failed_notified: false,
             last_build: None,
+            last_run_main: None,
+            launch: session.launch.clone(),
+            launch_open: false,
+            test_failures: Vec::new(),
             classpath_view: None,
             classpath_source: None,
             classpath_reload_at: None,
@@ -454,8 +514,22 @@ impl ReclipseApp {
         self.project_types = None;
         self.semantic_problems.clear();
         self.javac_problems.clear();
+        self.test_failures.clear();
         self.main_classes.clear();
         self.last_build = None;
+        self.last_run_main = None;
+        self.build_cancel = None;
+        self.build_label = None;
+        self.javac_diag_pending_at = None;
+        self.javac_diag_rx = None;
+        self.javac_diag_cancel = None;
+        self.launch_open = false;
+        self.jdtls = None;
+        self.jdtls_status = JdtlsStatus::Disabled;
+        self.jdtls_status_message = None;
+        self.jdtls_problems.clear();
+        self.jdtls_versions.clear();
+        self.jdtls_failed_notified = false;
         self.classpath_view = None;
         self.classpath_source = None;
         self.classpath_reload_at = None;
@@ -471,10 +545,144 @@ impl ReclipseApp {
         self.index_status = IndexStatus::Indexing { done: 0, total: 0 };
         self.index_rx = Some(spawn_index(root.clone()));
         self.start_watcher(&root);
+        self.maybe_start_jdtls();
         self.log(
             LogLevel::Info,
             format!("Abrindo projeto: {}", root.display()),
         );
+    }
+
+    /// Start the opt-in JDT language server (`RECLIPSE_JDTLS`), if configured.
+    /// Failures degrade to native diagnostics with a single toast.
+    fn maybe_start_jdtls(&mut self) {
+        if self.jdtls.is_some() {
+            return;
+        }
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let Some(config) = crate::jdtls::JdtlsConfig::from_env(&root) else {
+            self.jdtls_status = JdtlsStatus::Disabled;
+            return;
+        };
+        let root_uri = crate::jdtls::file_uri(&root);
+        match crate::jdtls::spawn(&config, &root_uri) {
+            Ok(handle) => {
+                self.jdtls = Some(handle);
+                self.jdtls_status = JdtlsStatus::Starting;
+                self.jdtls_status_message = Some(format!("JDT: iniciando ({})", config.command));
+                self.log(LogLevel::Info, "JDT: modo precisão ativado (opt-in)");
+            }
+            Err(error) => {
+                self.jdtls_status = JdtlsStatus::Failed;
+                self.jdtls_status_message = Some(error.clone());
+                self.log(LogLevel::Warning, format!("JDT indisponível: {error}"));
+            }
+        }
+    }
+
+    /// Ensure the active Java buffer is known to JDT LS (didOpen on first
+    /// sight; saves bump the version via [`Self::jdtls_notify_open`]).
+    fn jdtls_announce_active(&mut self) {
+        let Some(active) = self.active_tab else {
+            return;
+        };
+        let Some(tab) = self.tabs.get(active) else {
+            return;
+        };
+        if !is_java_path(&tab.doc.path) || self.jdtls_versions.contains_key(&tab.doc.path) {
+            return;
+        }
+        let (path, text) = (tab.doc.path.clone(), tab.doc.text());
+        self.jdtls_notify_open(&path, text);
+    }
+
+    /// Send the open buffer to JDT LS (didOpen on first sight, didChange on save).
+    fn jdtls_notify_open(&mut self, path: &Path, text: String) {
+        let Some(handle) = &self.jdtls else {
+            return;
+        };
+        let version = self.jdtls_versions.get(path).copied().unwrap_or(0) + 1;
+        let first = !self.jdtls_versions.contains_key(path);
+        self.jdtls_versions.insert(path.to_path_buf(), version);
+        if first {
+            handle.send(crate::jdtls::JdtlsCommand::DidOpen {
+                path: path.to_path_buf(),
+                text,
+                version,
+            });
+        } else {
+            handle.send(crate::jdtls::JdtlsCommand::DidChange {
+                path: path.to_path_buf(),
+                text,
+                version,
+            });
+        }
+    }
+
+    fn poll_jdtls(&mut self) {
+        if self.jdtls.is_some() {
+            self.jdtls_announce_active();
+        }
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(handle) = &self.jdtls {
+            loop {
+                match handle.events.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        } else {
+            return;
+        }
+        for event in events {
+            match event {
+                crate::jdtls::JdtlsEvent::Ready => {
+                    self.jdtls_status = JdtlsStatus::Ready;
+                    self.jdtls_status_message = None;
+                    self.log(LogLevel::Success, "JDT: servidor pronto".to_owned());
+                    self.toast("JDT: modo precisão ativo");
+                }
+                crate::jdtls::JdtlsEvent::Log(line) => {
+                    self.log(LogLevel::Info, line);
+                }
+                crate::jdtls::JdtlsEvent::Diagnostics { file, items } => {
+                    self.jdtls_problems.retain(|problem| problem.file != file);
+                    for item in items.into_iter().take(100) {
+                        self.jdtls_problems.push(JdtProblem {
+                            file: item.file,
+                            line: item.line,
+                            column: item.column,
+                            message: format!("{}: {}", item.severity, item.message),
+                        });
+                    }
+                    if self.jdtls_problems.len() > 2_000 {
+                        self.jdtls_problems.truncate(2_000);
+                    }
+                    self.show_problems = true;
+                }
+                crate::jdtls::JdtlsEvent::Exited(reason) => {
+                    self.jdtls = None;
+                    self.jdtls_status = JdtlsStatus::Failed;
+                    self.jdtls_status_message = Some(reason.clone());
+                    if !self.jdtls_failed_notified {
+                        self.jdtls_failed_notified = true;
+                        self.toast(format!("JDT encerrado: {reason}"));
+                    }
+                    self.log(LogLevel::Warning, format!("JDT encerrado: {reason}"));
+                }
+            }
+        }
+        if disconnected && self.jdtls.is_some() {
+            self.jdtls = None;
+            self.jdtls_status = JdtlsStatus::Failed;
+            self.jdtls_status_message = Some("canal JDT interrompido".to_owned());
+        }
     }
 
     fn start_watcher(&mut self, root: &Path) {
@@ -807,14 +1015,25 @@ impl ReclipseApp {
         self.log(LogLevel::Info, "Resolvendo classpath e indexando JARs/JDK…");
     }
 
+    fn open_java_buffers(&self) -> HashMap<PathBuf, String> {
+        let mut buffers = HashMap::new();
+        for tab in &self.tabs {
+            if is_java_path(&tab.doc.path) {
+                buffers.insert(tab.doc.path.clone(), tab.doc.text());
+            }
+        }
+        buffers
+    }
+
     fn refresh_semantics(&mut self) {
         let project_types = self.index.as_ref().map(ProjectTypes::build);
+        let buffers = self.open_java_buffers();
         let problems = if let (Some(index), Some(types), Some(classpath)) = (
             self.index.as_ref(),
             project_types.as_ref(),
             self.classpath_index.as_ref(),
         ) {
-            compute_semantic_problems(Some(index), Some(types), classpath)
+            compute_semantic_problems(Some(index), Some(types), classpath, &buffers)
         } else {
             Vec::new()
         };
@@ -829,7 +1048,7 @@ impl ReclipseApp {
 
     fn compile_project(&mut self) {
         if self.build_running {
-            self.toast("Build já em andamento");
+            self.toast("Build já em andamento (cancele para recomeçar)");
             return;
         }
         let Some(project) = self.project.clone() else {
@@ -842,15 +1061,20 @@ impl ReclipseApp {
             .map(BuildEnv::from_classpath)
             .unwrap_or_default();
         self.javac_problems.clear();
+        self.test_failures.clear();
         self.build_running = true;
+        self.build_label = Some("javac".to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.build_cancel = Some(cancel.clone());
         let (sender, receiver) = mpsc::channel();
         self.build_rx = Some(receiver);
+        self.show_console = true;
         self.log(
             LogLevel::Info,
             format!("javac: compilando {} arquivo(s)…", project.java_files.len()),
         );
         thread::spawn(move || {
-            let message = match build::compile(&project, &env) {
+            let message = match build::compile(&project, &env, &cancel) {
                 Ok(result) => BuildMessage::Compiled(Box::new(result)),
                 Err(error) => BuildMessage::Failed(error),
             };
@@ -858,15 +1082,7 @@ impl ReclipseApp {
         });
     }
 
-    fn run_project(&mut self) {
-        if self.build_running {
-            self.toast("Build já em andamento");
-            return;
-        }
-        let Some(project) = self.project.clone() else {
-            self.toast("Abra um projeto antes de executar");
-            return;
-        };
+    fn effective_main(&mut self) -> Option<String> {
         let mut mains = self
             .index
             .as_ref()
@@ -874,8 +1090,17 @@ impl ReclipseApp {
             .unwrap_or_default();
         self.main_classes = mains.clone();
         if mains.is_empty() {
-            self.toast("Nenhuma classe com public static void main encontrada");
-            return;
+            return None;
+        }
+        let configured = self.launch.main_class.trim().to_owned();
+        if !configured.is_empty() {
+            if mains.contains(&configured) {
+                return Some(configured);
+            }
+            self.log(
+                LogLevel::Warning,
+                format!("main configurada {configured} não encontrada; usando {mains:?}"),
+            );
         }
         let main = mains.remove(0);
         if !mains.is_empty() {
@@ -887,30 +1112,57 @@ impl ReclipseApp {
                 ),
             );
         }
+        if self.launch.main_class.trim().is_empty() {
+            self.launch.main_class = main.clone();
+        }
+        Some(main)
+    }
+
+    fn run_project(&mut self) {
+        if self.build_running {
+            self.toast("Build já em andamento (cancele para recomeçar)");
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            self.toast("Abra um projeto antes de executar");
+            return;
+        };
+        let Some(main) = self.effective_main() else {
+            self.toast("Nenhuma classe com public static void main encontrada");
+            return;
+        };
         let env = self
             .classpath_index
             .as_ref()
             .map(BuildEnv::from_classpath)
             .unwrap_or_default();
+        let launch = self.launch.clone();
+        self.last_run_main = Some(main.clone());
         self.javac_problems.clear();
         self.build_running = true;
+        self.build_label = Some(format!("exec {main}"));
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.build_cancel = Some(cancel.clone());
         let (sender, receiver) = mpsc::channel();
         self.build_rx = Some(receiver);
+        self.show_console = true;
         self.log(LogLevel::Info, format!("Compilando e executando {main}…"));
-        thread::spawn(move || match build::compile(&project, &env) {
-            Ok(compiled) if compiled.success => match build::run_main(&main, &env, &compiled) {
-                Ok(run) => {
-                    let _ = sender.send(BuildMessage::RunFinished {
-                        compile: Box::new(compiled),
-                        run,
-                        main,
-                    });
+        thread::spawn(move || match build::compile(&project, &env, &cancel) {
+            Ok(compiled) if compiled.success => {
+                match build::run_main(&main, &launch, &env, &compiled, &project.root, &cancel) {
+                    Ok(run) => {
+                        let _ = sender.send(BuildMessage::RunFinished {
+                            compile: Box::new(compiled),
+                            run,
+                            main,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = sender.send(BuildMessage::Compiled(Box::new(compiled)));
+                        let _ = sender.send(BuildMessage::Failed(error));
+                    }
                 }
-                Err(error) => {
-                    let _ = sender.send(BuildMessage::Compiled(Box::new(compiled)));
-                    let _ = sender.send(BuildMessage::Failed(error));
-                }
-            },
+            }
             Ok(compiled) => {
                 let _ = sender.send(BuildMessage::Compiled(Box::new(compiled)));
             }
@@ -918,6 +1170,249 @@ impl ReclipseApp {
                 let _ = sender.send(BuildMessage::Failed(error));
             }
         });
+    }
+
+    fn cancel_build(&mut self) {
+        if !self.build_running {
+            return;
+        }
+        if let Some(cancel) = &self.build_cancel {
+            cancel.store(true, Ordering::SeqCst);
+            self.log(LogLevel::Warning, "Cancelando build/execução…");
+        } else {
+            self.build_running = false;
+            self.build_rx = None;
+        }
+    }
+
+    fn rerun_last(&mut self) {
+        if self.build_running {
+            self.toast("Build já em andamento");
+            return;
+        }
+        if self.last_run_main.is_some() {
+            self.run_project();
+        } else {
+            self.toast("Nada para re-executar ainda");
+        }
+    }
+
+    /// Schedule background `javac` diagnostics (debounced). Called on save;
+    /// the actual compile runs in `poll_javac_diagnostics` without blocking
+    /// manual builds or the UI thread.
+    fn schedule_javac_diagnostics(&mut self) {
+        if self.project.is_none() {
+            return;
+        }
+        // A newer save cancels an in-flight background check.
+        if let Some(cancel) = &self.javac_diag_cancel {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        self.javac_diag_rx = None;
+        self.javac_diag_cancel = None;
+        self.javac_diag_pending_at = Some(Instant::now() + Duration::from_millis(800));
+    }
+
+    fn poll_javac_diagnostics(&mut self) {
+        if let Some(rx) = &self.javac_diag_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.javac_diag_rx = None;
+                    self.javac_diag_cancel = None;
+                    self.apply_background_diagnostics(&result);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.javac_diag_rx = None;
+                    self.javac_diag_cancel = None;
+                }
+            }
+            return;
+        }
+        let Some(at) = self.javac_diag_pending_at else {
+            return;
+        };
+        if Instant::now() < at {
+            return;
+        }
+        self.javac_diag_pending_at = None;
+        if self.build_running || self.project.is_none() {
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let env = self
+            .classpath_index
+            .as_ref()
+            .map(BuildEnv::from_classpath)
+            .unwrap_or_default();
+        if !javac_available(&env) {
+            if !self.javac_missing_warned {
+                self.javac_missing_warned = true;
+                self.log(
+                    LogLevel::Warning,
+                    "javac indisponível; diagnósticos limitados a imports não resolvidos",
+                );
+            }
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.javac_diag_cancel = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.javac_diag_rx = Some(receiver);
+        thread::spawn(move || {
+            match build::compile(&project, &env, &cancel) {
+                Ok(result) => {
+                    let _ = sender.send(result);
+                }
+                Err(_) => {
+                    // Cancelled or JDK vanished mid-flight: stay silent, the
+                    // next save re-schedules. Manual builds surface errors.
+                }
+            }
+        });
+    }
+
+    /// Merge background `javac` diagnostics without touching manual-build
+    /// status (`last_build`) or toasting on success.
+    fn apply_background_diagnostics(&mut self, result: &build::CompileResult) {
+        let errors = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.is_error)
+            .count();
+        let warnings = result.diagnostics.len().saturating_sub(errors);
+        let changed = self.javac_problems != result.diagnostics;
+        self.javac_problems = result.diagnostics.clone();
+        if !changed {
+            return;
+        }
+        if errors > 0 {
+            self.show_problems = true;
+            self.log(
+                LogLevel::Warning,
+                format!("javac (fundo): {errors} erro(s), {warnings} warning(s)"),
+            );
+        } else if warnings > 0 {
+            self.log(
+                LogLevel::Info,
+                format!("javac (fundo): ok, {warnings} warning(s)"),
+            );
+        } else {
+            self.log(LogLevel::Success, "javac (fundo): sem erros".to_owned());
+        }
+    }
+
+    fn test_project(&mut self) {
+        if self.build_running {
+            self.toast("Build já em andamento (cancele para recomeçar)");
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            self.toast("Abra um projeto antes de testar");
+            return;
+        };
+        self.test_failures.clear();
+        self.build_running = true;
+        self.build_label = Some("test".to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.build_cancel = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.build_rx = Some(receiver);
+        self.show_console = true;
+        let env = std::env::vars().collect();
+        self.log(LogLevel::Info, "Executando testes (mvn/gradle)…");
+        thread::spawn(move || {
+            let message = match build::run_tests(&project, &env, &cancel) {
+                Ok(result) => BuildMessage::TestsFinished(Box::new(result)),
+                Err(error) => BuildMessage::Failed(error),
+            };
+            let _ = sender.send(message);
+        });
+    }
+
+    fn fetch_dependencies(&mut self) {
+        if self.build_running {
+            self.toast("Build já em andamento (cancele para recomeçar)");
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            self.toast("Abra um projeto antes de baixar dependências");
+            return;
+        };
+        self.build_running = true;
+        self.build_label = Some("deps".to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.build_cancel = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.build_rx = Some(receiver);
+        self.show_console = true;
+        self.log(
+            LogLevel::Info,
+            "Baixando dependências para o repositório local (mvn/gradle)…",
+        );
+        thread::spawn(move || {
+            let message =
+                match build::resolve_dependencies(&project, &std::env::vars().collect(), &cancel) {
+                    Ok(result) => BuildMessage::External {
+                        label: result.tool,
+                        success: result.success,
+                        output: result.output,
+                        elapsed_ms: result.elapsed_ms,
+                        reindex_classpath: true,
+                    },
+                    Err(error) => BuildMessage::Failed(error),
+                };
+            let _ = sender.send(message);
+        });
+    }
+
+    fn apply_external_result(
+        &mut self,
+        label: &str,
+        success: bool,
+        output: &str,
+        elapsed_ms: u128,
+        reindex_classpath: bool,
+    ) {
+        if success {
+            self.log(LogLevel::Success, format!("{label}: ok em {elapsed_ms} ms"));
+        } else {
+            self.log(
+                LogLevel::Error,
+                format!("{label}: falhou em {elapsed_ms} ms"),
+            );
+        }
+        let lines: Vec<&str> = output
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        let tail = if lines.len() > 60 {
+            &lines[lines.len() - 60..]
+        } else {
+            &lines[..]
+        };
+        for line in tail {
+            self.log(
+                if success {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Error
+                },
+                (*line).to_owned(),
+            );
+        }
+        self.toast(if success {
+            format!("{label}: concluído")
+        } else {
+            format!("{label}: falhou (ver console)")
+        });
+        if success && reindex_classpath {
+            if let Some(project) = self.project.clone() {
+                self.start_classpath(project);
+            }
+        }
     }
 
     fn poll_build(&mut self) {
@@ -942,6 +1437,8 @@ impl ReclipseApp {
         let had_messages = !messages.is_empty();
         self.build_rx = None;
         self.build_running = false;
+        self.build_cancel = None;
+        self.build_label = None;
         for message in messages {
             match message {
                 BuildMessage::Compiled(compiled) => {
@@ -949,6 +1446,11 @@ impl ReclipseApp {
                 }
                 BuildMessage::RunFinished { compile, run, main } => {
                     self.apply_compile_result(&compile);
+                    if run.output.contains("execução cancelada") {
+                        self.log(LogLevel::Warning, format!("{main}: execução cancelada"));
+                        self.toast(format!("{main}: execução cancelada"));
+                        continue;
+                    }
                     if run.success {
                         self.log(
                             LogLevel::Success,
@@ -960,7 +1462,7 @@ impl ReclipseApp {
                             format!("{main}: execução falhou em {} ms", run.elapsed_ms),
                         );
                     }
-                    for line in run.output.lines().take(200) {
+                    for line in run.output.lines().take(300) {
                         if !line.trim().is_empty() {
                             self.log(
                                 if run.success {
@@ -977,6 +1479,24 @@ impl ReclipseApp {
                     } else {
                         format!("{main}: execução falhou")
                     });
+                }
+                BuildMessage::TestsFinished(result) => {
+                    self.apply_test_result(&result);
+                }
+                BuildMessage::External {
+                    label,
+                    success,
+                    output,
+                    elapsed_ms,
+                    reindex_classpath,
+                } => {
+                    self.apply_external_result(
+                        &label,
+                        success,
+                        &output,
+                        elapsed_ms,
+                        reindex_classpath,
+                    );
                 }
                 BuildMessage::Failed(error) => {
                     self.log(LogLevel::Error, format!("Build: {error}"));
@@ -1037,6 +1557,68 @@ impl ReclipseApp {
         }
     }
 
+    fn apply_test_result(&mut self, result: &build::TestResult) {
+        self.last_build = Some((result.success, result.elapsed_ms));
+        self.test_failures = result.summary.failures_detail.clone();
+        self.show_console = true;
+        self.log(
+            if result.success {
+                LogLevel::Success
+            } else {
+                LogLevel::Error
+            },
+            format!(
+                "{}: {} teste(s), {} falha(s), {} erro(s), {} ignorado(s) em {} ms",
+                result.tool,
+                result.summary.total,
+                result.summary.failures,
+                result.summary.errors,
+                result.summary.skipped,
+                result.elapsed_ms
+            ),
+        );
+        for failure in result.summary.failures_detail.iter().take(30) {
+            self.log(
+                LogLevel::Error,
+                format!(
+                    "teste: {}:{}: {}",
+                    short_file(&failure.file.to_string_lossy()),
+                    failure.line,
+                    failure.message
+                ),
+            );
+        }
+        if !result.success {
+            self.show_problems = true;
+            for line in result
+                .output
+                .lines()
+                .rev()
+                .take(30)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                // Keep raw tool output for context; hyperlinks are resolved in the console.
+                self.log(LogLevel::Error, line);
+                if self.console.len() > 600 {
+                    break;
+                }
+            }
+        }
+        self.toast(if result.success {
+            format!("{}: testes ok", result.tool)
+        } else {
+            format!(
+                "{}: {} falha(s)/{} erro(s)",
+                result.tool, result.summary.failures, result.summary.errors
+            )
+        });
+    }
+
     fn poll_classpath(&mut self) {
         let mut messages = Vec::new();
         let mut disconnected = false;
@@ -1061,10 +1643,12 @@ impl ReclipseApp {
                 }
                 ClasspathMessage::Ready(index) => {
                     let stats = index.stats.clone();
+                    let buffers = self.open_java_buffers();
                     self.semantic_problems = compute_semantic_problems(
                         self.index.as_ref(),
                         self.project_types.as_ref(),
                         &index,
+                        &buffers,
                     );
                     self.classpath_status = ClasspathStatus::Ready(stats.clone());
                     self.classpath_index = Some(*index);
@@ -1209,12 +1793,16 @@ impl ReclipseApp {
                 index.update_file(&path, &text);
             }
             self.refresh_semantics();
+            self.schedule_javac_diagnostics();
         }
         let _ = crate::recovery::discard(&path);
         self.backup_state.remove(&path);
         self.tabs[index].external_change = None;
         self.watch_ignored
             .insert(path.clone(), Instant::now() + Duration::from_secs(2));
+        if is_java {
+            self.jdtls_notify_open(&path, text.clone());
+        }
         self.toast(format!("Salvo: {}", path.display()));
         true
     }
@@ -2082,6 +2670,7 @@ impl ReclipseApp {
             show_console: self.show_console,
             font_size: self.font_size,
             theme: self.theme.config_name().to_owned(),
+            launch: self.launch.clone(),
             keybindings: self.keybindings.clone(),
         }
     }
@@ -3124,6 +3713,19 @@ impl ReclipseApp {
                     ),
                     PaletteEntry::new("Projeto: compilar com javac", "", Action::Compile),
                     PaletteEntry::new("Projeto: executar", "F6", Action::Run),
+                    PaletteEntry::new("Projeto: testar (mvn/gradle)", "", Action::Test),
+                    PaletteEntry::new(
+                        "Projeto: baixar dependências (mvn/gradle)",
+                        "",
+                        Action::FetchDeps,
+                    ),
+                    PaletteEntry::new("Projeto: cancelar build/execução", "", Action::CancelBuild),
+                    PaletteEntry::new("Projeto: re-executar última main", "", Action::Rerun),
+                    PaletteEntry::new(
+                        "Projeto: configuração de execução…",
+                        "",
+                        Action::LaunchConfig,
+                    ),
                     PaletteEntry::new("Projeto: debug (M4)", "", Action::Debug),
                     PaletteEntry::new(
                         "Ir para definição",
@@ -3838,7 +4440,11 @@ impl ReclipseApp {
 
         if let Some(symbol) = file.symbols.iter().find(|symbol| symbol.name == word) {
             let title = format!("{word} · {}", symbol.kind.label());
-            let lines = symbol.detail.clone().into_iter().collect::<Vec<_>>();
+            let mut lines = symbol.detail.clone().into_iter().collect::<Vec<_>>();
+            let source = self.tabs[active].doc.text();
+            if let Some(doc) = symbol_javadoc(&source, symbol.name_start_byte) {
+                lines.push(doc);
+            }
             show_hover_popup(ctx, position, &title, &lines);
             return;
         }
@@ -3866,6 +4472,12 @@ impl ReclipseApp {
                 .clone()
                 .into_iter()
                 .collect::<Vec<_>>();
+            let disk = fs::read_to_string(&location.file).ok();
+            if let Some(source) = disk.as_deref() {
+                if let Some(doc) = symbol_javadoc(source, location.symbol.name_start_byte) {
+                    lines.push(doc);
+                }
+            }
             lines.push(relative);
             show_hover_popup(ctx, position, &title, &lines);
         }
@@ -4299,7 +4911,11 @@ impl ReclipseApp {
                 ui.horizontal(|ui| {
                     if self.build_running {
                         ui.spinner();
-                        ui.label(RichText::new("javac…").small().color(theme::yellow()));
+                        let label = self.build_label.as_deref().unwrap_or("build…");
+                        ui.label(RichText::new(label).small().color(theme::yellow()));
+                        if toolbar_button(ui, "Cancelar", "Cancelar build/execução/testes") {
+                            actions.push(Action::CancelBuild);
+                        }
                     } else {
                         let run = ui
                             .add(
@@ -4315,6 +4931,12 @@ impl ReclipseApp {
                         }
                         if toolbar_button(ui, "Compilar", "Compilar com javac") {
                             actions.push(Action::Compile);
+                        }
+                        if toolbar_button(ui, "Testar", "mvn/gradle test com parser") {
+                            actions.push(Action::Test);
+                        }
+                        if toolbar_button(ui, "Launch…", "main, args, JVM, env") {
+                            actions.push(Action::LaunchConfig);
                         }
                         let debug = ui.add_enabled(
                             false,
@@ -4353,7 +4975,11 @@ impl ReclipseApp {
                         ui.label(RichText::new(cp_text).small().color(cp_color));
                         ui.separator();
                         if self.build_running {
-                            ui.label(RichText::new("build…").small().color(theme::yellow()));
+                            ui.label(
+                                RichText::new(self.build_label.as_deref().unwrap_or("build…"))
+                                    .small()
+                                    .color(theme::yellow()),
+                            );
                             ui.separator();
                         } else if let Some((success, elapsed)) = self.last_build {
                             ui.label(
@@ -4456,6 +5082,9 @@ impl ReclipseApp {
         }
         let mut clear = false;
         let mut close = false;
+        let mut cancel = false;
+        let mut rerun = false;
+        let mut open_launch = false;
         let index_line = match &self.index_status {
             IndexStatus::Ready {
                 files,
@@ -4529,10 +5158,26 @@ impl ReclipseApp {
                         if ui.small_button("Limpar").clicked() {
                             clear = true;
                         }
+                        if self.build_running {
+                            if ui.small_button("Cancelar").clicked() {
+                                cancel = true;
+                            }
+                        } else {
+                            if ui.small_button("Re-executar").clicked() {
+                                rerun = true;
+                            }
+                            if ui.small_button("Launch…").clicked() {
+                                open_launch = true;
+                            }
+                        }
                         ui.label(
-                            RichText::new("Rust-native diagnostics")
-                                .small()
-                                .color(theme::muted()),
+                            RichText::new(if self.build_running {
+                                self.build_label.as_deref().unwrap_or("build…")
+                            } else {
+                                "Rust-native diagnostics"
+                            })
+                            .small()
+                            .color(theme::muted()),
                         );
                     });
                 });
@@ -4550,6 +5195,8 @@ impl ReclipseApp {
                                             .color(theme::muted()),
                                     );
                                 }
+                                let root = self.root.clone();
+                                let mut open_link: Option<(PathBuf, usize)> = None;
                                 for line in &self.console {
                                     let color = match line.level {
                                         LogLevel::Info => theme::muted(),
@@ -4558,17 +5205,63 @@ impl ReclipseApp {
                                         LogLevel::Error => theme::red(),
                                     };
                                     let seconds = line.at.as_secs();
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "[{:02}:{:02}] {}",
-                                            seconds / 60,
-                                            seconds % 60,
-                                            line.text
-                                        ))
-                                        .monospace()
-                                        .size(11.0)
-                                        .color(color),
+                                    let text = format!(
+                                        "[{:02}:{:02}] {}",
+                                        seconds / 60,
+                                        seconds % 60,
+                                        line.text
                                     );
+                                    if let Some((file, lineno)) =
+                                        build::parse_file_link(&line.text, root.as_deref())
+                                    {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "[{:02}:{:02}] ",
+                                                    seconds / 60,
+                                                    seconds % 60
+                                                ))
+                                                .monospace()
+                                                .size(11.0)
+                                                .color(color),
+                                            );
+                                            let label = format!(
+                                                "{}:{}",
+                                                short_file(&file.to_string_lossy()),
+                                                lineno
+                                            );
+                                            if ui
+                                                .link(
+                                                    RichText::new(format!(
+                                                        "{label} {}",
+                                                        line.text
+                                                            .chars()
+                                                            .take(220)
+                                                            .collect::<String>()
+                                                    ))
+                                                    .color(color),
+                                                )
+                                                .clicked()
+                                            {
+                                                open_link = Some((file, lineno));
+                                            }
+                                        });
+                                    } else {
+                                        ui.label(
+                                            RichText::new(text).monospace().size(11.0).color(color),
+                                        );
+                                    }
+                                    let _ = color;
+                                }
+                                if let Some((file, lineno)) = open_link {
+                                    let file = if file.is_absolute() {
+                                        file
+                                    } else if let Some(root) = &self.root {
+                                        root.join(file)
+                                    } else {
+                                        file
+                                    };
+                                    self.open_at(file, lineno, 1);
                                 }
                             });
                     }
@@ -4609,6 +5302,70 @@ impl ReclipseApp {
         if close {
             self.show_console = false;
         }
+        if cancel {
+            self.cancel_build();
+        }
+        if rerun {
+            self.rerun_last();
+        }
+        if open_launch {
+            self.launch_open = true;
+        }
+    }
+
+    fn show_launch_dialog(&mut self, ctx: &Context) {
+        if !self.launch_open {
+            return;
+        }
+        let mut open = true;
+        let mut apply_main: Option<String> = None;
+        egui::Window::new("Configuração de execução")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(egui::vec2(560.0, 380.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("main, argumentos, JVM e ambiente (persistidos na sessão).")
+                        .small()
+                        .color(theme::muted()),
+                );
+                ui.separator();
+                ui.label("Classe main (vazio = auto-detectar):");
+                ui.text_edit_singleline(&mut self.launch.main_class);
+                if !self.main_classes.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Detectadas:").small().color(theme::muted()));
+                        for main in self.main_classes.clone() {
+                            if ui.small_button(&main).clicked() {
+                                apply_main = Some(main);
+                            }
+                        }
+                    });
+                }
+                ui.label("Argumentos do programa:");
+                ui.text_edit_singleline(&mut self.launch.program_args);
+                ui.label("Argumentos da JVM (ex: -Xmx1g -Dkey=val):");
+                ui.text_edit_singleline(&mut self.launch.jvm_args);
+                ui.label("Ambiente (KEY=VAL por linha):");
+                ui.text_edit_multiline(&mut self.launch.env_vars);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Executar").clicked() {
+                        self.launch_open = false;
+                        self.run_project();
+                    }
+                    if ui.button("Fechar").clicked() {
+                        self.launch_open = false;
+                    }
+                });
+            });
+        if let Some(main) = apply_main {
+            self.launch.main_class = main;
+        }
+        if !open {
+            self.launch_open = false;
+        }
     }
 
     fn status_bar(&mut self, ctx: &Context) {
@@ -4640,7 +5397,11 @@ impl ReclipseApp {
                         ui.separator();
                         if self.build_running {
                             ui.spinner();
-                            ui.label(RichText::new("javac…").small().color(theme::yellow()));
+                            ui.label(
+                                RichText::new(self.build_label.as_deref().unwrap_or("build…"))
+                                    .small()
+                                    .color(theme::yellow()),
+                            );
                         } else if let Some((success, elapsed)) = self.last_build {
                             ui.label(
                                 RichText::new(format!(
@@ -5063,6 +5824,8 @@ impl ReclipseApp {
         let javac_total = self.javac_problems.len();
         let javac: Vec<build::JavacDiagnostic> =
             self.javac_problems.iter().take(300).cloned().collect();
+        let test_total = self.test_failures.len();
+        let tests: Vec<build::TestFailure> = self.test_failures.iter().take(100).cloned().collect();
         let root = self.root.clone();
 
         ui.label(
@@ -5074,7 +5837,7 @@ impl ReclipseApp {
                     theme::red()
                 }),
         );
-        if total == 0 && semantic_total == 0 && javac_total == 0 {
+        if total == 0 && semantic_total == 0 && javac_total == 0 && test_total == 0 {
             return;
         }
 
@@ -5188,6 +5951,40 @@ impl ReclipseApp {
                     .clicked()
                 {
                     actions.push(Action::OpenAt(diagnostic.file, diagnostic.line, 1));
+                }
+            }
+        }
+
+        if test_total > 0 {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!("testes: {test_total} falha(s)"))
+                    .small()
+                    .color(theme::red()),
+            );
+            for failure in tests {
+                let relative = root
+                    .as_ref()
+                    .map(|root| {
+                        failure
+                            .file
+                            .strip_prefix(root)
+                            .unwrap_or(&failure.file)
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .unwrap_or_else(|| failure.file.display().to_string());
+                let label = format!(
+                    "{}:{}  {}",
+                    short_file(&relative),
+                    failure.line,
+                    failure.message
+                );
+                if ui
+                    .selectable_label(false, RichText::new(label).size(12.0).color(theme::red()))
+                    .clicked()
+                {
+                    actions.push(Action::OpenAt(failure.file, failure.line, 1));
                 }
             }
         }
@@ -6012,6 +6809,13 @@ impl ReclipseApp {
             Action::Reindex => self.reindex(),
             Action::Compile => self.compile_project(),
             Action::Run => self.run_project(),
+            Action::Test => self.test_project(),
+            Action::FetchDeps => self.fetch_dependencies(),
+            Action::CancelBuild => self.cancel_build(),
+            Action::Rerun => self.rerun_last(),
+            Action::LaunchConfig => {
+                self.launch_open = true;
+            }
             Action::Debug => self.toast("Debugger JDWP/JDI planejado para o M4"),
             Action::ToggleSplit => self.toggle_split(),
             Action::ToggleProject => self.show_project = !self.show_project,
@@ -6377,6 +7181,8 @@ impl eframe::App for ReclipseApp {
         self.poll_index();
         self.poll_classpath();
         self.poll_build();
+        self.poll_javac_diagnostics();
+        self.poll_jdtls();
         self.poll_watcher();
         self.maybe_reload_classpath();
         if self.project_search.poll() {
@@ -6407,6 +7213,7 @@ impl eframe::App for ReclipseApp {
         self.show_shortcuts(ctx);
         self.show_classpath_view(ctx);
         self.show_classpath_source(ctx);
+        self.show_launch_dialog(ctx);
         self.show_about(ctx);
         self.show_project_replace_confirm(ctx);
         self.show_recovery(ctx);
@@ -6420,6 +7227,8 @@ impl eframe::App for ReclipseApp {
             || self.classpath_reload_at.is_some()
             || self.project_search.running
             || self.build_running
+            || self.javac_diag_pending_at.is_some()
+            || self.javac_diag_rx.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(80));
         } else if self.status_message.is_some() {
@@ -6879,6 +7688,120 @@ fn hover_resolved(
     }
 }
 
+/// First sentence of the `/** ... */` Javadoc block attached to a declaration.
+/// Allows modifiers, annotations and the return type between the comment and
+/// `name_start` (e.g. `/** ... */ public String greet`), but nothing else
+/// (`(`, `)`, `;`, `{`, `}` in between means the comment belongs elsewhere).
+fn symbol_javadoc(source: &str, name_start: usize) -> Option<String> {
+    let before = source.get(..name_start.min(source.len()))?;
+    let comment_end = before.rfind("*/")?;
+    let between = before[comment_end + 2..].trim();
+    if between.contains(['(', ')', ';', '{', '}']) {
+        return None;
+    }
+    let open = before[..comment_end].rfind("/**")?;
+    // The opener must belong to this block, not an earlier closed one.
+    if before[open..comment_end].contains("*/") {
+        return None;
+    }
+    let body = before[open + 3..comment_end].trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some(javadoc_first_sentence(body))
+}
+
+fn javadoc_first_sentence(body: &str) -> String {
+    // Join continuation lines, dropping the leading `*`.
+    let mut text = String::new();
+    for line in body.lines() {
+        let line = line.trim().trim_start_matches('*').trim();
+        if !text.is_empty() && !text.ends_with(['-', '/']) {
+            text.push(' ');
+        }
+        text.push_str(line);
+    }
+    // Unwrap inline tags: `{@link Foo}` -> `Foo`, `{@code x}` -> `x`.
+    let mut clean = String::new();
+    let mut rest = text.as_str();
+    loop {
+        let Some(open) = rest.find("{@") else {
+            let tail = rest.trim();
+            if !tail.is_empty() {
+                if !clean.is_empty() {
+                    clean.push(' ');
+                }
+                clean.push_str(tail);
+            }
+            break;
+        };
+        let head = rest[..open].trim();
+        if !head.is_empty() {
+            if !clean.is_empty() {
+                clean.push(' ');
+            }
+            clean.push_str(head);
+        }
+        let Some(close_rel) = rest[open..].find('}') else {
+            break;
+        };
+        let close = open + close_rel;
+        let tag = rest[open + 2..close].trim();
+        let mut content = tag
+            .split_once(char::is_whitespace)
+            .map(|(_, content)| content.trim())
+            .unwrap_or("");
+        content = content.split('#').next_back().unwrap_or(content).trim();
+        content = content.trim_end_matches("()");
+        if !content.is_empty() {
+            if !clean.is_empty() {
+                clean.push(' ');
+            }
+            clean.push_str(content);
+        }
+        rest = rest[close + 1..].trim_start();
+    }
+    // Strip remaining HTML tags.
+    let mut plain = String::with_capacity(clean.len());
+    let mut in_tag = false;
+    for character in clean.chars() {
+        match character {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => plain.push(character),
+            _ => {}
+        }
+    }
+    let mut plain = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (bad, good) in [
+        (" .", "."),
+        (" ,", ","),
+        (" ;", ";"),
+        (" :", ":"),
+        (" !", "!"),
+        (" ?", "?"),
+    ] {
+        plain = plain.replace(bad, good);
+    }
+    // First sentence: cut at `. `, `.\n`, or a trailing `.`.
+    let mut end = plain.len();
+    for (index, window) in plain.char_indices() {
+        if window == '.' {
+            let after = plain.get(index + 1..).unwrap_or("");
+            if after.is_empty() || after.starts_with(char::is_whitespace) {
+                end = index + 1;
+                break;
+            }
+        }
+    }
+    let mut sentence: String = plain.chars().take(end).collect();
+    sentence = sentence.trim().to_owned();
+    if sentence.chars().count() > 200 {
+        sentence = sentence.chars().take(197).collect::<String>() + "...";
+    }
+    sentence
+}
+
 fn show_hover_popup(ctx: &Context, position: egui::Pos2, title: &str, lines: &[String]) {
     let screen = ctx.screen_rect();
     let mut position = position + egui::vec2(14.0, 18.0);
@@ -6921,6 +7844,21 @@ fn is_java_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn javac_available(env: &build::BuildEnv) -> bool {
+    if let Some(home) = &env.jdk_home {
+        let candidate = home
+            .join("bin")
+            .join(format!("javac{}", std::env::consts::EXE_SUFFIX));
+        if candidate.is_file() {
+            return true;
+        }
+    }
+    std::process::Command::new("javac")
+        .arg("-version")
+        .output()
+        .is_ok()
+}
+
 fn path_is_ignored(path: &Path) -> bool {
     path.components().any(|component| {
         component
@@ -6946,18 +7884,84 @@ fn compute_semantic_problems(
     index: Option<&ProjectIndex>,
     project_types: Option<&ProjectTypes>,
     classpath: &ClasspathIndex,
+    buffers: &HashMap<PathBuf, String>,
 ) -> Vec<SemanticProblem> {
+    use reclipse_java::semantic::{
+        override_problems, static_import_conflicts, unresolved_member_references,
+        unresolved_type_references,
+    };
     let (Some(index), Some(project_types)) = (index, project_types) else {
         return Vec::new();
     };
     let mut problems = Vec::new();
+    let mut push =
+        |file: &PathBuf, line: usize, message: String, problems: &mut Vec<SemanticProblem>| {
+            if problems.len() < 2_000 {
+                problems.push(SemanticProblem {
+                    file: file.clone(),
+                    line,
+                    message,
+                });
+            }
+        };
     for (path, file) in &index.files {
         for (import, line) in unresolved_imports(file, project_types, classpath) {
-            problems.push(SemanticProblem {
-                file: path.clone(),
+            push(
+                path,
                 line,
-                message: format!("import não resolvido: {import}"),
-            });
+                format!("import não resolvido: {import}"),
+                &mut problems,
+            );
+            if problems.len() >= 2_000 {
+                return problems;
+            }
+        }
+        let source: Option<String> = buffers
+            .get(path)
+            .cloned()
+            .or_else(|| fs::read_to_string(path).ok());
+        let Some(source) = source.as_deref() else {
+            continue;
+        };
+        for (name, line, owners) in
+            static_import_conflicts(file, source, project_types, Some(index), classpath)
+        {
+            push(
+                path,
+                line,
+                format!("static import ambíguo para '{name}': {}", owners.join(", ")),
+                &mut problems,
+            );
+            if problems.len() >= 2_000 {
+                return problems;
+            }
+        }
+        for (name, line) in unresolved_type_references(file, project_types, classpath) {
+            push(
+                path,
+                line,
+                format!("tipo não resolvido: {name}"),
+                &mut problems,
+            );
+            if problems.len() >= 2_000 {
+                return problems;
+            }
+        }
+        for (message, line) in
+            unresolved_member_references(file, source, project_types, Some(index), classpath)
+        {
+            push(
+                path,
+                line,
+                format!("membro não encontrado: {message}"),
+                &mut problems,
+            );
+            if problems.len() >= 2_000 {
+                return problems;
+            }
+        }
+        for (message, line) in override_problems(file, project_types, Some(index), classpath) {
+            push(path, line, message, &mut problems);
             if problems.len() >= 2_000 {
                 return problems;
             }
@@ -7032,5 +8036,23 @@ mod tests {
             "project/gradle/libs.versions.toml"
         )));
         assert!(!is_classpath_config(Path::new("project/App.java")));
+    }
+
+    #[test]
+    fn extracts_javadoc_first_sentence() {
+        let source = "/**\n * Greets the user.\n * Second sentence here.\n * @param name the name\n */\npublic String greet(String name) { return name; }";
+        let offset = source.find("greet").unwrap();
+        assert_eq!(
+            symbol_javadoc(source, offset).as_deref(),
+            Some("Greets the user.")
+        );
+        // Plain block comments are not Javadoc.
+        let plain = "/* just a comment */\nvoid run() {}";
+        assert_eq!(symbol_javadoc(plain, plain.find("run").unwrap()), None);
+        // Inline tags are unwrapped.
+        assert_eq!(
+            javadoc_first_sentence("See {@link User} and {@code main}. Next."),
+            "See User and main."
+        );
     }
 }

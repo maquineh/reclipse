@@ -63,6 +63,7 @@ pub struct Session {
     pub show_console: bool,
     pub font_size: f32,
     pub theme: String,
+    pub launch: crate::build::LaunchConfig,
     pub keybindings: Keybindings,
 }
 
@@ -78,6 +79,7 @@ impl Default for Session {
             show_console: true,
             font_size: 14.5,
             theme: "rust-oxide".to_owned(),
+            launch: crate::build::LaunchConfig::default(),
             keybindings: Keybindings::default(),
         }
     }

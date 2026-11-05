@@ -132,6 +132,7 @@ mod tests {
             interfaces: Vec::new(),
             fields: Vec::new(),
             methods: Vec::new(),
+            generic_signature: None,
             origin: origin.to_owned(),
         }
     }

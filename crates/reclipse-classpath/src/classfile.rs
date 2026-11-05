@@ -40,6 +40,11 @@ pub struct MemberInfo {
     pub kind: MemberKind,
     pub is_static: bool,
     pub is_public: bool,
+    /// JVM `ACC_VARARGS` flag; meaningful for methods and constructors.
+    pub is_varargs: bool,
+    /// JVM generic signature (`Signature` attribute), e.g.
+    /// `(TT;)TT;` for `<T> T identity(T)`. `None` when absent.
+    pub generic_signature: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +59,9 @@ pub struct ClassInfo {
     pub interfaces: Vec<String>,
     pub fields: Vec<MemberInfo>,
     pub methods: Vec<MemberInfo>,
+    /// JVM generic signature of the class (`Signature` attribute), e.g.
+    /// `<T::Ljava/lang/Object;>Ljava/lang/Object;`.
+    pub generic_signature: Option<String>,
     /// Human-readable origin (JAR/JMOD path).
     pub origin: String,
 }
@@ -141,7 +149,7 @@ pub fn parse_class(data: &[u8], origin: impl Into<String>) -> Result<ClassInfo> 
         let member_access = reader.u2()?;
         let member_name = utf8_at(reader.u2()?, &utf8).unwrap_or_default();
         let descriptor = utf8_at(reader.u2()?, &utf8).unwrap_or_default();
-        skip_attributes(&mut reader)?;
+        let generic_signature = attribute_signature(&mut reader, &utf8)?;
         if member_access & 0x0005 == 0 {
             continue;
         }
@@ -149,9 +157,11 @@ pub fn parse_class(data: &[u8], origin: impl Into<String>) -> Result<ClassInfo> 
             name: member_name.clone(),
             signature: format!("{} {member_name}", format_field_descriptor(&descriptor)),
             descriptor,
+            generic_signature,
             kind: MemberKind::Field,
             is_static: member_access & 0x0008 != 0,
             is_public: member_access & 0x0001 != 0 || member_access & 0x0004 != 0,
+            is_varargs: false,
         });
     }
 
@@ -161,7 +171,7 @@ pub fn parse_class(data: &[u8], origin: impl Into<String>) -> Result<ClassInfo> 
         let member_access = reader.u2()?;
         let member_name = utf8_at(reader.u2()?, &utf8).unwrap_or_default();
         let descriptor = utf8_at(reader.u2()?, &utf8).unwrap_or_default();
-        skip_attributes(&mut reader)?;
+        let generic_signature = attribute_signature(&mut reader, &utf8)?;
         if member_name == "<clinit>" || member_access & 0x0005 == 0 {
             continue;
         }
@@ -181,11 +191,35 @@ pub fn parse_class(data: &[u8], origin: impl Into<String>) -> Result<ClassInfo> 
             name: member_name,
             signature,
             descriptor,
+            generic_signature,
             kind,
             is_static: member_access & 0x0008 != 0,
             is_public: member_access & 0x0001 != 0 || member_access & 0x0004 != 0,
+            is_varargs: member_access & 0x0080 != 0,
         });
     }
+
+    // Class-level attributes (Signature included); tolerate truncation.
+    let generic_signature = match (|| -> Result<Option<String>> {
+        let mut signature = None;
+        let count = reader.u2()? as usize;
+        for _ in 0..count {
+            let name_index = reader.u2()?;
+            let length = reader.u4()? as usize;
+            if utf8_at(name_index, &utf8).as_deref() == Some("Signature") {
+                let bytes = reader.take(length)?;
+                if signature.is_none() {
+                    signature = Some(String::from_utf8_lossy(bytes).into_owned());
+                }
+            } else {
+                reader.skip(length)?;
+            }
+        }
+        Ok(signature)
+    })() {
+        Ok(signature) => signature,
+        Err(_) => None,
+    };
 
     Ok(ClassInfo {
         name,
@@ -197,6 +231,7 @@ pub fn parse_class(data: &[u8], origin: impl Into<String>) -> Result<ClassInfo> 
         interfaces,
         fields,
         methods,
+        generic_signature,
         origin: origin.into(),
     })
 }
@@ -214,14 +249,24 @@ fn normalize_internal_name(name: &str) -> String {
     name.replace('/', ".")
 }
 
-fn skip_attributes(reader: &mut Reader<'_>) -> Result<()> {
+/// Read member attributes, returning the `Signature` attribute when present.
+/// Other attributes are skipped unread.
+fn attribute_signature(reader: &mut Reader<'_>, utf8: &[Option<String>]) -> Result<Option<String>> {
     let count = reader.u2()? as usize;
+    let mut signature = None;
     for _ in 0..count {
-        reader.skip(2)?;
+        let name_index = reader.u2()?;
         let length = reader.u4()? as usize;
-        reader.skip(length)?;
+        if utf8_at(name_index, utf8).as_deref() == Some("Signature") {
+            let bytes = reader.take(length)?;
+            if signature.is_none() {
+                signature = Some(String::from_utf8_lossy(bytes).into_owned());
+            }
+        } else {
+            reader.skip(length)?;
+        }
     }
-    Ok(())
+    Ok(signature)
 }
 
 /// Format a field descriptor such as `Ljava/lang/String;`.
@@ -264,6 +309,301 @@ pub fn method_return_type_name(descriptor: &str) -> Option<String> {
         None
     } else {
         Some(name)
+    }
+}
+
+/// Parse a JVM generic `Signature` type parameter section, e.g.
+/// `<T::Ljava/lang/Object;E:Ljava/lang/Number;>` into
+/// `[(T, None), (E, Some(java.lang.Number))]`.
+/// Bounds keep dots (`/` and `$`-style inner `.` normalized to `.`).
+pub fn signature_type_params(signature: &str) -> Vec<(String, Option<String>)> {
+    let bytes = signature.as_bytes();
+    if bytes.first() != Some(&b'<') {
+        return Vec::new();
+    }
+    let mut index = 1;
+    let mut params = Vec::new();
+    while index < bytes.len() && bytes[index] != b'>' {
+        let start = index;
+        while index < bytes.len() && bytes[index] != b':' {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        let name = String::from_utf8_lossy(&bytes[start..index]).into_owned();
+        index += 1; // class bound ':'
+        let mut bounds: Vec<String> = Vec::new();
+        // Class bound may be empty (just ':'); interface bounds add more.
+        loop {
+            if index >= bytes.len() || bytes[index] == b'>' {
+                break;
+            }
+            if bytes[index] == b':' {
+                // Empty class bound, move to interface bounds.
+                index += 1;
+                continue;
+            }
+            // A new type parameter starts with an identifier followed by ':'.
+            // If we already have no bound and see `Name:`, this param is done.
+            if bounds.is_empty()
+                && index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric()
+                    || bytes[index] == b'_'
+                    || bytes[index] == b'$')
+            {
+                let scan = index;
+                let mut end = scan;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric()
+                        || bytes[end] == b'_'
+                        || bytes[end] == b'$')
+                {
+                    end += 1;
+                }
+                if bytes.get(end) == Some(&b':') && end > scan {
+                    break;
+                }
+            }
+            match parse_signature_type(bytes, &mut index) {
+                Some(bound) if !bound.is_empty() => bounds.push(bound),
+                _ => break,
+            }
+            if index < bytes.len() && bytes[index] == b':' {
+                index += 1;
+                continue;
+            }
+            // Another bound only follows a ':'; otherwise next param or '>'.
+            break;
+        }
+        if name.is_empty() {
+            continue;
+        }
+        params.push((name, bounds.into_iter().next()));
+    }
+    params
+}
+
+/// Parameter types of a generic method `Signature` as display text, e.g.
+/// `(TT;I)Ljava/lang/String;` -> [`T`, `int`].
+pub fn signature_params_text(signature: &str) -> Option<Vec<String>> {
+    let bytes = signature.as_bytes();
+    let mut index = 0;
+    if bytes.first() == Some(&b'<') {
+        let mut depth = 0i32;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth -= 1;
+                    index += 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+    }
+    if bytes.get(index) != Some(&b'(') {
+        return None;
+    }
+    index += 1;
+    let mut params = Vec::new();
+    while index < bytes.len() && bytes[index] != b')' {
+        params.push(parse_signature_type(bytes, &mut index)?);
+    }
+    Some(params)
+}
+
+/// Parse the return type of a generic method `Signature` into display text
+/// with dots, e.g. `(TT;)TT;` -> `T`, `(I)Ljava/util/List<TT;>;` ->
+/// `java.util.List<T>`. Type arguments keep single-letter variables as-is.
+pub fn signature_return_text(signature: &str) -> Option<String> {
+    let bytes = signature.as_bytes();
+    let after_params = skip_signature_params(bytes, index0(bytes))?;
+    let mut index = after_params;
+    parse_signature_type(bytes, &mut index)
+}
+
+fn index0(bytes: &[u8]) -> usize {
+    let mut index = 0;
+    if bytes.first() == Some(&b'<') {
+        let mut depth = 0i32;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth -= 1;
+                    index += 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+    }
+    index
+}
+
+fn skip_signature_params(bytes: &[u8], mut index: usize) -> Option<usize> {
+    if bytes.get(index) != Some(&b'(') {
+        return None;
+    }
+    index += 1;
+    let mut depth = 0i32;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' | b'[' => depth += 1,
+            b'<' => depth += 1,
+            b')' => {
+                if depth == 0 {
+                    return Some(index + 1);
+                }
+                depth -= 1;
+            }
+            b'>' | b']' => depth = (depth - 1).max(0),
+            b';' => {}
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Parse one JVM generic signature type starting at `index`, advancing past it.
+/// Returns display text with `.` separators; `Inner` classes keep `.`.
+fn parse_signature_type(bytes: &[u8], index: &mut usize) -> Option<String> {
+    let byte = *bytes.get(*index)?;
+    match byte {
+        b'B' => {
+            *index += 1;
+            Some("byte".to_owned())
+        }
+        b'C' => {
+            *index += 1;
+            Some("char".to_owned())
+        }
+        b'D' => {
+            *index += 1;
+            Some("double".to_owned())
+        }
+        b'F' => {
+            *index += 1;
+            Some("float".to_owned())
+        }
+        b'I' => {
+            *index += 1;
+            Some("int".to_owned())
+        }
+        b'J' => {
+            *index += 1;
+            Some("long".to_owned())
+        }
+        b'S' => {
+            *index += 1;
+            Some("short".to_owned())
+        }
+        b'Z' => {
+            *index += 1;
+            Some("boolean".to_owned())
+        }
+        b'V' => {
+            *index += 1;
+            Some("void".to_owned())
+        }
+        b'[' => {
+            *index += 1;
+            parse_signature_type(bytes, index).map(|inner| format!("{inner}[]"))
+        }
+        b'T' => {
+            *index += 1;
+            let start = *index;
+            while *index < bytes.len() && bytes[*index] != b';' {
+                *index += 1;
+            }
+            let name = String::from_utf8_lossy(&bytes[start..*index]).into_owned();
+            if bytes.get(*index) == Some(&b';') {
+                *index += 1;
+            }
+            if name.is_empty() {
+                return None;
+            }
+            Some(name)
+        }
+        b'L' => {
+            *index += 1;
+            let mut name = String::new();
+            let mut args: Vec<String> = Vec::new();
+            loop {
+                if *index >= bytes.len() {
+                    return None;
+                }
+                match bytes[*index] {
+                    b';' => {
+                        *index += 1;
+                        break;
+                    }
+                    b'<' => {
+                        *index += 1;
+                        loop {
+                            if *index >= bytes.len() {
+                                return None;
+                            }
+                            match bytes[*index] {
+                                b'>' => {
+                                    *index += 1;
+                                    break;
+                                }
+                                b'*' => {
+                                    *index += 1;
+                                    args.push("?".to_owned());
+                                }
+                                b'+' | b'-' => {
+                                    *index += 1;
+                                    if let Some(bound) = parse_signature_type(bytes, index) {
+                                        args.push(bound);
+                                    }
+                                }
+                                _ => {
+                                    if let Some(arg) = parse_signature_type(bytes, index) {
+                                        args.push(arg);
+                                    } else {
+                                        return None;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    b'.' => {
+                        name.push('.');
+                        *index += 1;
+                    }
+                    b'/' => {
+                        name.push('.');
+                        *index += 1;
+                    }
+                    _ => {
+                        name.push(bytes[*index] as char);
+                        *index += 1;
+                    }
+                }
+            }
+            if name.is_empty() {
+                return None;
+            }
+            if args.is_empty() {
+                Some(name)
+            } else {
+                Some(format!("{name}<{}>", args.join(", ")))
+            }
+        }
+        _ => None,
     }
 }
 
@@ -492,5 +832,43 @@ mod tests {
             format_method_descriptor("()Ljava/util/List;"),
             (String::new(), "List".to_owned())
         );
+    }
+
+    #[test]
+    fn parses_signature_type_params() {
+        assert_eq!(signature_type_params("Ljava/lang/Object;"), Vec::new());
+        assert_eq!(
+            signature_type_params("<T::Ljava/lang/Object;>Ljava/lang/Object;"),
+            vec![("T".to_owned(), Some("java.lang.Object".to_owned()))]
+        );
+        assert_eq!(
+            signature_type_params("<E:Ljava/lang/Number;>Ljava/lang/Object;"),
+            vec![("E".to_owned(), Some("java.lang.Number".to_owned()))]
+        );
+        assert_eq!(
+            signature_type_params("<K:Ljava/lang/Object;V:Ljava/lang/Object;>Ljava/lang/Object;"),
+            vec![
+                ("K".to_owned(), Some("java.lang.Object".to_owned())),
+                ("V".to_owned(), Some("java.lang.Object".to_owned())),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_signature_return_types() {
+        assert_eq!(signature_return_text("(TT;)TT;"), Some("T".to_owned()));
+        assert_eq!(
+            signature_return_text("(I)Ljava/util/List<TT;>;"),
+            Some("java.util.List<T>".to_owned())
+        );
+        assert_eq!(
+            signature_return_text("()Ljava/lang/String;"),
+            Some("java.lang.String".to_owned())
+        );
+        assert_eq!(
+            signature_return_text("<T:Ljava/lang/Object;>(TT;)Ljava/util/List<TT;>;"),
+            Some("java.util.List<T>".to_owned())
+        );
+        assert_eq!(signature_return_text("(I)V"), Some("void".to_owned()));
     }
 }

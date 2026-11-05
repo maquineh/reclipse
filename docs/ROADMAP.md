@@ -57,7 +57,7 @@ Limitações residuais (M1.1, sem bloquear M2):
 - “select next occurrence” e column mode por teclado;
 - replace no projeto ignora buffers sujos.
 
-## M2 — Núcleo semântico Java (em andamento; completion/hover/referências/rename entregues)
+## M2 — Núcleo semântico Java (fechado no núcleo nativo)
 
 Entregue:
 
@@ -68,22 +68,26 @@ Entregue:
 - fontes via `-sources.jar` e `src.zip`, abertas no visualizador de tipo externo;
 - Open Type com tipos externos; F3 em tipo do classpath abre o visualizador de metadados;
 - resolução de tipos por import, mesmo pacote, wildcard e `java.lang`;
-- diagnóstico de imports não resolvidos no painel Problemas;
+- diagnóstico de imports, tipos e membros não resolvidos, `static imports` ambíguos e `@Override` inválido no painel Problemas;
+- `javac` incremental em fundo ao salvar (com debounce e cancelamento);
 - inferência de variáveis (linhas anteriores, generics e arrays);
-- **completion de membros inline** por `.`/`Ctrl+Space`, com herança do projeto e do classpath e retorno encadeado;
+- **completion de membros inline** por `.`/`Ctrl+Space`, com herança do projeto e do classpath e retorno encadeado com type arguments;
+- overloads ranqueados por tipo com fallback de aridade;
+- type variables com substituição (projeto e `Signature` de bytecode), bounds e `Object` como fallback conservador;
+- static imports com precedência single-sobre-wildcard; ambiguidade genuína recusada e diagnosticada;
 - **hover semântico** de tipos, variáveis e símbolos;
 - **referências semânticas de tipos** e de **métodos/campos** (`Ctrl+Shift+G`), com method references e fallback textual;
 - **rename conservador** de tipos, métodos, campos e variáveis locais (`Alt+Shift+R`), com rename de arquivo, imports e proteção de overrides/shadowing;
 - inferência de `var` e hierarquia de tipos do projeto;
 - **RECLIPSE Studio**: 3 temas comutáveis, activity bar, toolbar, breadcrumb e console de diagnóstico.
 
-Pendente:
+Pendente (refinamento, fora do núcleo):
 
-- Generics/overloads completos e desambiguação de static imports concorrentes;
+- overloads finos por subtipo/varargs e conversões além de widening/boxing (entregue em 3 fases JLS);
 - rename de pacote/move e atualização de Javadoc/recursos;
-- diagnósticos semânticos nativos; fallback opcional para `javac`/JDT LS;
+- modo de precisão via JDT LS (opt-in); diagnósticos de fluxo/nullness seguem fora de escopo nativo;
 - Gradle Tooling API, bundles de version catalog e dependências de plugins;
-- Javadoc e perfis Maven.
+- Javadoc (primeira frase no hover entregue; HTML completo pendente) e perfis Maven (entregue: activeByDefault/jdk/os/property).
 
 Aceite final:
 

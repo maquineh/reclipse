@@ -255,7 +255,7 @@ pub fn plan_type_rename(
     files.retain(|file| !file.edits.is_empty());
     for file in &mut files {
         file.edits
-            .sort_by(|left, right| right.start_byte.cmp(&left.start_byte));
+            .sort_by_key(|edit| std::cmp::Reverse(edit.start_byte));
         file.edits
             .dedup_by(|left, right| left.start_byte == right.start_byte);
     }
@@ -425,7 +425,7 @@ pub fn plan_package_rename(
     files.retain(|file| !file.edits.is_empty());
     for file in &mut files {
         file.edits
-            .sort_by(|left, right| right.start_byte.cmp(&left.start_byte));
+            .sort_by_key(|edit| std::cmp::Reverse(edit.start_byte));
         file.edits
             .dedup_by(|left, right| left.start_byte == right.start_byte);
     }
@@ -581,7 +581,7 @@ pub fn plan_member_rename(
     files.retain(|file| !file.edits.is_empty());
     for file in &mut files {
         file.edits
-            .sort_by(|left, right| right.start_byte.cmp(&left.start_byte));
+            .sort_by_key(|edit| std::cmp::Reverse(edit.start_byte));
         file.edits
             .dedup_by(|left, right| left.start_byte == right.start_byte);
     }
@@ -711,7 +711,7 @@ pub fn plan_local_rename(
     if edits.is_empty() {
         return Err("nenhuma ocorrência encontrada".to_owned());
     }
-    edits.sort_by(|left, right| right.start_byte.cmp(&left.start_byte));
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.start_byte));
     edits.dedup_by(|left, right| left.start_byte == right.start_byte);
     Ok(LocalRenamePlan {
         old_name,
@@ -724,7 +724,7 @@ pub fn plan_local_rename(
 /// must not overlap.
 pub fn apply_text_edits(source: &str, edits: &[TextEdit]) -> Result<String, String> {
     let mut edits = edits.to_vec();
-    edits.sort_by(|left, right| right.start_byte.cmp(&left.start_byte));
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.start_byte));
     let mut result = source.to_owned();
     let mut last_start = source.len() + 1;
     for edit in edits {

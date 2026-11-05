@@ -7,7 +7,8 @@ pub mod resolve;
 pub mod source;
 
 pub use classfile::{
-    field_type_name, method_return_type_name, ClassInfo, MemberInfo, MemberKind, TypeKind,
+    field_type_name, method_return_type_name, signature_params_text, signature_return_text,
+    signature_type_params, ClassInfo, MemberInfo, MemberKind, TypeKind,
 };
 pub use index::{build as build_index, ClasspathIndex, ClasspathStats};
 pub use resolve::{find_jdk, resolve, ClasspathResolution, Jdk};
