@@ -5,10 +5,19 @@
 //! (**Eclipse Dark Cósmico** and **Cyber Solar Eclipse**) can be selected
 //! in the `Exibir → Tema` menu; the choice is persisted in the session.
 
-use egui::{Color32, Context, FontId, Stroke, TextStyle, Vec2};
+use egui::{
+    Color32, Context, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle, Vec2,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+const COMMISSIONER_TTF: &[u8] = include_bytes!("../assets/fonts/Commissioner-Regular.ttf");
+const COMMISSIONER_SEMIBOLD_TTF: &[u8] =
+    include_bytes!("../assets/fonts/Commissioner-SemiBold.ttf");
+const SOURCE_CODE_PRO_TTF: &[u8] = include_bytes!("../assets/fonts/SourceCodePro-Regular.ttf");
+const CAL_SANS_TTF: &[u8] = include_bytes!("../assets/fonts/CalSans.ttf");
+
 static ACTIVE_THEME: AtomicUsize = AtomicUsize::new(0);
+static FONTS_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `RECLIPSE Studio v1.0` — switchable theme set (see `docs/DESIGN_SYSTEM.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -32,6 +41,14 @@ impl ThemeKind {
             Self::RustOxide => "Rust Oxide",
             Self::EclipseCosmic => "Eclipse Cosmic",
             Self::CyberSolar => "Cyber Solar",
+        }
+    }
+
+    pub fn compact_label(self) -> &'static str {
+        match self {
+            Self::RustOxide => "Rust",
+            Self::EclipseCosmic => "Eclipse",
+            Self::CyberSolar => "Cyber",
         }
     }
 
@@ -191,8 +208,52 @@ const PALETTES: [Palette; 3] = [
     },
 ];
 
+fn install_fonts(ctx: &Context) {
+    if FONTS_INSTALLED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "commissioner".to_owned(),
+        FontData::from_static(COMMISSIONER_TTF).into(),
+    );
+    fonts.font_data.insert(
+        "commissioner-semibold".to_owned(),
+        FontData::from_static(COMMISSIONER_SEMIBOLD_TTF).into(),
+    );
+    fonts.font_data.insert(
+        "source-code-pro".to_owned(),
+        FontData::from_static(SOURCE_CODE_PRO_TTF).into(),
+    );
+    fonts.font_data.insert(
+        "cal-sans".to_owned(),
+        FontData::from_static(CAL_SANS_TTF).into(),
+    );
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, "commissioner".to_owned());
+    fonts
+        .families
+        .entry(FontFamily::Monospace)
+        .or_default()
+        .insert(0, "source-code-pro".to_owned());
+    fonts.families.insert(
+        FontFamily::Name("display".into()),
+        vec!["cal-sans".to_owned(), "commissioner-semibold".to_owned()],
+    );
+    ctx.set_fonts(fonts);
+}
+
+/// Display face (Cal Sans) for brand/headlines; falls back to Commissioner.
+pub fn display_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("display".into()))
+}
+
 pub fn configure(ctx: &Context, kind: ThemeKind) {
     ACTIVE_THEME.store(kind.slot(), Ordering::Relaxed);
+    install_fonts(ctx);
     let p = PALETTES[kind.slot()];
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = p.panel;
@@ -237,7 +298,7 @@ pub fn configure(ctx: &Context, kind: ThemeKind) {
         .insert(TextStyle::Small, FontId::proportional(11.0));
     style
         .text_styles
-        .insert(TextStyle::Heading, FontId::proportional(20.0));
+        .insert(TextStyle::Heading, display_font(22.0));
     style
         .text_styles
         .insert(TextStyle::Monospace, FontId::monospace(13.0));

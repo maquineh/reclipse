@@ -119,6 +119,17 @@ pub fn plan_type_rename(
     if classpath.get_loose(&new_fqn).is_some() {
         return Err(format!("já existe o tipo {new_fqn} no classpath"));
     }
+    if let Some(path) = index.files.iter().find_map(|(path, file)| {
+        file.local_type_names
+            .iter()
+            .any(|name| name == &old_name)
+            .then_some(path)
+    }) {
+        return Err(format!(
+            "há um tipo local chamado '{old_name}' em {}; rename cancelado por segurança",
+            path.display()
+        ));
+    }
 
     let mut files: Vec<FileEdits> = Vec::new();
     for (path, file) in &index.files {
@@ -1282,6 +1293,78 @@ class App {
         let updated = apply_text_edits(app_source, &app_edits.edits).unwrap();
         assert!(updated.contains("import static com.acme.User.persist;"));
         assert!(updated.contains("persist();"));
+    }
+
+    #[test]
+    fn ambiguous_static_imports_do_not_produce_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("com/acme/A.java");
+        let b_path = dir.path().join("com/acme/B.java");
+        let app_path = dir.path().join("com/acme/App.java");
+        std::fs::create_dir_all(a_path.parent().unwrap()).unwrap();
+        let a_source = "package com.acme; public class A { public static void save() {} }";
+        let b_source = "package com.acme; public class B { public static void save() {} }";
+        let app_source = "package com.acme; import static com.acme.A.save; import static com.acme.B.save; class App { void run() { save(); } }";
+        std::fs::write(&a_path, a_source).unwrap();
+        std::fs::write(&b_path, b_source).unwrap();
+        std::fs::write(&app_path, app_source).unwrap();
+        let a = parse_source(&a_path, a_source);
+        let b = parse_source(&b_path, b_source);
+        let app = parse_source(&app_path, app_source);
+        let project = reclipse_core::Project {
+            root: dir.path().to_path_buf(),
+            name: "test".to_owned(),
+            build_system: reclipse_core::BuildSystem::Plain,
+            source_roots: Vec::new(),
+            java_files: vec![a_path.clone(), b_path, app_path],
+            all_files: Vec::new(),
+        };
+        let index = ProjectIndex::from_files(project, vec![a, b, app], 0);
+        let types = ProjectTypes::build(&index);
+        let target = MemberTarget::Project {
+            path: a_path,
+            container: "A".to_owned(),
+            type_fqn: "com.acme.A".to_owned(),
+            name: "save".to_owned(),
+            is_call: true,
+        };
+        assert!(
+            find_member_references(&target, &types, &index, &ClasspathIndex::default()).is_empty()
+        );
+    }
+
+    #[test]
+    fn type_rename_refuses_when_a_local_type_shadows_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("com/acme/User.java");
+        let app_path = dir.path().join("com/acme/App.java");
+        std::fs::create_dir_all(user_path.parent().unwrap()).unwrap();
+        let user_source = "package com.acme; public class User {}";
+        let app_source =
+            "package com.acme; class App { void run() { class User {} User local = new User(); } }";
+        std::fs::write(&user_path, user_source).unwrap();
+        std::fs::write(&app_path, app_source).unwrap();
+        let user = parse_source(&user_path, user_source);
+        let app = parse_source(&app_path, app_source);
+        let project = reclipse_core::Project {
+            root: dir.path().to_path_buf(),
+            name: "test".to_owned(),
+            build_system: reclipse_core::BuildSystem::Plain,
+            source_roots: Vec::new(),
+            java_files: vec![user_path.clone(), app_path.clone()],
+            all_files: vec![user_path, app_path],
+        };
+        let index = ProjectIndex::from_files(project, vec![user, app], 0);
+        let types = ProjectTypes::build(&index);
+        let error = plan_type_rename(
+            "com.acme.User",
+            "Account",
+            &types,
+            &index,
+            &ClasspathIndex::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("tipo local"));
     }
 
     #[test]

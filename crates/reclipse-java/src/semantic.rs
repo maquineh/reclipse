@@ -517,7 +517,13 @@ pub fn find_type_references(
     classpath: &ClasspathIndex,
 ) -> Vec<TypeReference> {
     let mut references = Vec::new();
+    let simple = fqn.rsplit('.').next().unwrap_or(fqn);
     for (path, file) in &index.files {
+        // Local classes are not project types; skip files that shadow the
+        // target's simple name to avoid renaming a local declaration.
+        if file.local_type_names.iter().any(|name| name == simple) {
+            continue;
+        }
         for reference in &file.type_refs {
             let Some(resolved) = resolve_type(&reference.name, file, project, classpath) else {
                 continue;
@@ -738,15 +744,25 @@ fn resolve_reference_member(
     bindings: &[crate::LocalBinding],
 ) -> Option<ResolvedMember> {
     let ty = match &reference.qualifier {
-        Some(qualifier) => resolve_expression_type(
-            qualifier,
-            source,
-            char_index_of_byte(source, reference.start_byte),
-            file,
-            project,
-            index,
-            classpath,
-        )?,
+        Some(qualifier) => {
+            if reference
+                .container
+                .as_deref()
+                .is_some_and(|container| container.contains("<anonymous>"))
+                && matches!(qualifier.as_str(), "this" | "super")
+            {
+                return None;
+            }
+            resolve_expression_type(
+                qualifier,
+                source,
+                char_index_of_byte(source, reference.start_byte),
+                file,
+                project,
+                index,
+                classpath,
+            )?
+        }
         None => {
             if !reference.is_call
                 && local_binding_covers(bindings, &reference.name, reference.start_byte)
@@ -796,6 +812,7 @@ fn resolve_static_import_member(
     index: Option<&ProjectIndex>,
     classpath: &ClasspathIndex,
 ) -> Option<ResolvedMember> {
+    let mut found: Option<ResolvedMember> = None;
     for import in &file.imports {
         let Some(path) = import.trim().strip_prefix("static ") else {
             continue;
@@ -809,13 +826,21 @@ fn resolve_static_import_member(
         let Some(owner_type) = resolve_type(owner, file, project, classpath) else {
             continue;
         };
-        if let Some(found) =
+        if let Some(candidate) =
             resolve_member_of_type(&owner_type, name, Some(is_call), project, index, classpath)
         {
-            return Some(found);
+            if let Some(existing) = &found {
+                if existing.owner.name() != candidate.owner.name() {
+                    // Ambiguous static imports: Java would reject the call and
+                    // a guess could rename the wrong member.
+                    return None;
+                }
+            } else {
+                found = Some(candidate);
+            }
         }
     }
-    None
+    found
 }
 
 fn local_binding_covers(bindings: &[crate::LocalBinding], name: &str, byte: usize) -> bool {

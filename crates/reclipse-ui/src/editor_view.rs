@@ -379,7 +379,7 @@ impl Tab {
                         Pos2::new(text_clip.right(), y + row_height),
                     ),
                     0.0,
-                    with_alpha(theme::accent(), 16),
+                    with_alpha(theme::accent_dim(), 90),
                 );
             }
 

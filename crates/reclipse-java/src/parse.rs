@@ -143,6 +143,9 @@ pub struct FileSymbols {
     pub member_refs: Vec<JavaMemberReference>,
     /// Raw superclass/interface names declared in this file.
     pub type_relations: Vec<JavaTypeRelation>,
+    /// Names of local (method-scoped) type declarations. They are not project
+    /// types and must not be confused with same-named top-level types.
+    pub local_type_names: Vec<String>,
     pub errors: Vec<ParseError>,
     pub line_count: usize,
     /// Set when the file could not be read or the parser itself failed.
@@ -161,6 +164,7 @@ impl FileSymbols {
             type_refs: Vec::new(),
             member_refs: Vec::new(),
             type_relations: Vec::new(),
+            local_type_names: Vec::new(),
             errors: Vec::new(),
             line_count: 0,
             parse_error: None,
@@ -229,13 +233,40 @@ fn visit_type_refs(node: Node<'_>, source: &[u8], file: &mut FileSymbols) {
             | "annotation_type_declaration"
     ) {
         if let Some(name) = node.child_by_field_name("name") {
-            push_type_ref(name, source, file);
+            if is_local_type_declaration(node) {
+                let name = text(name, source);
+                if !name.is_empty() {
+                    file.local_type_names.push(name);
+                }
+            } else {
+                push_type_ref(name, source, file);
+            }
         }
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         visit_type_refs(child, source, file);
     }
+}
+
+fn is_local_type_declaration(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "block"
+            | "for_statement"
+            | "enhanced_for_statement"
+            | "lambda_expression"
+            | "switch_block_statement_group" => return true,
+            "class_body"
+            | "interface_body"
+            | "enum_body"
+            | "annotation_type_body"
+            | "record_body" => return false,
+            _ => current = parent.parent(),
+        }
+    }
+    false
 }
 
 fn push_type_ref(node: Node<'_>, source: &[u8], file: &mut FileSymbols) {
@@ -282,9 +313,19 @@ fn visit_member_refs(
     if let Some(name) = &type_name {
         container.push(name.clone());
     }
+    let anonymous_body = node.kind() == "class_body"
+        && node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "object_creation_expression");
+    if anonymous_body {
+        container.push("<anonymous>".to_owned());
+    }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         visit_member_refs(child, source, file, container);
+    }
+    if anonymous_body {
+        container.pop();
     }
     if type_name.is_some() {
         container.pop();
@@ -1073,6 +1114,40 @@ class App extends Base implements Runnable {
             .unwrap();
         assert!(relation.super_types.contains(&"Base".to_owned()));
         assert!(relation.super_types.contains(&"Runnable".to_owned()));
+    }
+
+    #[test]
+    fn marks_anonymous_class_member_containers() {
+        let source = r#"
+class App {
+    Runnable job = new Runnable() {
+        public void run() { helper(); }
+    };
+    void helper() {}
+}
+"#;
+        let file = parse_source(Path::new("App.java"), source);
+        let helper = file
+            .member_refs
+            .iter()
+            .find(|reference| reference.name == "helper" && reference.is_call)
+            .unwrap();
+        assert_eq!(helper.container.as_deref(), Some("App.<anonymous>"));
+    }
+
+    #[test]
+    fn detects_local_type_declarations() {
+        let source = r#"
+class App {
+    void run() {
+        class Local { int value; }
+        Local local = new Local();
+    }
+}
+"#;
+        let file = parse_source(Path::new("App.java"), source);
+        assert_eq!(file.local_type_names, vec!["Local".to_owned()]);
+        assert!(!file.symbols.iter().any(|symbol| symbol.name == "Local"));
     }
 
     #[test]

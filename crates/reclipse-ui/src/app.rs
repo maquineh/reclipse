@@ -246,6 +246,7 @@ impl ReclipseApp {
         let plugin_commands = plugins.commands();
         let recovery_entries = crate::recovery::list();
         let recovery_open = !recovery_entries.is_empty();
+        let screenshot_mode = std::env::var_os("RECLIPSE_SCREENSHOT_TO").is_some();
 
         let mut app = Self {
             root: None,
@@ -276,10 +277,10 @@ impl ReclipseApp {
             keybindings: session.keybindings.clone(),
             file_search: FileSearch::default(),
             project_search: ProjectSearch::default(),
-            show_project: session.show_project,
-            show_outline: session.show_outline,
-            show_problems: session.show_problems,
-            show_console: session.show_console,
+            show_project: session.show_project || screenshot_mode,
+            show_outline: session.show_outline || screenshot_mode,
+            show_problems: session.show_problems || screenshot_mode,
+            show_console: session.show_console || screenshot_mode,
             console_tab: ConsoleTab::Output,
             console: Vec::new(),
             app_started_at: Instant::now(),
@@ -3825,9 +3826,8 @@ impl ReclipseApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new("RECLIPSE")
-                                .strong()
-                                .color(theme::accent())
-                                .size(13.0),
+                                .font(theme::display_font(13.0))
+                                .color(theme::accent()),
                         );
                         ui.label(
                             RichText::new("Rust-native Java IDE")
@@ -4307,7 +4307,7 @@ impl ReclipseApp {
     }
 
     fn left_panel(&mut self, ctx: &Context) {
-        if !(self.show_project || self.show_outline || self.show_problems) {
+        if !(self.show_project || self.show_problems) {
             return;
         }
 
@@ -4316,7 +4316,7 @@ impl ReclipseApp {
             .resizable(true)
             .min_width(220.0)
             .max_width(520.0)
-            .default_width(300.0)
+            .default_width(280.0)
             .frame(
                 egui::Frame::NONE
                     .fill(theme::panel())
@@ -4329,9 +4329,6 @@ impl ReclipseApp {
                         if self.show_project {
                             self.project_section(ui, &mut actions);
                         }
-                        if self.show_outline {
-                            self.outline_section(ui, &mut actions);
-                        }
                         if self.show_problems {
                             self.problems_section(ui, &mut actions);
                         }
@@ -4341,6 +4338,122 @@ impl ReclipseApp {
         for action in actions {
             self.execute_action(action);
         }
+    }
+
+    fn right_panel(&mut self, ctx: &Context) {
+        if !self.show_outline {
+            return;
+        }
+        let mut actions = Vec::new();
+        egui::SidePanel::right("reclipse_right")
+            .resizable(true)
+            .min_width(220.0)
+            .max_width(440.0)
+            .default_width(260.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme::panel())
+                    .inner_margin(egui::Margin::symmetric(8, 6)),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.outline_section(ui, &mut actions);
+                        ui.add_space(10.0);
+                        self.rust_telemetry_card(ui);
+                        self.classpath_warnings_card(ui);
+                    });
+            });
+        for action in actions {
+            self.execute_action(action);
+        }
+    }
+
+    fn rust_telemetry_card(&self, ui: &mut Ui) {
+        egui::Frame::NONE
+            .fill(theme::panel_alt())
+            .stroke(egui::Stroke::new(1.0, theme::border()))
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .corner_radius(6.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("RUST ENGINE")
+                            .font(theme::display_font(10.0))
+                            .color(theme::accent()),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new("ativo").small().color(theme::green()));
+                    });
+                });
+                ui.separator();
+                let (files, symbols, elapsed) = match &self.index_status {
+                    IndexStatus::Ready {
+                        files,
+                        symbols,
+                        elapsed_ms,
+                        ..
+                    } => (
+                        files.to_string(),
+                        symbols.to_string(),
+                        format!("{elapsed_ms} ms"),
+                    ),
+                    IndexStatus::Indexing { .. } => {
+                        ("…".to_owned(), "…".to_owned(), "…".to_owned())
+                    }
+                    IndexStatus::Failed(_) => ("erro".to_owned(), "—".to_owned(), "—".to_owned()),
+                    IndexStatus::Idle => ("—".to_owned(), "—".to_owned(), "—".to_owned()),
+                };
+                telemetry_row(ui, "arquivos", &files);
+                telemetry_row(ui, "símbolos", &symbols);
+                telemetry_row(ui, "índice", &elapsed);
+                let cp = match &self.classpath_status {
+                    ClasspathStatus::Ready(stats) => {
+                        format!("{} classes", stats.classes)
+                    }
+                    ClasspathStatus::Indexing { .. } => "indexando…".to_owned(),
+                    ClasspathStatus::Failed(_) => "falhou".to_owned(),
+                    ClasspathStatus::Idle => "—".to_owned(),
+                };
+                telemetry_row(ui, "classpath", &cp);
+                telemetry_row(
+                    ui,
+                    "semântica",
+                    &format!("{} import(s)", self.semantic_problems.len()),
+                );
+                telemetry_row(ui, "tema", self.theme.compact_label());
+                telemetry_row(ui, "plugins", &self.plugins.plugin_count().to_string());
+            });
+    }
+
+    fn classpath_warnings_card(&self, ui: &mut Ui) {
+        let Some(classpath) = &self.classpath_index else {
+            return;
+        };
+        if classpath.warnings.is_empty() {
+            return;
+        }
+        ui.add_space(8.0);
+        egui::Frame::NONE
+            .fill(theme::panel_alt())
+            .stroke(egui::Stroke::new(1.0, theme::border()))
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .corner_radius(6.0)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "CLASSPATH · {} warning(s)",
+                        classpath.warnings.len()
+                    ))
+                    .font(theme::display_font(10.0))
+                    .color(theme::yellow()),
+                );
+                ui.separator();
+                for warning in classpath.warnings.iter().take(6) {
+                    ui.label(RichText::new(warning).small().color(theme::muted()));
+                }
+            });
     }
 
     fn project_section(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -4720,7 +4833,7 @@ impl ReclipseApp {
             ui.add_space(6.0);
             ui.label(
                 RichText::new("RECLIPSE Studio")
-                    .size(34.0)
+                    .font(theme::display_font(36.0))
                     .strong()
                     .color(theme::accent()),
             );
@@ -5607,6 +5720,7 @@ impl eframe::App for ReclipseApp {
         self.search_panel(ctx);
         self.activity_bar(ctx);
         self.left_panel(ctx);
+        self.right_panel(ctx);
         self.central_panel(ctx);
         self.maybe_auto_complete();
         self.show_completion(ctx);
@@ -5661,8 +5775,26 @@ impl Drop for ReclipseApp {
 
 fn section_header(ui: &mut Ui, title: &str) {
     ui.add_space(4.0);
-    ui.label(RichText::new(title).small().strong().color(theme::muted()));
+    ui.label(
+        RichText::new(title)
+            .font(theme::display_font(11.0))
+            .color(theme::muted()),
+    );
     ui.separator();
+}
+
+fn telemetry_row(ui: &mut Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).small().color(theme::muted()));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(
+                RichText::new(value)
+                    .small()
+                    .monospace()
+                    .color(theme::text()),
+            );
+        });
+    });
 }
 
 fn toolbar_button(ui: &mut Ui, label: &str, hint: &str) -> bool {

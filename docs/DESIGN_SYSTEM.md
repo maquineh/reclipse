@@ -200,4 +200,4 @@ O design system está implementado nativamente no shell egui, sem HTML/CSS:
 - `crates/reclipse-ui/src/editor_view.rs`: linha atual, seleção e destaques de busca derivam da paleta ativa.
 - `session.json`: o campo `theme` persiste `rust-oxide`, `eclipse-cosmic` ou `cyber-solar`; `RECLIPSE_THEME` permite override no startup.
 
-As fontes Cal Sans/Commissioner/Source Code Pro são a referência tipográfica; a UI usa as faces proporcionais e monoespaçadas do egui até o carregamento de fontes customizadas.
+As fontes **Cal Sans**, **Commissioner** e **Source Code Pro** são embutidas via `include_bytes!` a partir de `crates/reclipse-ui/assets/fonts/` (OFL 1.1), com fallback para as fontes do egui em glifos não cobertos.

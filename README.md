@@ -13,7 +13,7 @@ Este repositório contém o **MVP 0.1.0**, o **M1** do editor e a **fundação d
 ## O que já funciona
 
 - Shell nativo em Rust com **egui/eframe** (GPU), tema escuro e layout de IDE.
-- **RECLIPSE Studio**: identidade visual com emblema desenhado em GPU, activity bar, toolbar de ações, breadcrumb, console de diagnóstico e **3 temas** comutáveis (`Exibir → Tema`): Rust Oxide, Eclipse Dark Cósmico e Cyber Solar Eclipse. Persistidos na sessão.
+- **RECLIPSE Studio**: identidade visual com emblema desenhado em GPU, fontes embutidas (Cal Sans/Commissioner/Source Code Pro), activity bar, toolbar de ações, breadcrumb, right dock de outline/telemetria, console de diagnóstico e **3 temas** comutáveis (`Exibir → Tema`): Rust Oxide, Eclipse Dark Cósmico e Cyber Solar Eclipse. Persistidos na sessão.
 - Abertura de pasta/projeto com descoberta de fontes Java:
   - Eclipse (`.project` + `.classpath`)
   - Maven (`pom.xml`, `src/main/java`, `src/test/java`)
@@ -98,7 +98,7 @@ Cyber Solar Eclipse:
 Este MVP é deliberadamente honesto sobre o escopo:
 
 - Não compila, não roda testes e não depura projetos Java ainda.
-- A semântica Java cobre imports/tipos, completion de membros, hover, referências semânticas de tipos/membros e rename conservador, mas ainda não tem resolução completa de generics/overloads ou rename de membros do classpath.
+- A semântica Java cobre imports/tipos, completion de membros, hover, referências semânticas de tipos/membros e rename conservador, mas ainda não tem resolução completa de generics/overloads, desambiguação de static imports concorrentes ou rename de membros do classpath. Tipos locais são detectados; tipos anônimos ainda não são modelados.
 - Rename não reescreve Javadoc, strings, configuração por reflexão ou nomes em arquivos de recursos; overrides/implementações e locais sombreados são recusados por segurança, e o rename de workspace exige buffers Java salvos.
 - Maven/Gradle resolvem dependências transitivas do repositório local; não há download, perfis Maven nem Tooling API/bundles avançados do Gradle.
 - Multi-cursor agrupa undo de digitação, mas backspace/delete multi ainda são por tecla.
