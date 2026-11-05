@@ -1274,7 +1274,7 @@ pub fn unresolved_member_references(
 fn qualifier_is_plain_variable(qualifier: &str) -> bool {
     let qualifier = qualifier.trim();
     !qualifier.is_empty()
-        && qualifier.chars().all(|c| is_identifier_char(c))
+        && qualifier.chars().all(is_identifier_char)
         && qualifier != "this"
         && qualifier != "super"
 }
@@ -3066,6 +3066,7 @@ fn empty_file() -> FileSymbols {
         member_refs: Vec::new(),
         type_relations: Vec::new(),
         local_type_names: Vec::new(),
+        test_methods: Vec::new(),
         errors: Vec::new(),
         line_count: 0,
         parse_error: None,
@@ -4487,7 +4488,7 @@ mod tests {
                 "package com.acme; public class Box<T> { public T get() { return null; } }",
             ),
         ]);
-        let mut classpath = string_classpath();
+        let classpath = string_classpath();
         let app = empty_file("com/acme/App.java", Some("com.acme"));
         // Box<String>.get() resolves to String through the type variable.
         let chained = resolve_expression_type(

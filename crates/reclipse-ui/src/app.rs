@@ -18,8 +18,8 @@ use reclipse_classpath::{ClasspathIndex, ClasspathStats};
 use reclipse_core::{discover_project, Project, IGNORED_DIRS};
 use reclipse_editor::{Document, SearchMatcher, SearchOptions};
 use reclipse_java::refactor::{
-    apply_text_edits, local_binding_at, plan_local_rename, plan_member_rename, plan_package_rename,
-    plan_type_rename, LocalRenamePlan, RenameKind, RenamePlan,
+    apply_text_edits, local_binding_at, organize_imports, plan_local_rename, plan_member_rename,
+    plan_package_rename, plan_type_rename, LocalRenamePlan, RenameKind, RenamePlan,
 };
 use reclipse_java::semantic::{
     completion_context, find_member_references, find_type_references, infer_variable_type,
@@ -39,6 +39,9 @@ use crate::session::Keybindings;
 use crate::theme;
 use crate::tree::FileTree;
 
+const CONSOLE_MAX_LINES: usize = 600;
+const CONSOLE_MAX_LINE_CHARS: usize = 4096;
+
 enum IndexMessage {
     Progress { done: usize, total: usize },
     Done(Box<IndexPayload>),
@@ -52,6 +55,7 @@ enum ClasspathMessage {
 }
 
 enum BuildMessage {
+    Output(String),
     Compiled(Box<build::CompileResult>),
     RunFinished {
         compile: Box<build::CompileResult>,
@@ -244,6 +248,7 @@ pub struct ReclipseApp {
     main_classes: Vec<String>,
     build_running: bool,
     build_rx: Option<Receiver<BuildMessage>>,
+    build_output_buffer: String,
     build_cancel: Option<Arc<AtomicBool>>,
     build_label: Option<String>,
     javac_diag_pending_at: Option<Instant>,
@@ -261,6 +266,7 @@ pub struct ReclipseApp {
     launch: build::LaunchConfig,
     launch_open: bool,
     test_failures: Vec<build::TestFailure>,
+    test_targets: Vec<reclipse_java::JavaTestMethod>,
     classpath_view: Option<String>,
     classpath_source: Option<(String, String)>,
     classpath_reload_at: Option<Instant>,
@@ -286,6 +292,7 @@ pub struct ReclipseApp {
     show_console: bool,
     console_tab: ConsoleTab,
     console: Vec<LogLine>,
+    console_dropped: usize,
     app_started_at: Instant,
     plugins: PluginHost,
     plugin_commands: Vec<PluginCommand>,
@@ -335,6 +342,7 @@ impl ReclipseApp {
             main_classes: Vec::new(),
             build_running: false,
             build_rx: None,
+            build_output_buffer: String::new(),
             build_cancel: None,
             build_label: None,
             javac_diag_pending_at: None,
@@ -352,6 +360,7 @@ impl ReclipseApp {
             launch: session.launch.clone(),
             launch_open: false,
             test_failures: Vec::new(),
+            test_targets: Vec::new(),
             classpath_view: None,
             classpath_source: None,
             classpath_reload_at: None,
@@ -376,7 +385,16 @@ impl ReclipseApp {
             show_problems: session.show_problems || screenshot_mode,
             show_console: session.show_console || screenshot_mode,
             console_tab: ConsoleTab::Output,
-            console: Vec::new(),
+            console: session
+                .console_history
+                .iter()
+                .map(|text| LogLine {
+                    at: Duration::ZERO,
+                    level: LogLevel::Info,
+                    text: text.clone(),
+                })
+                .collect(),
+            console_dropped: 0,
             app_started_at: Instant::now(),
             plugins,
             plugin_commands,
@@ -781,14 +799,7 @@ impl ReclipseApp {
                         }
                     }
 
-                    if let Some(index) = &self.index {
-                        self.project_types = Some(ProjectTypes::build(index));
-                    }
-                    self.main_classes = self
-                        .index
-                        .as_ref()
-                        .map(build::main_classes)
-                        .unwrap_or_default();
+                    self.refresh_semantics();
                     if self.frame_bench.is_none() {
                         if let Some(project) = self.project.clone() {
                             self.start_classpath(project);
@@ -1043,6 +1054,23 @@ impl ReclipseApp {
             .index
             .as_ref()
             .map(build::main_classes)
+            .unwrap_or_default();
+        self.test_targets = self
+            .index
+            .as_ref()
+            .map(|index| {
+                let mut tests: Vec<_> = index
+                    .files
+                    .values()
+                    .flat_map(|file| file.test_methods.iter().cloned())
+                    .collect();
+                tests.sort_by(|left, right| {
+                    left.class_name
+                        .cmp(&right.class_name)
+                        .then(left.method.cmp(&right.method))
+                });
+                tests
+            })
             .unwrap_or_default();
     }
 
@@ -1305,6 +1333,10 @@ impl ReclipseApp {
     }
 
     fn test_project(&mut self) {
+        self.test_project_filtered(None);
+    }
+
+    fn test_project_filtered(&mut self, filter: Option<build::TestFilter>) {
         if self.build_running {
             self.toast("Build já em andamento (cancele para recomeçar)");
             return;
@@ -1315,21 +1347,44 @@ impl ReclipseApp {
         };
         self.test_failures.clear();
         self.build_running = true;
-        self.build_label = Some("test".to_owned());
+        let label = filter
+            .as_ref()
+            .map(|filter| match &filter.method {
+                Some(method) => format!("{}#{}", filter.class_name, method),
+                None => filter.class_name.clone(),
+            })
+            .unwrap_or_else(|| "test".to_owned());
+        self.build_label = Some(label.clone());
         let cancel = Arc::new(AtomicBool::new(false));
         self.build_cancel = Some(cancel.clone());
         let (sender, receiver) = mpsc::channel();
         self.build_rx = Some(receiver);
         self.show_console = true;
         let env = std::env::vars().collect();
-        self.log(LogLevel::Info, "Executando testes (mvn/gradle)…");
+        self.log(LogLevel::Info, format!("Executando testes ({label})…"));
         thread::spawn(move || {
-            let message = match build::run_tests(&project, &env, &cancel) {
+            let output_sender = sender.clone();
+            let message = match build::run_tests_filtered(
+                &project,
+                &env,
+                &cancel,
+                filter.as_ref(),
+                &mut |text| {
+                    let _ = output_sender.send(BuildMessage::Output(text.to_owned()));
+                },
+            ) {
                 Ok(result) => BuildMessage::TestsFinished(Box::new(result)),
                 Err(error) => BuildMessage::Failed(error),
             };
             let _ = sender.send(message);
         });
+    }
+
+    fn run_test_class(&mut self, class_name: &str) {
+        self.test_project_filtered(Some(build::TestFilter {
+            class_name: class_name.to_owned(),
+            method: None,
+        }));
     }
 
     fn fetch_dependencies(&mut self) {
@@ -1352,18 +1407,61 @@ impl ReclipseApp {
             LogLevel::Info,
             "Baixando dependências para o repositório local (mvn/gradle)…",
         );
+        let env = std::env::vars().collect();
         thread::spawn(move || {
-            let message =
-                match build::resolve_dependencies(&project, &std::env::vars().collect(), &cancel) {
-                    Ok(result) => BuildMessage::External {
-                        label: result.tool,
-                        success: result.success,
-                        output: result.output,
-                        elapsed_ms: result.elapsed_ms,
-                        reindex_classpath: true,
-                    },
-                    Err(error) => BuildMessage::Failed(error),
-                };
+            let output_sender = sender.clone();
+            let message = match build::resolve_dependencies(&project, &env, &cancel, &mut |text| {
+                let _ = output_sender.send(BuildMessage::Output(text.to_owned()));
+            }) {
+                Ok(result) => BuildMessage::External {
+                    label: result.tool,
+                    success: result.success,
+                    output: result.output,
+                    elapsed_ms: result.elapsed_ms,
+                    reindex_classpath: true,
+                },
+                Err(error) => BuildMessage::Failed(error),
+            };
+            let _ = sender.send(message);
+        });
+    }
+
+    fn run_lifecycle_phase(&mut self, phase: build::LifecyclePhase) {
+        if self.build_running {
+            self.toast("Build já em andamento (cancele para recomeçar)");
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            self.toast("Abra um projeto antes de compilar");
+            return;
+        };
+        self.build_running = true;
+        self.build_label = Some(phase.label().to_owned());
+        self.build_output_buffer.clear();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.build_cancel = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.build_rx = Some(receiver);
+        self.show_console = true;
+        let env = std::env::vars().collect();
+        self.log(
+            LogLevel::Info,
+            format!("Executando lifecycle: {}…", phase.label()),
+        );
+        thread::spawn(move || {
+            let output_sender = sender.clone();
+            let message = match build::run_lifecycle(&project, &env, &cancel, phase, &mut |text| {
+                let _ = output_sender.send(BuildMessage::Output(text.to_owned()));
+            }) {
+                Ok(result) => BuildMessage::External {
+                    label: result.tool,
+                    success: result.success,
+                    output: result.output,
+                    elapsed_ms: result.elapsed_ms,
+                    reindex_classpath: false,
+                },
+                Err(error) => BuildMessage::Failed(error),
+            };
             let _ = sender.send(message);
         });
     }
@@ -1372,7 +1470,7 @@ impl ReclipseApp {
         &mut self,
         label: &str,
         success: bool,
-        output: &str,
+        _output: &str,
         elapsed_ms: u128,
         reindex_classpath: bool,
     ) {
@@ -1382,25 +1480,6 @@ impl ReclipseApp {
             self.log(
                 LogLevel::Error,
                 format!("{label}: falhou em {elapsed_ms} ms"),
-            );
-        }
-        let lines: Vec<&str> = output
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .collect();
-        let tail = if lines.len() > 60 {
-            &lines[lines.len() - 60..]
-        } else {
-            &lines[..]
-        };
-        for line in tail {
-            self.log(
-                if success {
-                    LogLevel::Info
-                } else {
-                    LogLevel::Error
-                },
-                (*line).to_owned(),
             );
         }
         self.toast(if success {
@@ -1441,10 +1520,13 @@ impl ReclipseApp {
         self.build_label = None;
         for message in messages {
             match message {
+                BuildMessage::Output(text) => self.push_build_output(&text),
                 BuildMessage::Compiled(compiled) => {
+                    self.flush_build_output();
                     self.apply_compile_result(&compiled);
                 }
                 BuildMessage::RunFinished { compile, run, main } => {
+                    self.flush_build_output();
                     self.apply_compile_result(&compile);
                     if run.output.contains("execução cancelada") {
                         self.log(LogLevel::Warning, format!("{main}: execução cancelada"));
@@ -1481,6 +1563,7 @@ impl ReclipseApp {
                     });
                 }
                 BuildMessage::TestsFinished(result) => {
+                    self.flush_build_output();
                     self.apply_test_result(&result);
                 }
                 BuildMessage::External {
@@ -1490,6 +1573,7 @@ impl ReclipseApp {
                     elapsed_ms,
                     reindex_classpath,
                 } => {
+                    self.flush_build_output();
                     self.apply_external_result(
                         &label,
                         success,
@@ -1499,6 +1583,7 @@ impl ReclipseApp {
                     );
                 }
                 BuildMessage::Failed(error) => {
+                    self.flush_build_output();
                     self.log(LogLevel::Error, format!("Build: {error}"));
                     self.toast(error);
                 }
@@ -1508,6 +1593,36 @@ impl ReclipseApp {
             // The worker always sends at least one message; a silent disconnect
             // is reported as a build failure so the UI never stays "running".
             self.toast("O processo de build terminou inesperadamente");
+        }
+    }
+
+    fn push_build_output(&mut self, text: &str) {
+        self.build_output_buffer.push_str(text);
+        while let Some(position) = self.build_output_buffer.find('\n') {
+            let line: String = self.build_output_buffer.drain(..=position).collect();
+            let line = line.trim_end_matches(['\r', '\n']);
+            if !line.trim().is_empty() {
+                let lower = line.to_lowercase();
+                let level = if lower.contains("error")
+                    || lower.contains("failed")
+                    || lower.contains("falhou")
+                {
+                    LogLevel::Error
+                } else if lower.contains("warning") || lower.contains("warn") {
+                    LogLevel::Warning
+                } else {
+                    LogLevel::Info
+                };
+                self.log(level, line);
+            }
+        }
+    }
+
+    fn flush_build_output(&mut self) {
+        let line = self.build_output_buffer.trim().to_owned();
+        self.build_output_buffer.clear();
+        if !line.is_empty() {
+            self.log(LogLevel::Info, line);
         }
     }
 
@@ -1578,34 +1693,35 @@ impl ReclipseApp {
             ),
         );
         for failure in result.summary.failures_detail.iter().take(30) {
+            let identity = failure
+                .class_name
+                .as_deref()
+                .map(|class| match &failure.method {
+                    Some(method) => format!("{class}#{method}"),
+                    None => class.to_owned(),
+                })
+                .unwrap_or_else(|| "teste".to_owned());
             self.log(
                 LogLevel::Error,
-                format!(
-                    "teste: {}:{}: {}",
-                    short_file(&failure.file.to_string_lossy()),
-                    failure.line,
-                    failure.message
-                ),
+                if failure.file.as_os_str().is_empty() {
+                    format!("teste: {identity}: {}", failure.message)
+                } else {
+                    format!(
+                        "teste: {}:{}: {}",
+                        short_file(&failure.file.to_string_lossy()),
+                        failure.line,
+                        failure.message
+                    )
+                },
             );
         }
         if !result.success {
             self.show_problems = true;
-            for line in result
-                .output
-                .lines()
-                .rev()
-                .take(30)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-            {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                // Keep raw tool output for context; hyperlinks are resolved in the console.
-                self.log(LogLevel::Error, line);
-                if self.console.len() > 600 {
-                    break;
+            if result.summary.failures_detail.is_empty() {
+                for line in result.output.lines().take(24) {
+                    if !line.trim().is_empty() {
+                        self.log(LogLevel::Error, line);
+                    }
                 }
             }
         }
@@ -2052,6 +2168,48 @@ impl ReclipseApp {
         }
 
         self.textual_references(word);
+    }
+
+    fn organize_imports(&mut self) {
+        let Some(active) = self.active_tab else {
+            self.toast("Nenhum arquivo ativo");
+            return;
+        };
+        let path = self.tabs[active].doc.path.clone();
+        let source = self.tabs[active].doc.text();
+        let file = reclipse_java::parse_source(&path, &source);
+        match organize_imports(&source, &file) {
+            Ok(edits) => {
+                let count = edits.len();
+                for edit in edits {
+                    let start = source[..edit.start_byte].chars().count();
+                    let end = source[..edit.end_byte].chars().count();
+                    self.tabs[active].doc.edit(start, end, &edit.replacement);
+                }
+                self.tabs[active].invalidate_highlight();
+                self.tabs[active].focus();
+                self.toast(format!("{count} import(s) organizado(s)"));
+            }
+            Err(error) => self.toast(error),
+        }
+    }
+
+    fn format_file(&mut self) {
+        let Some(active) = self.active_tab else {
+            self.toast("Nenhum arquivo ativo");
+            return;
+        };
+        let source = self.tabs[active].doc.text();
+        match build::format_source(&source) {
+            Ok(formatted) => {
+                let len = source.chars().count();
+                self.tabs[active].doc.edit(0, len, &formatted);
+                self.tabs[active].invalidate_highlight();
+                self.tabs[active].focus();
+                self.toast("Arquivo formatado");
+            }
+            Err(error) => self.toast(error),
+        }
     }
 
     fn textual_references(&mut self, word: String) {
@@ -2668,6 +2826,16 @@ impl ReclipseApp {
             show_outline: self.show_outline,
             show_problems: self.show_problems,
             show_console: self.show_console,
+            console_history: self
+                .console
+                .iter()
+                .rev()
+                .take(600)
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
             font_size: self.font_size,
             theme: self.theme.config_name().to_owned(),
             launch: self.launch.clone(),
@@ -3672,13 +3840,23 @@ impl ReclipseApp {
     }
 
     fn log(&mut self, level: LogLevel, text: impl Into<String>) {
+        let mut text = text.into();
+        if text.chars().count() > CONSOLE_MAX_LINE_CHARS {
+            text = text
+                .chars()
+                .take(CONSOLE_MAX_LINE_CHARS - 16)
+                .collect::<String>()
+                + "… [truncated]";
+        }
         self.console.push(LogLine {
             at: self.app_started_at.elapsed(),
             level,
-            text: text.into(),
+            text,
         });
-        if self.console.len() > 300 {
-            self.console.remove(0);
+        if self.console.len() > CONSOLE_MAX_LINES {
+            let excess = self.console.len() - CONSOLE_MAX_LINES;
+            self.console.drain(0..excess);
+            self.console_dropped += excess;
         }
     }
 
@@ -3712,6 +3890,17 @@ impl ReclipseApp {
                         Action::Reindex,
                     ),
                     PaletteEntry::new("Projeto: compilar com javac", "", Action::Compile),
+                    PaletteEntry::new(
+                        "Projeto: build compile (mvn/gradle)",
+                        "",
+                        Action::BuildCompile,
+                    ),
+                    PaletteEntry::new(
+                        "Projeto: build package (mvn/gradle)",
+                        "",
+                        Action::BuildPackage,
+                    ),
+                    PaletteEntry::new("Projeto: build clean (mvn/gradle)", "", Action::BuildClean),
                     PaletteEntry::new("Projeto: executar", "F6", Action::Run),
                     PaletteEntry::new("Projeto: testar (mvn/gradle)", "", Action::Test),
                     PaletteEntry::new(
@@ -3734,6 +3923,12 @@ impl ReclipseApp {
                     ),
                     PaletteEntry::new("Editar: renomear", "Alt+Shift+R", Action::Rename),
                     PaletteEntry::new("Editar: renomear pacote", "", Action::RenamePackage),
+                    PaletteEntry::new(
+                        "Código: organizar imports",
+                        "Ctrl+Shift+I",
+                        Action::OrganizeImports,
+                    ),
+                    PaletteEntry::new("Código: formatar arquivo", "Ctrl+Alt+F", Action::FormatFile),
                     PaletteEntry::new(
                         "Navegar: referências",
                         "Ctrl+Shift+G",
@@ -3943,6 +4138,14 @@ impl ReclipseApp {
         }
         if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::F11)) {
             self.toast("Debugger JDWP/JDI planejado para o M4");
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::I)) {
+            self.organize_imports();
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL | Modifiers::ALT, Key::F)) {
+            self.format_file();
             return;
         }
 
@@ -4644,6 +4847,26 @@ impl ReclipseApp {
                         }
                     });
 
+                    ui.menu_button("Código", |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new("Organizar imports")
+                                    .shortcut_text("Ctrl+Shift+I"),
+                            )
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.organize_imports();
+                        }
+                        if ui
+                            .add(egui::Button::new("Formatar arquivo").shortcut_text("Ctrl+Alt+F"))
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.format_file();
+                        }
+                    });
+
                     ui.menu_button("Navegar", |ui| {
                         if ui
                             .add(
@@ -4705,6 +4928,18 @@ impl ReclipseApp {
                         if ui.button("Compilar com javac").clicked() {
                             ui.close_menu();
                             self.compile_project();
+                        }
+                        if ui.button("Build compile (mvn/gradle)").clicked() {
+                            ui.close_menu();
+                            self.run_lifecycle_phase(build::LifecyclePhase::Compile);
+                        }
+                        if ui.button("Package (mvn/gradle)").clicked() {
+                            ui.close_menu();
+                            self.run_lifecycle_phase(build::LifecyclePhase::Package);
+                        }
+                        if ui.button("Clean (mvn/gradle)").clicked() {
+                            ui.close_menu();
+                            self.run_lifecycle_phase(build::LifecyclePhase::Clean);
                         }
                         if ui
                             .add(egui::Button::new("Executar").shortcut_text("Ctrl+F11"))
@@ -4931,6 +5166,13 @@ impl ReclipseApp {
                         }
                         if toolbar_button(ui, "Compilar", "Compilar com javac") {
                             actions.push(Action::Compile);
+                        }
+                        if toolbar_button(
+                            ui,
+                            "Build",
+                            "Compile do Maven/Gradle com output incremental",
+                        ) {
+                            actions.push(Action::BuildCompile);
                         }
                         if toolbar_button(ui, "Testar", "mvn/gradle test com parser") {
                             actions.push(Action::Test);
@@ -5179,6 +5421,19 @@ impl ReclipseApp {
                             .small()
                             .color(theme::muted()),
                         );
+                        ui.label(
+                            RichText::new(format!(
+                                "{} linhas{}",
+                                self.console.len(),
+                                if self.console_dropped > 0 {
+                                    format!(" (+{} antigas)", self.console_dropped)
+                                } else {
+                                    String::new()
+                                }
+                            ))
+                            .small()
+                            .color(theme::muted()),
+                        );
                     });
                 });
                 ui.separator();
@@ -5205,6 +5460,7 @@ impl ReclipseApp {
                                         LogLevel::Error => theme::red(),
                                     };
                                     let seconds = line.at.as_secs();
+                                    let clean = strip_ansi(&line.text);
                                     let text = format!(
                                         "[{:02}:{:02}] {}",
                                         seconds / 60,
@@ -5212,7 +5468,7 @@ impl ReclipseApp {
                                         line.text
                                     );
                                     if let Some((file, lineno)) =
-                                        build::parse_file_link(&line.text, root.as_deref())
+                                        build::parse_file_link(&clean, root.as_deref())
                                     {
                                         ui.horizontal(|ui| {
                                             ui.label(
@@ -5234,10 +5490,7 @@ impl ReclipseApp {
                                                 .link(
                                                     RichText::new(format!(
                                                         "{label} {}",
-                                                        line.text
-                                                            .chars()
-                                                            .take(220)
-                                                            .collect::<String>()
+                                                        clean.chars().take(220).collect::<String>()
                                                     ))
                                                     .color(color),
                                                 )
@@ -5247,11 +5500,12 @@ impl ReclipseApp {
                                             }
                                         });
                                     } else {
-                                        ui.label(
-                                            RichText::new(text).monospace().size(11.0).color(color),
-                                        );
+                                        ui.label(ansi_layout(
+                                            &text,
+                                            color,
+                                            egui::FontId::monospace(11.0),
+                                        ));
                                     }
-                                    let _ = color;
                                 }
                                 if let Some((file, lineno)) = open_link {
                                     let file = if file.is_absolute() {
@@ -5298,6 +5552,7 @@ impl ReclipseApp {
             });
         if clear {
             self.console.clear();
+            self.console_dropped = 0;
         }
         if close {
             self.show_console = false;
@@ -5587,12 +5842,123 @@ impl ReclipseApp {
                     .show(ui, |ui| {
                         self.outline_section(ui, &mut actions);
                         ui.add_space(10.0);
+                        self.tests_section(ui);
+                        ui.add_space(10.0);
                         self.rust_telemetry_card(ui);
                         self.classpath_warnings_card(ui);
                     });
             });
         for action in actions {
             self.execute_action(action);
+        }
+    }
+
+    fn tests_section(&mut self, ui: &mut Ui) {
+        section_header(ui, "TESTES");
+        let tests = self.test_targets.clone();
+        if tests.is_empty() {
+            ui.label(
+                RichText::new("Nenhum teste JUnit descoberto")
+                    .small()
+                    .color(theme::muted()),
+            );
+            return;
+        }
+        let failures = self.test_failures.clone();
+        let mut run: Option<build::TestFilter> = None;
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{} método(s)", tests.len()))
+                    .small()
+                    .color(theme::muted()),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .small_button("Todos")
+                    .on_hover_text("Executar todos")
+                    .clicked()
+                {
+                    run = Some(build::TestFilter {
+                        class_name: String::new(),
+                        method: None,
+                    });
+                }
+            });
+        });
+        let mut current_class = String::new();
+        for test in &tests {
+            if test.class_name != current_class {
+                current_class = test.class_name.clone();
+                let class_failed = failures
+                    .iter()
+                    .any(|failure| failure.class_name.as_deref() == Some(&current_class));
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("▶")
+                        .on_hover_text("Executar a classe")
+                        .clicked()
+                    {
+                        run = Some(build::TestFilter {
+                            class_name: current_class.clone(),
+                            method: None,
+                        });
+                    }
+                    ui.label(RichText::new(&current_class).small().strong().color(
+                        if class_failed {
+                            theme::red()
+                        } else {
+                            theme::accent()
+                        },
+                    ))
+                    .on_hover_text(format!(
+                        "{} · {}",
+                        current_class,
+                        match test.framework {
+                            reclipse_java::TestFramework::JUnit4 => "JUnit 4",
+                            reclipse_java::TestFramework::JUnit5 => "JUnit 5",
+                        }
+                    ));
+                });
+            }
+            let method_failed = failures.iter().any(|failure| {
+                failure.class_name.as_deref() == Some(&current_class)
+                    && failure.method.as_deref() == Some(&test.method)
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                if ui
+                    .small_button("▶")
+                    .on_hover_text("Executar este teste")
+                    .clicked()
+                {
+                    run = Some(build::TestFilter {
+                        class_name: test.class_name.clone(),
+                        method: Some(test.method.clone()),
+                    });
+                }
+                let label = ui.selectable_label(
+                    false,
+                    RichText::new(&test.method)
+                        .size(12.0)
+                        .color(if method_failed {
+                            theme::red()
+                        } else {
+                            theme::text()
+                        }),
+                );
+                if label.clicked() {
+                    self.open_at(test.file.clone(), test.line, 1);
+                }
+            });
+        }
+        if let Some(filter) = run {
+            if filter.class_name.is_empty() {
+                self.test_project();
+            } else if filter.method.is_some() {
+                self.test_project_filtered(Some(filter));
+            } else {
+                self.run_test_class(&filter.class_name);
+            }
         }
     }
 
@@ -5826,6 +6192,8 @@ impl ReclipseApp {
             self.javac_problems.iter().take(300).cloned().collect();
         let test_total = self.test_failures.len();
         let tests: Vec<build::TestFailure> = self.test_failures.iter().take(100).cloned().collect();
+        let jdt_total = self.jdtls_problems.len();
+        let jdt: Vec<JdtProblem> = self.jdtls_problems.iter().take(300).cloned().collect();
         let root = self.root.clone();
 
         ui.label(
@@ -5837,7 +6205,12 @@ impl ReclipseApp {
                     theme::red()
                 }),
         );
-        if total == 0 && semantic_total == 0 && javac_total == 0 && test_total == 0 {
+        if total == 0
+            && semantic_total == 0
+            && javac_total == 0
+            && test_total == 0
+            && jdt_total == 0
+        {
             return;
         }
 
@@ -5974,17 +6347,71 @@ impl ReclipseApp {
                             .into_owned()
                     })
                     .unwrap_or_else(|| failure.file.display().to_string());
-                let label = format!(
-                    "{}:{}  {}",
-                    short_file(&relative),
-                    failure.line,
-                    failure.message
-                );
+                let label = if failure.file.as_os_str().is_empty() {
+                    format!(
+                        "{}  {}",
+                        failure
+                            .class_name
+                            .as_deref()
+                            .map(|class| match &failure.method {
+                                Some(method) => format!("{class}#{method}"),
+                                None => class.to_owned(),
+                            })
+                            .unwrap_or_else(|| "teste".to_owned()),
+                        failure.message
+                    )
+                } else {
+                    format!(
+                        "{}:{}  {}",
+                        short_file(&relative),
+                        failure.line,
+                        failure.message
+                    )
+                };
                 if ui
                     .selectable_label(false, RichText::new(label).size(12.0).color(theme::red()))
                     .clicked()
+                    && !failure.file.as_os_str().is_empty()
                 {
                     actions.push(Action::OpenAt(failure.file, failure.line, 1));
+                }
+            }
+        }
+
+        if jdt_total > 0 {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!("JDT LS: {jdt_total} diagnóstico(s)"))
+                    .small()
+                    .color(theme::yellow()),
+            );
+            for problem in jdt {
+                let relative = root
+                    .as_ref()
+                    .map(|root| {
+                        problem
+                            .file
+                            .strip_prefix(root)
+                            .unwrap_or(&problem.file)
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .unwrap_or_else(|| problem.file.display().to_string());
+                let label = format!(
+                    "{}:{}:{}  {}",
+                    short_file(&relative),
+                    problem.line,
+                    problem.column,
+                    problem.message
+                );
+                if ui
+                    .selectable_label(
+                        false,
+                        RichText::new(label).size(12.0).color(theme::yellow()),
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::OpenAt(problem.file, problem.line, problem.column));
                 }
             }
         }
@@ -6808,6 +7235,9 @@ impl ReclipseApp {
             }
             Action::Reindex => self.reindex(),
             Action::Compile => self.compile_project(),
+            Action::BuildCompile => self.run_lifecycle_phase(build::LifecyclePhase::Compile),
+            Action::BuildPackage => self.run_lifecycle_phase(build::LifecyclePhase::Package),
+            Action::BuildClean => self.run_lifecycle_phase(build::LifecyclePhase::Clean),
             Action::Run => self.run_project(),
             Action::Test => self.test_project(),
             Action::FetchDeps => self.fetch_dependencies(),
@@ -6824,6 +7254,8 @@ impl ReclipseApp {
             Action::GoToDefinition => self.goto_definition(),
             Action::Rename => self.begin_rename(),
             Action::RenamePackage => self.begin_package_rename(),
+            Action::OrganizeImports => self.organize_imports(),
+            Action::FormatFile => self.format_file(),
             Action::FindReferences => self.find_references(),
             Action::FindInFile => self.begin_file_search(false),
             Action::ReplaceInFile => self.begin_file_search(true),
@@ -7573,6 +8005,148 @@ fn tint(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }
 
+fn strip_ansi(text: &str) -> String {
+    let characters: Vec<char> = text.chars().collect();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < characters.len() {
+        if characters[index] == '\u{1b}' && characters.get(index + 1) == Some(&'[') {
+            index += 2;
+            while index < characters.len() && characters[index] != 'm' {
+                index += 1;
+            }
+            if index < characters.len() {
+                index += 1;
+            }
+        } else {
+            output.push(characters[index]);
+            index += 1;
+        }
+    }
+    output
+}
+
+fn ansi_layout(text: &str, base: Color32, font: egui::FontId) -> egui::text::LayoutJob {
+    let characters: Vec<char> = text.chars().collect();
+    let mut job = egui::text::LayoutJob::default();
+    let mut color = base;
+    let mut buffer = String::new();
+    let mut index = 0;
+    let flush = |job: &mut egui::text::LayoutJob, buffer: &mut String, color: Color32| {
+        if buffer.is_empty() {
+            return;
+        }
+        let format = egui::TextFormat {
+            font_id: font.clone(),
+            color,
+            ..Default::default()
+        };
+        job.append(buffer, 0.0, format);
+        buffer.clear();
+    };
+    while index < characters.len() {
+        if characters[index] == '\u{1b}' && characters.get(index + 1) == Some(&'[') {
+            flush(&mut job, &mut buffer, color);
+            index += 2;
+            let mut codes = String::new();
+            while index < characters.len() && characters[index] != 'm' {
+                codes.push(characters[index]);
+                index += 1;
+            }
+            if index < characters.len() {
+                index += 1;
+            }
+            apply_sgr(&codes, &mut color, base);
+        } else {
+            buffer.push(characters[index]);
+            index += 1;
+        }
+    }
+    flush(&mut job, &mut buffer, color);
+    job
+}
+
+fn apply_sgr(codes: &str, color: &mut Color32, base: Color32) {
+    let parts: Vec<u16> = codes
+        .split(';')
+        .filter_map(|part| part.parse().ok())
+        .collect();
+    let mut index = 0;
+    while index < parts.len() {
+        match parts[index] {
+            0 => *color = base,
+            30 => *color = Color32::from_rgb(0x2a, 0x31, 0x3d),
+            31 => *color = theme::red(),
+            32 => *color = theme::green(),
+            33 => *color = theme::yellow(),
+            34 => *color = theme::accent(),
+            35 => *color = theme::clr_annotation(),
+            36 => *color = theme::clr_type(),
+            37 => *color = theme::text(),
+            90..=97 => {
+                *color = match parts[index] {
+                    91 => theme::red(),
+                    92 => theme::green(),
+                    93 => theme::yellow(),
+                    94 => theme::clr_type(),
+                    95 => theme::clr_annotation(),
+                    96 => theme::clr_type(),
+                    97 => theme::text(),
+                    _ => theme::muted(),
+                }
+            }
+            38 => {
+                if parts.get(index + 1) == Some(&5) {
+                    let value = parts.get(index + 2).copied().unwrap_or(7) as u8;
+                    *color = ansi_256(value);
+                    index += 2;
+                } else if parts.get(index + 1) == Some(&2) {
+                    let r = parts.get(index + 2).copied().unwrap_or(255) as u8;
+                    let g = parts.get(index + 3).copied().unwrap_or(255) as u8;
+                    let b = parts.get(index + 4).copied().unwrap_or(255) as u8;
+                    *color = Color32::from_rgb(r, g, b);
+                    index += 4;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+}
+
+fn ansi_256(value: u8) -> Color32 {
+    if value < 16 {
+        return match value {
+            0 => Color32::from_rgb(0x15, 0x18, 0x1d),
+            1 => theme::red(),
+            2 => theme::green(),
+            3 => theme::yellow(),
+            4 => theme::accent(),
+            5 => theme::clr_annotation(),
+            6 => theme::clr_type(),
+            7 => theme::text(),
+            8 => theme::muted(),
+            9 => theme::red(),
+            10 => theme::green(),
+            11 => theme::yellow(),
+            12 => theme::clr_type(),
+            13 => theme::clr_annotation(),
+            14 => theme::clr_type(),
+            _ => theme::text(),
+        };
+    }
+    if value < 232 {
+        let index = value - 16;
+        let levels = [0, 95, 135, 175, 215, 255];
+        let r = levels[(index / 36) as usize];
+        let g = levels[((index % 36) / 6) as usize];
+        let b = levels[(index % 6) as usize];
+        return Color32::from_rgb(r, g, b);
+    }
+    let gray = 8 + (value - 232) * 10;
+    Color32::from_rgb(gray, gray, gray)
+}
+
 fn preview_line(text: &str, line: usize) -> String {
     text.split('\n')
         .nth(line.saturating_sub(1))
@@ -7894,7 +8468,7 @@ fn compute_semantic_problems(
         return Vec::new();
     };
     let mut problems = Vec::new();
-    let mut push =
+    let push =
         |file: &PathBuf, line: usize, message: String, problems: &mut Vec<SemanticProblem>| {
             if problems.len() < 2_000 {
                 problems.push(SemanticProblem {
@@ -8036,6 +8610,34 @@ mod tests {
             "project/gradle/libs.versions.toml"
         )));
         assert!(!is_classpath_config(Path::new("project/App.java")));
+    }
+
+    #[test]
+    fn strips_ansi_sequences() {
+        assert_eq!(strip_ansi("\u{1b}[31merror\u{1b}[0m ok"), "error ok");
+        assert_eq!(strip_ansi("\u{1b}[1;32mbuild\u{1b}[0m"), "build");
+        assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn streams_process_output() {
+        use std::collections::HashMap;
+        use std::path::Path;
+        use std::sync::atomic::AtomicBool;
+        let cancel = AtomicBool::new(false);
+        let mut captured = String::new();
+        let output = build::run_piped_stream(
+            Path::new("cmd"),
+            &["/C".to_owned(), "echo reclipse-stream".to_owned()],
+            &HashMap::new(),
+            Path::new("."),
+            &cancel,
+            &mut |text| captured.push_str(text),
+        )
+        .unwrap();
+        assert!(output.combined.contains("reclipse-stream"));
+        assert!(captured.contains("reclipse-stream"));
     }
 
     #[test]

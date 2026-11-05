@@ -209,9 +209,7 @@ fn run_server(
                 );
             }
             Ok(JdtlsCommand::Shutdown) => {
-                let id = next_id;
-                next_id += 1;
-                writer.send_request(id, "shutdown", &serde_json::Value::Null);
+                writer.send_request(next_id, "shutdown", &serde_json::Value::Null);
                 // Best effort: give the server a moment, then exit.
                 thread::sleep(Duration::from_millis(800));
                 writer.send_notification("exit", &serde_json::Value::Null);

@@ -40,8 +40,11 @@ Este repositório contém o **MVP 0.1.0**, o **M1** do editor e a **fundação d
   - renomeia o `.java` de tipos top-level e atualiza o índice sem recarregar o classpath;
   - recusa classpath/JDK, colisões, sombreamento de locais e métodos sobrescritos/implementados;
   - aplica edits em lote e um único passo de undo para rename local.
-- **Compilação e execução**: **Compilar** com `javac` (classpath do projeto + `--release` do target), diagnósticos no painel Problemas e **Executar** a classe `main` com `java`, com saída no console (`Ctrl+F11`). Debug JDWP/JDI fica para o M4.
+- **Compilação e execução**: **Compilar** com `javac` (classpath do projeto + `--release` do target), **Build compile/package/clean** do Maven/Gradle com saída incremental, diagnósticos no painel Problemas e **Executar** a classe `main` com `java` (`Ctrl+F11`). Debug JDWP/JDI fica para o M4.
+- **JUnit inline**: descoberta de testes JUnit 4/5, árvore classe → método no right dock, execução por classe ou método e falhas clicáveis com stack frame.
 - **Editor dividido** com dois painéis e **abas arrastáveis** (drag-and-drop) entre eles.
+- **Organizar imports** (`Ctrl+Shift+I`) e **formatar arquivo** via formatter externo opt-in (`Ctrl+Alt+F`).
+- **Console ANSI**: cores SGR, histórico persistido e limites explícitos (600 linhas, 4 KiB/linha).
 - **Rename de pacote** (com subpacotes): atualiza `package`, imports, referências qualificadas e move os `.java` entre source roots.
 - **Inferência de `var`** em inicializadores simples (`new Type(...)`, literais) para completion/hover.
 - Diagnóstico de **imports não resolvidos** no painel de problemas.
@@ -106,18 +109,23 @@ Dois editores lado a lado com abas arrastáveis:
 
 ![Editor dividido](docs/screenshot-split.png)
 
+Descoberta de testes JUnit no right dock:
+
+![Testes JUnit](docs/screenshot-tests.png)
+
 ## O que ainda não existe
 
 Este MVP é deliberadamente honesto sobre o escopo:
 
-- Compila e executa `main` via `javac`/`java` com launch config, e roda `mvn test`/`gradle test` com parser, mas ainda não depura (JDWP/JDI) e não executa ciclos de build Maven/Gradle completos.
+- Compila e executa `main` via `javac`/`java` com launch config, roda `mvn test`/`gradle test` com parser e JUnit inline por classe/método, mas ainda não depura (JDWP/JDI) e não executa ciclos de build Maven/Gradle completos.
+- O formatter é externo e opt-in (`RECLIPSE_FORMATTER`/`RECLIPSE_FORMATTER_JAR`); organize imports é nativo e conservador.
 - A semântica Java cobre imports/tipos, completion de membros, hover, referências semânticas de tipos/membros, rename conservador, overloads por tipo, type variables com substituição e diagnósticos nativos (tipos/membros não resolvidos, `@Override`, static ambíguo) além do `javac` em fundo; faltam apenas refinamentos (overloads finos por subtipo, Javadoc, modo JDT opt-in). Tipos locais são detectados; tipos anônimos ainda não são modelados.
 - Rename não reescreve Javadoc, strings, configuração por reflexão ou nomes em arquivos de recursos; overrides/implementações e locais sombreados são recusados por segurança, e o rename de workspace exige buffers Java salvos.
-- Maven/Gradle resolvem dependências transitivas do repositório local; não há download, perfis Maven nem Tooling API/bundles avançados do Gradle.
+- Maven/Gradle resolvem dependências transitivas do repositório local e têm download sob demanda e perfis Maven; não há Tooling API nem bundles avançados do Gradle.
 - Multi-cursor agrupa undo de digitação, mas backspace/delete multi ainda são por tecla.
 - Não é um substituto completo do Eclipse para projetos corporativos.
 - Plugins Eclipse/OSGi/SWT **não** são carregados ainda. A compatibilidade headless está no roadmap.
-- Não há LSP embutido nesta versão.
+- Há **JDT LS opt-in** via `RECLIPSE_JDTLS` (diagnósticos extras), desabilitado por padrão; não é um LSP embutido completo.
 
 Veja [docs/M1.md](docs/M1.md) para o detalhamento do editor, [docs/M2.md](docs/M2.md) para o classpath/semântica e [docs/ROADMAP.md](docs/ROADMAP.md) para os próximos marcos.
 
@@ -161,6 +169,8 @@ Também é possível abrir a IDE sem argumentos e escolher **Arquivo → Abrir p
 | `Ctrl+Shift+G` | Referências (semânticas para tipos/membros; locais no buffer) |
 | `Alt+Shift+R` | Renomear tipo/método/campo/variável local |
 | `Ctrl+F11` | Compilar e executar a classe `main` |
+| `Ctrl+Shift+I` | Organizar imports |
+| `Ctrl+Alt+F` | Formatar arquivo (formatter externo) |
 | `F11` | Debug (planejado para o M4) |
 | `Ctrl+Shift+L` | Ajuda de atalhos |
 | `F3` | Ir para definição |
@@ -181,6 +191,8 @@ Os atalhos de arquivo, navegação, busca e projeto podem ser redefinidos em `%A
 A IDE salva projeto, abas, cursor, visibilidade dos painéis (incluindo o console), tema, tamanho da fonte e keybindings ao sair. Abra **Ajuda → Abrir configuração (session.json)** para editar. Alterações de keybinding exigem reinício; edições externas de keybindings são preservadas ao fechar a IDE.
 
 O campo `theme` aceita `rust-oxide` (padrão), `eclipse-cosmic` ou `cyber-solar`. Também é possível iniciar com `RECLIPSE_THEME=cyber-solar`.
+
+O formatter é externo e opt-in: defina `RECLIPSE_FORMATTER` (executável que lê o código pela stdin) ou `RECLIPSE_FORMATTER_JAR` (jar do google-java-format). `Ctrl+Shift+I` organiza imports nativamente.
 
 Buffers sujos são gravados em backups para recuperação; a sessão guarda abas, cursor, folds, painéis e keybindings.
 

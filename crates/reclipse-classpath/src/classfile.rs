@@ -200,7 +200,7 @@ pub fn parse_class(data: &[u8], origin: impl Into<String>) -> Result<ClassInfo> 
     }
 
     // Class-level attributes (Signature included); tolerate truncation.
-    let generic_signature = match (|| -> Result<Option<String>> {
+    let generic_signature = (|| -> Result<Option<String>> {
         let mut signature = None;
         let count = reader.u2()? as usize;
         for _ in 0..count {
@@ -216,10 +216,8 @@ pub fn parse_class(data: &[u8], origin: impl Into<String>) -> Result<ClassInfo> 
             }
         }
         Ok(signature)
-    })() {
-        Ok(signature) => signature,
-        Err(_) => None,
-    };
+    })()
+    .unwrap_or_default();
 
     Ok(ClassInfo {
         name,

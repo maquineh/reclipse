@@ -100,6 +100,21 @@ pub struct JavaMemberReference {
     pub end_byte: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestFramework {
+    JUnit4,
+    JUnit5,
+}
+
+#[derive(Debug, Clone)]
+pub struct JavaTestMethod {
+    pub class_name: String,
+    pub method: String,
+    pub file: PathBuf,
+    pub line: usize,
+    pub framework: TestFramework,
+}
+
 /// Raw `extends`/`implements` information for a declared type. Names keep the
 /// spelling used in the file (simple or qualified) and are resolved later with
 /// the declaring file's imports.
@@ -152,6 +167,8 @@ pub struct FileSymbols {
     /// Names of local (method-scoped) type declarations. They are not project
     /// types and must not be confused with same-named top-level types.
     pub local_type_names: Vec<String>,
+    /// JUnit test methods discovered from annotations.
+    pub test_methods: Vec<JavaTestMethod>,
     pub errors: Vec<ParseError>,
     pub line_count: usize,
     /// Set when the file could not be read or the parser itself failed.
@@ -173,6 +190,7 @@ impl FileSymbols {
             member_refs: Vec::new(),
             type_relations: Vec::new(),
             local_type_names: Vec::new(),
+            test_methods: Vec::new(),
             errors: Vec::new(),
             line_count: 0,
             parse_error: None,
@@ -561,6 +579,25 @@ fn visit_node(
             } else {
                 SymbolKind::Constructor
             };
+            if kind == SymbolKind::Method {
+                if let Some(framework) = test_framework(node, source, file) {
+                    if let Some(container) = container_name(container) {
+                        let class_name = match file.package.as_deref() {
+                            Some(package) if !package.is_empty() => {
+                                format!("{package}.{container}")
+                            }
+                            _ => container,
+                        };
+                        file.test_methods.push(JavaTestMethod {
+                            class_name,
+                            method: name.clone(),
+                            file: file.path.clone(),
+                            line: node.start_position().row + 1,
+                            framework,
+                        });
+                    }
+                }
+            }
             file.symbols.push(JavaSymbol {
                 name,
                 kind,
@@ -1005,6 +1042,73 @@ fn text(node: Node<'_>, source: &[u8]) -> String {
     node.utf8_text(source).unwrap_or("").trim().to_owned()
 }
 
+fn test_framework(node: Node<'_>, source: &[u8], file: &FileSymbols) -> Option<TestFramework> {
+    let annotations = annotation_names(node, source);
+    let is_test = annotations.iter().any(|annotation| {
+        matches!(
+            annotation.rsplit('.').next().unwrap_or(annotation),
+            "Test" | "ParameterizedTest" | "RepeatedTest" | "TestFactory" | "TestTemplate"
+        )
+    });
+    if !is_test {
+        return None;
+    }
+    let junit5 = annotations
+        .iter()
+        .any(|annotation| annotation.contains("jupiter"));
+    let explicit4 = annotations
+        .iter()
+        .any(|annotation| annotation.starts_with("org.junit.") && !annotation.contains("jupiter"));
+    let junit5 = junit5
+        || (!explicit4
+            && file
+                .imports
+                .iter()
+                .any(|import| import.contains("org.junit.jupiter")));
+    Some(if junit5 {
+        TestFramework::JUnit5
+    } else {
+        TestFramework::JUnit4
+    })
+}
+
+fn annotation_names(node: Node<'_>, source: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "modifiers" => {
+                let mut inner = child.walk();
+                for modifier in child.children(&mut inner) {
+                    if matches!(modifier.kind(), "annotation" | "marker_annotation") {
+                        if let Some(annotation) = annotation_name(modifier, source) {
+                            names.push(annotation);
+                        }
+                    }
+                }
+            }
+            "annotation" | "marker_annotation" => {
+                if let Some(annotation) = annotation_name(child, source) {
+                    names.push(annotation);
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+fn annotation_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    node.child_by_field_name("name")
+        .map(|name| text(name, source))
+        .or_else(|| {
+            let raw = text(node, source);
+            let raw = raw.trim_start_matches('@');
+            Some(raw.split('(').next().unwrap_or(raw).trim().to_owned())
+        })
+        .filter(|name| !name.is_empty())
+}
+
 fn container_name(container: &[String]) -> Option<String> {
     if container.is_empty() {
         None
@@ -1141,6 +1245,35 @@ class App extends Base implements Runnable {
             .unwrap();
         assert!(relation.super_types.contains(&"Base".to_owned()));
         assert!(relation.super_types.contains(&"Runnable".to_owned()));
+    }
+
+    #[test]
+    fn discovers_junit4_and_junit5_tests() {
+        let source = r#"
+package com.acme;
+import org.junit.jupiter.api.Test;
+class AppTest {
+    @Test
+    void works() {}
+    void helper() {}
+}
+class LegacyTest {
+    @org.junit.Test
+    public void legacy() {}
+}
+"#;
+        let file = parse_source(Path::new("AppTest.java"), source);
+        assert_eq!(file.test_methods.len(), 2);
+        assert!(file.test_methods.iter().any(|test| {
+            test.class_name == "com.acme.AppTest"
+                && test.method == "works"
+                && test.framework == TestFramework::JUnit5
+        }));
+        assert!(file.test_methods.iter().any(|test| {
+            test.class_name == "com.acme.LegacyTest"
+                && test.method == "legacy"
+                && test.framework == TestFramework::JUnit4
+        }));
     }
 
     #[test]

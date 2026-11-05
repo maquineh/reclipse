@@ -15,7 +15,7 @@ use crate::semantic::{
     find_member_references, find_type_references, resolve_member_of_type, supertypes_of,
     MemberTarget, ProjectTypes, ResolvedType,
 };
-use crate::{parse_local_bindings, LocalBinding, ProjectIndex, SymbolKind};
+use crate::{parse_local_bindings, FileSymbols, LocalBinding, ProjectIndex, SymbolKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextEdit {
@@ -451,6 +451,49 @@ fn source_root_for(path: &Path, project: &Project) -> PathBuf {
         .max_by_key(|root| root.as_os_str().len())
         .cloned()
         .unwrap_or_else(|| project.root.clone())
+}
+
+/// Plan an import organization: sort normal imports, then static imports,
+/// remove exact duplicates and keep each declaration in its original line.
+pub fn organize_imports(source: &str, file: &FileSymbols) -> Result<Vec<TextEdit>, String> {
+    if file.imports.is_empty() {
+        return Err("o arquivo não possui imports".to_owned());
+    }
+    if file.import_ranges.len() != file.imports.len() {
+        return Err(
+            "índice de imports inconsistente; salve o arquivo e tente novamente".to_owned(),
+        );
+    }
+    let mut normal = Vec::new();
+    let mut statics = Vec::new();
+    for import in &file.imports {
+        let import = import.trim();
+        if let Some(static_import) = import.strip_prefix("static ") {
+            statics.push(format!("import static {};", static_import.trim()));
+        } else {
+            normal.push(format!("import {};", import));
+        }
+    }
+    normal.sort();
+    normal.dedup();
+    statics.sort();
+    statics.dedup();
+    let mut ordered = normal;
+    ordered.extend(statics);
+    let mut edits = Vec::new();
+    for (index, (start, end)) in file.import_ranges.iter().enumerate() {
+        if *end > source.len() || start >= end {
+            return Err("faixa de import inválida".to_owned());
+        }
+        let replacement = ordered.get(index).cloned().unwrap_or_default();
+        edits.push(TextEdit {
+            start_byte: *start,
+            end_byte: *end,
+            replacement,
+        });
+    }
+    edits.sort_by(|left, right| right.start_byte.cmp(&left.start_byte));
+    Ok(edits)
 }
 
 /// Plan a method/field rename using semantic member references.
@@ -1230,6 +1273,20 @@ class App {
         let updated = apply_text_edits(source, &plan.edits).unwrap();
         assert!(updated.contains("String value"));
         assert!(updated.contains("println(value)"));
+    }
+
+    #[test]
+    fn organizes_imports_and_static_last() {
+        let source =
+            "package p;\nimport z.Z;\nimport static b.B.x;\nimport a.A;\nimport z.Z;\nclass C {}\n";
+        let file = crate::parse_source(Path::new("C.java"), source);
+        let edits = organize_imports(source, &file).unwrap();
+        let updated = apply_text_edits(source, &edits).unwrap();
+        let first = updated.find("import a.A;").unwrap();
+        let second = updated.find("import z.Z;").unwrap();
+        let static_pos = updated.find("import static b.B.x;").unwrap();
+        assert!(first < second && second < static_pos);
+        assert_eq!(updated.matches("import z.Z;").count(), 1);
     }
 
     #[test]

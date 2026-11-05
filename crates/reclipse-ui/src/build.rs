@@ -130,6 +130,8 @@ pub struct TestFailure {
     pub file: PathBuf,
     pub line: usize,
     pub message: String,
+    pub class_name: Option<String>,
+    pub method: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -328,9 +330,9 @@ pub fn run_main(
     })
 }
 
-struct PipedOutput {
-    status_success: bool,
-    combined: String,
+pub(crate) struct PipedOutput {
+    pub(crate) status_success: bool,
+    pub(crate) combined: String,
 }
 
 fn run_piped(
@@ -339,6 +341,17 @@ fn run_piped(
     env: &HashMap<String, String>,
     workdir: &Path,
     cancel: &AtomicBool,
+) -> Result<PipedOutput, String> {
+    run_piped_stream(program, args, env, workdir, cancel, &mut |_| {})
+}
+
+pub(crate) fn run_piped_stream(
+    program: &Path,
+    args: &[String],
+    env: &HashMap<String, String>,
+    workdir: &Path,
+    cancel: &AtomicBool,
+    on_output: &mut dyn FnMut(&str),
 ) -> Result<PipedOutput, String> {
     let out_file = tempfile::Builder::new()
         .prefix("reclipse-out-")
@@ -364,7 +377,15 @@ fn run_piped(
     let mut child = command
         .spawn()
         .map_err(|error| format!("falha ao iniciar {}: {error}", program.display()))?;
+    let mut position = 0usize;
     loop {
+        if let Ok(bytes) = fs::read(&out_path) {
+            if bytes.len() > position {
+                let chunk = String::from_utf8_lossy(&bytes[position..]);
+                on_output(&chunk);
+                position = bytes.len();
+            }
+        }
         if cancel.load(Ordering::SeqCst) {
             let _ = child.kill();
             let _ = child.wait();
@@ -376,6 +397,12 @@ fn run_piped(
         }
         match child.try_wait() {
             Ok(Some(status)) => {
+                if let Ok(bytes) = fs::read(&out_path) {
+                    if bytes.len() > position {
+                        let chunk = String::from_utf8_lossy(&bytes[position..]);
+                        on_output(&chunk);
+                    }
+                }
                 let combined = fs::read_to_string(&out_path).unwrap_or_default();
                 return Ok(PipedOutput {
                     status_success: status.success(),
@@ -604,30 +631,74 @@ fn find_wrapper(root: &Path, wrappers: &[&str], fallbacks: &[&str]) -> Option<Pa
     None
 }
 
-pub fn run_tests(
+/// Format Java source through an external formatter.
+///
+/// Opt-in via `RECLIPSE_FORMATTER` (executable that reads stdin, e.g. a
+/// `google-java-format` wrapper) or `RECLIPSE_FORMATTER_JAR` (invoked with
+/// `java -jar <jar> -`). The native engine does not reimplement formatting.
+pub fn format_source(source: &str) -> Result<String, String> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let (program, args) = if let Ok(program) = std::env::var("RECLIPSE_FORMATTER") {
+        (PathBuf::from(program), vec!["-".to_owned()])
+    } else if let Ok(jar) = std::env::var("RECLIPSE_FORMATTER_JAR") {
+        (
+            jdk_binary(None, "java")?,
+            vec!["-jar".to_owned(), jar, "-".to_owned()],
+        )
+    } else {
+        return Err(
+            "formatter não configurado: defina RECLIPSE_FORMATTER ou RECLIPSE_FORMATTER_JAR"
+                .to_owned(),
+        );
+    };
+    let mut child = Command::new(&program)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("falha ao iniciar formatter {}: {error}", program.display()))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(source.as_bytes())
+            .map_err(|error| format!("falha ao enviar código ao formatter: {error}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("formatter falhou: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "formatter retornou {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("formatter retornou saída inválida (UTF-8): {error}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestFilter {
+    pub class_name: String,
+    pub method: Option<String>,
+}
+
+pub fn run_tests_filtered(
     project: &Project,
     env: &HashMap<String, String>,
     cancel: &AtomicBool,
+    filter: Option<&TestFilter>,
+    on_output: &mut dyn FnMut(&str),
 ) -> Result<TestResult, String> {
     let started = Instant::now();
     let Some((tool, binary)) = detect_test_tool(project) else {
         return Err("nenhum pom.xml ou build.gradle encontrado para testes".to_owned());
     };
-    let (args, label) = match tool {
-        TestTool::Maven => (
-            vec!["-B".to_owned(), "test".to_owned()],
-            "mvn test".to_owned(),
-        ),
-        TestTool::Gradle => (
-            vec![
-                "test".to_owned(),
-                "--console=plain".to_owned(),
-                "-q".to_owned(),
-            ],
-            "gradle test".to_owned(),
-        ),
-    };
-    let output = run_piped(&binary, &args, env, &project.root, cancel)
+    let (args, label) = test_command(tool, filter);
+    let output = run_piped_stream(&binary, &args, env, &project.root, cancel, on_output)
         .map_err(|error| format!("falha ao executar {label}: {error}"))?;
     let summary = parse_test_output(&output.combined);
     Ok(TestResult {
@@ -637,6 +708,130 @@ pub fn run_tests(
             && !cancel.load(Ordering::SeqCst),
         tool: label,
         summary,
+        output: output.combined,
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+fn test_command(tool: TestTool, filter: Option<&TestFilter>) -> (Vec<String>, String) {
+    match tool {
+        TestTool::Maven => {
+            let mut args = vec!["-B".to_owned(), "test".to_owned()];
+            let mut label = "mvn test".to_owned();
+            if let Some(filter) = filter {
+                let class_name = filter
+                    .class_name
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&filter.class_name);
+                let target = match &filter.method {
+                    Some(method) => format!("{class_name}#{method}"),
+                    None => class_name.to_owned(),
+                };
+                args.push(format!("-Dtest={target}"));
+                args.push("-DfailIfNoTests=false".to_owned());
+                label = format!("mvn test ({target})");
+            }
+            (args, label)
+        }
+        TestTool::Gradle => {
+            let mut args = vec![
+                "test".to_owned(),
+                "--console=plain".to_owned(),
+                "-q".to_owned(),
+            ];
+            let mut label = "gradle test".to_owned();
+            if let Some(filter) = filter {
+                let target = match &filter.method {
+                    Some(method) => format!("{}.{}", filter.class_name, method),
+                    None => filter.class_name.clone(),
+                };
+                args.push("--tests".to_owned());
+                args.push(target.clone());
+                label = format!("gradle test ({target})");
+            }
+            (args, label)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecyclePhase {
+    Compile,
+    Package,
+    Clean,
+}
+
+impl LifecyclePhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Compile => "compile",
+            Self::Package => "package",
+            Self::Clean => "clean",
+        }
+    }
+}
+
+pub fn run_lifecycle(
+    project: &Project,
+    env: &HashMap<String, String>,
+    cancel: &AtomicBool,
+    phase: LifecyclePhase,
+    on_output: &mut dyn FnMut(&str),
+) -> Result<ResolveResult, String> {
+    let started = Instant::now();
+    let Some((tool, binary)) = detect_test_tool(project) else {
+        return Err("lifecycle requer Maven (pom.xml) ou Gradle (build.gradle)".to_owned());
+    };
+    let (args, label) = match (tool, phase) {
+        (TestTool::Maven, LifecyclePhase::Compile) => (
+            vec!["-B".to_owned(), "compile".to_owned()],
+            "mvn compile".to_owned(),
+        ),
+        (TestTool::Maven, LifecyclePhase::Package) => (
+            vec![
+                "-B".to_owned(),
+                "package".to_owned(),
+                "-DskipTests".to_owned(),
+            ],
+            "mvn package".to_owned(),
+        ),
+        (TestTool::Maven, LifecyclePhase::Clean) => (
+            vec!["-B".to_owned(), "clean".to_owned()],
+            "mvn clean".to_owned(),
+        ),
+        (TestTool::Gradle, LifecyclePhase::Compile) => (
+            vec![
+                "compileJava".to_owned(),
+                "--console=plain".to_owned(),
+                "-q".to_owned(),
+            ],
+            "gradle compileJava".to_owned(),
+        ),
+        (TestTool::Gradle, LifecyclePhase::Package) => (
+            vec![
+                "jar".to_owned(),
+                "-x".to_owned(),
+                "test".to_owned(),
+                "--console=plain".to_owned(),
+                "-q".to_owned(),
+            ],
+            "gradle jar".to_owned(),
+        ),
+        (TestTool::Gradle, LifecyclePhase::Clean) => (
+            vec![
+                "clean".to_owned(),
+                "--console=plain".to_owned(),
+                "-q".to_owned(),
+            ],
+            "gradle clean".to_owned(),
+        ),
+    };
+    let output = run_piped_stream(&binary, &args, env, &project.root, cancel, on_output)
+        .map_err(|error| format!("falha ao executar {label}: {error}"))?;
+    Ok(ResolveResult {
+        success: output.status_success && !cancel.load(Ordering::SeqCst),
+        tool: label,
         output: output.combined,
         elapsed_ms: started.elapsed().as_millis(),
     })
@@ -658,6 +853,7 @@ pub fn resolve_dependencies(
     project: &Project,
     env: &HashMap<String, String>,
     cancel: &AtomicBool,
+    on_output: &mut dyn FnMut(&str),
 ) -> Result<ResolveResult, String> {
     let started = Instant::now();
     let Some((tool, binary)) = detect_test_tool(project) else {
@@ -683,7 +879,7 @@ pub fn resolve_dependencies(
             "gradle dependencies".to_owned(),
         ),
     };
-    let output = run_piped(&binary, &args, env, &project.root, cancel)
+    let output = run_piped_stream(&binary, &args, env, &project.root, cancel, on_output)
         .map_err(|error| format!("falha ao executar {label}: {error}"))?;
     Ok(ResolveResult {
         success: output.status_success && !cancel.load(Ordering::SeqCst),
@@ -746,6 +942,7 @@ fn parse_test_failure(line: &str) -> Option<TestFailure> {
     let stripped = trimmed.strip_prefix("[ERROR]").unwrap_or(trimmed).trim();
     // Maven surefire: `com.FooTest.test -- Time elapsed ... <<< FAILURE!`
     // Gradle: `com.FooTest > test FAILED`
+    // Stack: `at com.FooTest.test(FooTest.java:42)`
     let candidate = if stripped.contains("FAILURE")
         || stripped.contains("FAILED")
         || stripped.starts_with("at ")
@@ -754,18 +951,81 @@ fn parse_test_failure(line: &str) -> Option<TestFailure> {
     } else {
         return None;
     };
-    let (file, line_number) = parse_file_link(&candidate, None)?;
+    let (class_name, method) = parse_test_identity(&candidate);
+    let (file, line_number) = parse_file_link(&candidate, None).unwrap_or_default();
+    if file.as_os_str().is_empty() && class_name.is_none() {
+        return None;
+    }
     Some(TestFailure {
         file,
         line: line_number,
         message: candidate.chars().take(240).collect(),
+        class_name,
+        method,
     })
+}
+
+fn parse_test_identity(candidate: &str) -> (Option<String>, Option<String>) {
+    if let Some((left, right)) = candidate.split_once(" > ") {
+        let class_name = left.trim().to_owned();
+        let method = right
+            .trim()
+            .trim_end_matches(" FAILED")
+            .split_whitespace()
+            .next()
+            .map(str::to_owned);
+        return ((!class_name.is_empty()).then_some(class_name), method);
+    }
+    if let Some((left, _)) = candidate.split_once(" -- ") {
+        let left = left.trim();
+        if let Some((class_name, method)) = left.rsplit_once('.') {
+            return (Some(class_name.to_owned()), Some(method.to_owned()));
+        }
+    }
+    if let Some(rest) = candidate.strip_prefix("at ") {
+        let rest = rest.split('(').next().unwrap_or(rest).trim();
+        if let Some((class_name, method)) = rest.rsplit_once('.') {
+            return (Some(class_name.to_owned()), Some(method.to_owned()));
+        }
+    }
+    (None, None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn parses_test_failure_identity() {
+        let gradle = parse_test_failure("com.acme.AppTest > works FAILED").unwrap();
+        assert_eq!(gradle.class_name.as_deref(), Some("com.acme.AppTest"));
+        assert_eq!(gradle.method.as_deref(), Some("works"));
+        let maven =
+            parse_test_failure("[ERROR] com.acme.AppTest.works -- Time elapsed: 1 s <<< FAILURE!")
+                .unwrap();
+        assert_eq!(maven.class_name.as_deref(), Some("com.acme.AppTest"));
+        assert_eq!(maven.method.as_deref(), Some("works"));
+        let stack = parse_test_failure("at com.acme.AppTest.works(AppTest.java:42)").unwrap();
+        assert_eq!(stack.file, PathBuf::from("AppTest.java"));
+        assert_eq!(stack.line, 42);
+        assert_eq!(stack.method.as_deref(), Some("works"));
+    }
+
+    #[test]
+    fn builds_filtered_test_commands() {
+        let filter = TestFilter {
+            class_name: "com.acme.AppTest".to_owned(),
+            method: Some("works".to_owned()),
+        };
+        let (maven, label) = test_command(TestTool::Maven, Some(&filter));
+        assert!(maven.contains(&"test".to_owned()));
+        assert!(maven.contains(&"-Dtest=AppTest#works".to_owned()));
+        assert!(label.contains("AppTest#works"));
+        let (gradle, _) = test_command(TestTool::Gradle, Some(&filter));
+        assert!(gradle.contains(&"--tests".to_owned()));
+        assert!(gradle.contains(&"com.acme.AppTest.works".to_owned()));
+    }
 
     #[test]
     fn parses_javac_diagnostics_with_windows_paths() {

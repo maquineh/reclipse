@@ -83,11 +83,11 @@ Entregue:
 
 Pendente (refinamento, fora do núcleo):
 
-- overloads finos por subtipo/varargs e conversões além de widening/boxing (entregue em 3 fases JLS);
-- rename de pacote/move e atualização de Javadoc/recursos;
-- modo de precisão via JDT LS (opt-in); diagnósticos de fluxo/nullness seguem fora de escopo nativo;
+- overloads finos por conversão de narrowing/varargs além das 3 fases JLS;
+- move de um tipo individual entre pacotes e atualização de Javadoc/recursos no rename;
+- JDT LS opt-in já existe; falta empacotamento/UX e matriz de projetos reais;
 - Gradle Tooling API, bundles de version catalog e dependências de plugins;
-- Javadoc (primeira frase no hover entregue; HTML completo pendente) e perfis Maven (entregue: activeByDefault/jdk/os/property).
+- Javadoc HTML completo e download automático de sources.
 
 Aceite final:
 
@@ -103,16 +103,19 @@ Entregue:
 - compilação do projeto com `javac` usando o classpath resolvido e `--release` do target;
 - diagnósticos do javac no painel Problemas e no console;
 - descoberta de `main` e execução com `java`, com saída no console e `Ctrl+F11`;
+- lifecycle Maven/Gradle (`compile`, `package`, `clean`) com output incremental e hyperlinks;
+- JUnit 4/5 inline: descoberta, árvore classe → método, execução por classe/método e falhas clicáveis;
+- formatter externo opt-in e organize imports nativo;
+- console com ANSI, histórico persistido e limites explícitos;
 - split editor com abas arrastáveis entre dois painéis.
 
 Pendente:
 
-- Execução de Maven/Gradle com output incremental e hyperlinks.
-- Configurações de execução (main class, args, env, JVM options).
-- Console com ANSI, cancelamento e histórico.
-- JUnit 4/5: descoberta, execução por arquivo/classe, árvore de resultados.
-- Formatter (google-java-format ou Eclipse formatter) e organize imports.
-- Problemas de compilação mapeados para o editor (javac já mapeia arquivo/linha).
+- Debugger JDWP/JDI (M4).
+- JUnit independente do runner Maven/Gradle (execução direta via launcher/JUnit Platform).
+- Configurações de execução múltiplas e variáveis por plataforma.
+- Formatter embutido (sem dependência externa).
+- Problemas de compilação em tempo real durante a digitação (javac em fundo já existe).
 
 Aceite:
 
@@ -189,7 +192,7 @@ Aceite:
 | M0 | concluído | — |
 | M1 | concluído | 3 |
 | M2 | em andamento (referências, rename e fontes entregues) | 15 |
-| M3 | em andamento (javac/run/split entregues) | 21 |
+| M3 | em andamento (javac/run/JUnit/lifecycle/console entregues) | 21 |
 | M4 | 4–6 | 27 |
 | M5 | 4–6 | 33 |
 | M6 | 8–12 | 45 |
