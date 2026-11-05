@@ -38,7 +38,7 @@ impl FileTree {
         }
         for entry in self.entries(dir) {
             if entry.is_dir {
-                let header = RichText::new(&entry.name).color(theme::TEXT);
+                let header = RichText::new(&entry.name).color(theme::text());
                 egui::CollapsingHeader::new(header)
                     .id_salt(("reclipse_tree_dir", &entry.path))
                     .default_open(depth < 5)
@@ -52,7 +52,11 @@ impl FileTree {
                     .and_then(|extension| extension.to_str())
                     .map(|extension| extension.eq_ignore_ascii_case("java"))
                     .unwrap_or(false);
-                let color = if is_java { theme::TEXT } else { theme::MUTED };
+                let color = if is_java {
+                    theme::text()
+                } else {
+                    theme::muted()
+                };
                 let label = format!("  {}", entry.name);
                 if ui
                     .selectable_label(false, RichText::new(label).color(color))

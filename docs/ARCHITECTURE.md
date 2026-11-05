@@ -112,6 +112,7 @@ O índice sintático é reconstruído por completo nesta versão. A próxima evo
 ## 6. UI e editor
 
 - **egui/eframe** com backend glow. A UI é imediata; o estado persistente fica em `ReclipseApp`.
+- **RECLIPSE Studio**: paleta ativa em `theme.rs` (`ThemeKind` + `Palette` + acessores dinâmicos); title bar com emblema vetorial, seletor de 3 temas, toolbar, activity bar, breadcrumb, console de diagnóstico e status bar. O tema escolhido é persistido em `session.json`.
 - **Palette** usa ranking fuzzy próprio, sem dependências, com bônus para prefixos, limites de palavra e matches consecutivos.
 - **Editor (M1)**: widget próprio desenhado com `Painter` e `Galley`. O buffer é um `Rope` (ropey), e apenas as linhas visíveis no viewport são tokenizadas, layoutadas e pintadas.
 - **Gutter** é pintado diretamente, com posição fixa durante o scroll horizontal; a linha atual, a seleção, o cursor e os matches de busca são desenhados como retângulos/linhas.
@@ -159,7 +160,9 @@ O M1 está concluído; o foco atual é o motor semântico Java (M2).
 
 O índice lê `.class` sem JVM (`classfile.rs`): constant pool, acesso, superclasse, interfaces, campos e métodos públicos/protegidos. Descritores são formatados para assinaturas legíveis e tipos FQN são expostos para o resolvedor. JARs usam `zip`; JMODs descartam o header `JM\x01\x00` e leem o ZIP interno. Classes duplicadas são deduplicadas, com preferência pela versão pública.
 
-`reclipse-java::semantic` implementa a camada de consulta: `ProjectTypes`, resolução por import/pacote/wildcard/`java.lang`, diagnóstico de imports, inferência reversa de variáveis (inclusive generics/arrays), completion de membros com herança do classpath e hover de tipos/variáveis/símbolos. O parser também coleta `type_identifier` em uma segunda passada (inclusive dentro de corpos) para um índice de referências semânticas de tipos; a UI usa esse índice no `Ctrl+Shift+G` e cai para busca textual quando o símbolo não é um tipo.
+`reclipse-java::semantic` implementa a camada de consulta: `ProjectTypes` (com relações `extends`/`implements`), resolução por import/pacote/wildcard/`java.lang`, diagnóstico de imports, inferência reversa de variáveis (inclusive generics/arrays/`var`), completion de membros com herança do projeto e do classpath, retorno encadeado e hover de tipos/variáveis/símbolos. O parser coleta `type_identifier`, membros (`method_invocation`, `field_access`, `method_reference`), escopos locais e relações de tipo. A UI usa isso no `Ctrl+Shift+G` (tipos e membros) e no rename (`Alt+Shift+R`), com fallback textual quando não há resolução.
+
+`reclipse-java::refactor` planeja rename em byte offsets: declaração, referências semânticas, imports e arquivo (`Type`), sobrecargas/refs (`Method`), campos/constantes e locais/parâmetros com análise de escopo. A aplicação é conservadora: recusa classpath, colisões, shadowing e métodos que sobrescrevem/implementam; a UI grava os arquivos, renomeia o `.java`, recarrega abas e reindexa.
 
 `reclipse-java::semantic` consulta os dois índices:
 
@@ -170,7 +173,7 @@ O índice lê `.class` sem JVM (`classfile.rs`): constant pool, acesso, supercla
 
 Na UI, o status do classpath mostra archives/classes/tempo e o target; Open Type inclui tipos externos; F3 sobre um tipo do classpath abre um visualizador de metadados, com código-fonte quando `-sources.jar`/`src.zip` estão disponíveis.
 
-Limitações: sem download, perfis Maven, Tooling API do Gradle, Javadoc HTML ou rename; referências semânticas cobrem tipos, não membros.
+Limitações: sem download, perfis Maven, Tooling API do Gradle, Javadoc HTML ou generics/overloads completos. Rename não reescreve Javadoc/strings/recursos e recusa overrides/shadowing.
 
 ### Descoberta de fontes
 
@@ -196,7 +199,7 @@ Entradas de workspace como `/OutroProjeto/src` são ignoradas de propósito: abr
 1. **Classpath**: Eclipse/Maven/Gradle/JDK, JARs/JMODs e transitivas existem; faltam download, perfis Maven, Tooling API/version catalogs do Gradle e observação em tempo real.
 2. **Resolução**: imports/tipos básicos existem; faltam escopos, herança, generics e overloads. É um compilador frontal, não um parser.
 3. **Diagnósticos**: erros semânticos incrementais ou fallback controlado para `javac`/JDT.
-4. **Completion/refactor**: completion de membros, hover e referências semânticas de tipos existem; rename e referências de membros ainda faltam.
+4. **Completion/refactor**: completion de membros, hover, referências semânticas de tipos/membros e rename conservador existem; faltam generics/overloads precisos, static imports e rename de pacote/move.
 5. **Build/test/debug**: integrar Maven/Gradle, JUnit e JDI/DAP.
 
 A estratégia é construir L2/L3 nativos para o caminho quente e oferecer um **modo de precisão** opcional via JDT Language Server (LSP) enquanto o motor nativo amadurece. O modo de precisão é opt-in porque reidrata o custo de JVM que motivou o projeto.
@@ -311,7 +314,9 @@ Nada disso substitui aconselhamento jurídico.
 | Resolução de imports/tipos + Open Type externo | ✅ |
 | Inferência/completion/hover | 🔶 básicos |
 | Referências semânticas de tipos | ✅ |
-| Rename / referências de membros | ❌ |
+| Referências semânticas de métodos/campos | 🔶 qualificadas/não qualificadas/method refs |
+| Rename de tipo/membro/local | 🔶 conservador |
+| Herança de tipos do projeto na completion | ✅ |
 | Fontes de JARs/JDK | ✅ |
 | Build/test/debug | ❌ |
 | LSP/JDT | ❌ |

@@ -72,6 +72,39 @@ pub struct JavaSymbol {
     pub depth: usize,
     /// Short declaration head, e.g. `public static void main(String[] args)`.
     pub detail: Option<String>,
+    /// Byte range of the symbol name (not the whole declaration head).
+    pub name_start_byte: usize,
+    pub name_end_byte: usize,
+}
+
+/// A member (method/field/constant) occurrence in source code.
+///
+/// `qualifier` is the receiver text before the dot (`app.service`), or `None`
+/// for unqualified references. `container` is the enclosing type chain, used to
+/// resolve unqualified members.
+#[derive(Debug, Clone)]
+pub struct JavaMemberReference {
+    pub name: String,
+    pub qualifier: Option<String>,
+    pub container: Option<String>,
+    /// True for method calls/references, false for fields/constants.
+    pub is_call: bool,
+    /// 1-based line.
+    pub line: usize,
+    /// 1-based column.
+    pub column: usize,
+    /// Byte offsets in the original source.
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+/// Raw `extends`/`implements` information for a declared type. Names keep the
+/// spelling used in the file (simple or qualified) and are resolved later with
+/// the declaring file's imports.
+#[derive(Debug, Clone)]
+pub struct JavaTypeRelation {
+    pub type_name: String,
+    pub super_types: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,9 +134,15 @@ pub struct FileSymbols {
     pub package: Option<String>,
     pub imports: Vec<String>,
     pub import_lines: Vec<usize>,
+    /// Byte ranges of each import declaration (same order as `imports`).
+    pub import_ranges: Vec<(usize, usize)>,
     pub symbols: Vec<JavaSymbol>,
     /// Type-identifier occurrences (including declarations) for semantic refs.
     pub type_refs: Vec<JavaReference>,
+    /// Method/field occurrences used by member references and rename.
+    pub member_refs: Vec<JavaMemberReference>,
+    /// Raw superclass/interface names declared in this file.
+    pub type_relations: Vec<JavaTypeRelation>,
     pub errors: Vec<ParseError>,
     pub line_count: usize,
     /// Set when the file could not be read or the parser itself failed.
@@ -117,8 +156,11 @@ impl FileSymbols {
             package: None,
             imports: Vec::new(),
             import_lines: Vec::new(),
+            import_ranges: Vec::new(),
             symbols: Vec::new(),
             type_refs: Vec::new(),
+            member_refs: Vec::new(),
+            type_relations: Vec::new(),
             errors: Vec::new(),
             line_count: 0,
             parse_error: None,
@@ -152,6 +194,8 @@ pub fn parse_source_with(parser: &mut Parser, path: &Path, source: &str) -> File
     let mut container = Vec::new();
     visit_children(root, source.as_bytes(), &mut file, &mut container, 0);
     visit_type_refs(root, source.as_bytes(), &mut file);
+    let mut member_container = Vec::new();
+    visit_member_refs(root, source.as_bytes(), &mut file, &mut member_container);
 
     if file.errors.len() > 200 {
         file.errors.truncate(200);
@@ -209,6 +253,160 @@ fn push_type_ref(node: Node<'_>, source: &[u8], file: &mut FileSymbols) {
     });
 }
 
+fn visit_member_refs(
+    node: Node<'_>,
+    source: &[u8],
+    file: &mut FileSymbols,
+    container: &mut Vec<String>,
+) {
+    let is_type = matches!(
+        node.kind(),
+        "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
+    );
+    let type_name = is_type
+        .then(|| node.child_by_field_name("name"))
+        .flatten()
+        .map(|name| text(name, source))
+        .filter(|name| !name.is_empty());
+
+    if node.kind() == "identifier" {
+        if let Some(reference) = classify_member_reference(node, source, container) {
+            file.member_refs.push(reference);
+        }
+    }
+
+    if let Some(name) = &type_name {
+        container.push(name.clone());
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_member_refs(child, source, file, container);
+    }
+    if type_name.is_some() {
+        container.pop();
+    }
+}
+
+fn classify_member_reference(
+    node: Node<'_>,
+    source: &[u8],
+    container: &[String],
+) -> Option<JavaMemberReference> {
+    let name = text(node, source);
+    if name.is_empty() {
+        return None;
+    }
+    let parent = node.parent()?;
+    if is_declaration_name(node, parent) {
+        return None;
+    }
+    if matches!(
+        parent.kind(),
+        "package_declaration"
+            | "import_declaration"
+            | "scoped_identifier"
+            | "inferred_parameters"
+            | "labeled_statement"
+            | "break_statement"
+            | "continue_statement"
+            | "marker_annotation"
+            | "annotation"
+            | "type_pattern"
+            | "record_pattern"
+            | "record_pattern_component"
+            | "receiver_parameter"
+    ) {
+        return None;
+    }
+    if parent.kind() == "lambda_expression"
+        && parent
+            .child_by_field_name("parameters")
+            .is_some_and(|parameters| parameters.id() == node.id())
+    {
+        return None;
+    }
+
+    let (qualifier, is_call) = match parent.kind() {
+        "method_invocation" => {
+            if parent
+                .child_by_field_name("name")
+                .is_none_or(|name_node| name_node.id() != node.id())
+            {
+                return None;
+            }
+            (
+                parent
+                    .child_by_field_name("object")
+                    .map(|object| text(object, source)),
+                true,
+            )
+        }
+        "field_access" => {
+            if parent
+                .child_by_field_name("field")
+                .is_none_or(|field| field.id() != node.id())
+            {
+                return None;
+            }
+            (
+                parent
+                    .child_by_field_name("object")
+                    .map(|object| text(object, source)),
+                false,
+            )
+        }
+        "method_reference" => {
+            let raw = text(parent, source);
+            let before = raw.split("::").next().unwrap_or(&raw).trim();
+            ((!before.is_empty()).then(|| before.to_owned()), true)
+        }
+        _ => (None, false),
+    };
+
+    let position = node.start_position();
+    Some(JavaMemberReference {
+        name,
+        qualifier: qualifier.filter(|value| !value.is_empty()),
+        container: container_name(container),
+        is_call,
+        line: position.row + 1,
+        column: position.column + 1,
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+    })
+}
+
+fn is_declaration_name(node: Node<'_>, parent: Node<'_>) -> bool {
+    let is_name = parent
+        .child_by_field_name("name")
+        .is_some_and(|name| name.id() == node.id());
+    if !is_name {
+        return false;
+    }
+    matches!(
+        parent.kind(),
+        "variable_declarator"
+            | "formal_parameter"
+            | "catch_formal_parameter"
+            | "enhanced_for_statement"
+            | "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration"
+            | "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
+            | "enum_constant"
+            | "annotation_type_element_declaration"
+            | "resource"
+    )
+}
+
 fn visit_node(
     node: Node<'_>,
     source: &[u8],
@@ -255,6 +453,8 @@ fn visit_node(
             if !import.is_empty() {
                 file.imports.push(import);
                 file.import_lines.push(node.start_position().row + 1);
+                file.import_ranges
+                    .push((node.start_byte(), node.end_byte()));
             }
         }
         "class_declaration"
@@ -280,7 +480,7 @@ fn visit_node(
                 true,
             );
         }
-        "method_declaration" | "constructor_declaration" => {
+        "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
             let Some(name_node) = node.child_by_field_name("name") else {
                 return;
             };
@@ -301,6 +501,8 @@ fn visit_node(
                 container: container_name(container),
                 depth,
                 detail: Some(declaration_head(node, source)),
+                name_start_byte: name_node.start_byte(),
+                name_end_byte: name_node.end_byte(),
             });
         }
         "field_declaration" | "constant_declaration" => {
@@ -318,6 +520,8 @@ fn visit_node(
                                 container: container_name(container),
                                 depth,
                                 detail: Some(declaration_head(node, source)),
+                                name_start_byte: name_node.start_byte(),
+                                name_end_byte: name_node.end_byte(),
                             });
                         }
                     }
@@ -340,6 +544,8 @@ fn visit_node(
                         container: container_name(container),
                         depth,
                         detail: None,
+                        name_start_byte: name_node.start_byte(),
+                        name_end_byte: name_node.end_byte(),
                     });
                 }
             }
@@ -377,7 +583,13 @@ fn push_type(
         container: container_name(container),
         depth,
         detail: Some(declaration_head(node, source)),
+        name_start_byte: name_node.start_byte(),
+        name_end_byte: name_node.end_byte(),
     });
+
+    if let Some(relation) = type_relation(node, source, container, &name) {
+        file.type_relations.push(relation);
+    }
 
     container.push(name);
     let _ = is_record;
@@ -398,6 +610,8 @@ fn push_type(
                                 container: container_name(container),
                                 depth: depth + 1,
                                 detail: Some(declaration_head(child, source)),
+                                name_start_byte: field_name.start_byte(),
+                                name_end_byte: field_name.end_byte(),
                             });
                         }
                     }
@@ -412,6 +626,79 @@ fn push_type(
     container.pop();
 }
 
+fn type_relation(
+    node: Node<'_>,
+    source: &[u8],
+    container: &[String],
+    name: &str,
+) -> Option<JavaTypeRelation> {
+    let mut super_types = Vec::new();
+    if let Some(superclass) = node.child_by_field_name("superclass") {
+        if let Some(raw) = type_list_first(superclass, source) {
+            super_types.push(raw);
+        }
+    }
+    if let Some(interfaces) = node.child_by_field_name("interfaces") {
+        super_types.extend(type_list_children(interfaces, source));
+    }
+    // Interface declarations use an unnamed `extends_interfaces` node.
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "extends_interfaces" {
+            super_types.extend(type_list_children(child, source));
+        }
+    }
+    super_types.sort();
+    super_types.dedup();
+    if super_types.is_empty() {
+        return None;
+    }
+    let mut type_name = container.to_vec();
+    type_name.push(name.to_owned());
+    Some(JavaTypeRelation {
+        type_name: type_name.join("."),
+        super_types,
+    })
+}
+
+fn type_list_children(node: Node<'_>, source: &[u8]) -> Vec<String> {
+    let mut cursor = node.walk();
+    let mut types = Vec::new();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "type_list" {
+            let mut list_cursor = child.walk();
+            for item in child.named_children(&mut list_cursor) {
+                if let Some(raw) = raw_type_name(item, source) {
+                    types.push(raw);
+                }
+            }
+        }
+    }
+    types
+}
+
+fn type_list_first(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    let found = node
+        .named_children(&mut cursor)
+        .find_map(|child| raw_type_name(child, source));
+    found
+}
+
+fn raw_type_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let raw = node.utf8_text(source).ok()?.trim();
+    if raw.is_empty() || raw == "extends" || raw == "implements" {
+        return None;
+    }
+    let raw = raw.split('<').next().unwrap_or(raw).trim();
+    let raw = raw.trim_end_matches("[]").trim();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_owned())
+    }
+}
+
 fn push_error(node: Node<'_>, file: &mut FileSymbols, message: &str) {
     let position = node.start_position();
     file.errors.push(ParseError {
@@ -419,6 +706,231 @@ fn push_error(node: Node<'_>, file: &mut FileSymbols, message: &str) {
         column: position.column + 1,
         message: message.to_owned(),
     });
+}
+
+/// Byte range of a local variable/parameter name and the scope in which it is
+/// visible. Used to avoid confusing locals with fields during reference search
+/// and to power local rename.
+#[derive(Debug, Clone)]
+pub struct LocalBinding {
+    pub name: String,
+    pub kind: LocalBindingKind,
+    pub name_start_byte: usize,
+    pub name_end_byte: usize,
+    pub declaration_start_byte: usize,
+    pub scope_start_byte: usize,
+    pub scope_end_byte: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalBindingKind {
+    Variable,
+    Parameter,
+    CatchParameter,
+    ForEach,
+    Resource,
+    LambdaParameter,
+}
+
+/// Parse local variable/parameter bindings and their scopes from source text.
+pub fn parse_local_bindings(source: &str) -> Vec<LocalBinding> {
+    let mut parser = Parser::new();
+    let language: tree_sitter::Language = tree_sitter_java::LANGUAGE.into();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let mut bindings = Vec::new();
+    collect_local_bindings(tree.root_node(), source.as_bytes(), &mut bindings);
+    bindings.sort_by_key(|binding| (binding.scope_end_byte, binding.name_start_byte));
+    bindings
+}
+
+fn collect_local_bindings(node: Node<'_>, source: &[u8], bindings: &mut Vec<LocalBinding>) {
+    match node.kind() {
+        "variable_declarator" => {
+            if is_local_declarator(node) {
+                if let (Some(name_node), Some(scope)) =
+                    (node.child_by_field_name("name"), declaration_scope(node))
+                {
+                    push_binding(
+                        bindings,
+                        name_node,
+                        source,
+                        LocalBindingKind::Variable,
+                        scope,
+                    );
+                }
+            }
+        }
+        "formal_parameter" | "receiver_parameter" => {
+            if let (Some(name_node), Some(scope)) =
+                (node.child_by_field_name("name"), parameter_scope(node))
+            {
+                push_binding(
+                    bindings,
+                    name_node,
+                    source,
+                    LocalBindingKind::Parameter,
+                    scope,
+                );
+            }
+        }
+        "catch_formal_parameter" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let scope = nearest_ancestor(node, &["catch_clause"]).unwrap_or(node);
+                push_binding(
+                    bindings,
+                    name_node,
+                    source,
+                    LocalBindingKind::CatchParameter,
+                    scope,
+                );
+            }
+        }
+        "enhanced_for_statement" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                push_binding(bindings, name_node, source, LocalBindingKind::ForEach, node);
+            }
+        }
+        "resource" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let scope =
+                    nearest_ancestor(node, &["try_with_resources_statement"]).unwrap_or(node);
+                push_binding(
+                    bindings,
+                    name_node,
+                    source,
+                    LocalBindingKind::Resource,
+                    scope,
+                );
+            }
+        }
+        "lambda_expression" => {
+            if let Some(parameters) = node.child_by_field_name("parameters") {
+                if parameters.kind() == "identifier" {
+                    push_binding(
+                        bindings,
+                        parameters,
+                        source,
+                        LocalBindingKind::LambdaParameter,
+                        node,
+                    );
+                }
+            }
+        }
+        "inferred_parameters" => {
+            let scope = nearest_ancestor(node, &["lambda_expression"]).unwrap_or(node);
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "identifier" {
+                    push_binding(
+                        bindings,
+                        child,
+                        source,
+                        LocalBindingKind::LambdaParameter,
+                        scope,
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_local_bindings(child, source, bindings);
+    }
+}
+
+fn push_binding(
+    bindings: &mut Vec<LocalBinding>,
+    name_node: Node<'_>,
+    source: &[u8],
+    kind: LocalBindingKind,
+    scope: Node<'_>,
+) {
+    let name = name_node.utf8_text(source).unwrap_or("").trim().to_owned();
+    if name.is_empty() {
+        return;
+    }
+    bindings.push(LocalBinding {
+        name,
+        kind,
+        name_start_byte: name_node.start_byte(),
+        name_end_byte: name_node.end_byte(),
+        declaration_start_byte: name_node.start_byte(),
+        scope_start_byte: scope.start_byte(),
+        scope_end_byte: scope.end_byte(),
+    });
+}
+
+fn is_local_declarator(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "block" | "for_statement" | "switch_block_statement_group" | "lambda_expression" => {
+                return true;
+            }
+            "class_body"
+            | "interface_body"
+            | "enum_body"
+            | "annotation_type_body"
+            | "record_body"
+            | "field_declaration"
+            | "constant_declaration" => return false,
+            _ => current = parent.parent(),
+        }
+    }
+    false
+}
+
+fn declaration_scope(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "for_statement"
+            | "enhanced_for_statement"
+            | "try_with_resources_statement"
+            | "catch_clause"
+            | "lambda_expression"
+            | "block"
+            | "switch_block_statement_group" => {
+                return Some(parent);
+            }
+            "class_body"
+            | "interface_body"
+            | "enum_body"
+            | "annotation_type_body"
+            | "record_body" => return None,
+            _ => current = parent.parent(),
+        }
+    }
+    None
+}
+
+fn parameter_scope(node: Node<'_>) -> Option<Node<'_>> {
+    nearest_ancestor(
+        node,
+        &[
+            "method_declaration",
+            "constructor_declaration",
+            "lambda_expression",
+        ],
+    )
+}
+
+fn nearest_ancestor<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if kinds.contains(&parent.kind()) {
+            return Some(parent);
+        }
+        current = parent.parent();
+    }
+    None
 }
 
 fn text(node: Node<'_>, source: &[u8]) -> String {
@@ -519,6 +1031,77 @@ public class App {
             "public class Broken { void x( { }",
         );
         assert!(!file.errors.is_empty());
+    }
+
+    #[test]
+    fn collects_member_references_and_type_relations() {
+        let source = r#"
+package com.acme;
+class Base { String name; void save() {} }
+class App extends Base implements Runnable {
+    App app;
+    void run() {
+        app.save();
+        this.name = "x";
+        Runnable r = Base::save;
+        name.length();
+    }
+    public void run() {}
+}
+"#;
+        let file = parse_source(Path::new("App.java"), source);
+        let save: Vec<_> = file
+            .member_refs
+            .iter()
+            .filter(|reference| reference.name == "save")
+            .collect();
+        assert!(save
+            .iter()
+            .any(|reference| reference.qualifier.as_deref() == Some("app") && reference.is_call));
+        assert!(save.iter().any(|reference| {
+            reference.qualifier.as_deref() == Some("Base") && reference.is_call
+        }));
+        assert!(file.member_refs.iter().any(|reference| {
+            reference.name == "name"
+                && reference.qualifier.as_deref() == Some("this")
+                && !reference.is_call
+        }));
+        let relation = file
+            .type_relations
+            .iter()
+            .find(|relation| relation.type_name == "App")
+            .unwrap();
+        assert!(relation.super_types.contains(&"Base".to_owned()));
+        assert!(relation.super_types.contains(&"Runnable".to_owned()));
+    }
+
+    #[test]
+    fn collects_local_bindings_with_scopes() {
+        let source = r#"
+class App {
+    void run(int parameter) {
+        String name = "x";
+        for (String item : java.util.List.of(name)) {
+            name += item;
+        }
+        try (var reader = open()) { reader.read(); }
+    }
+}
+"#;
+        let bindings = parse_local_bindings(source);
+        assert!(bindings
+            .iter()
+            .any(|binding| binding.name == "parameter"
+                && binding.kind == LocalBindingKind::Parameter));
+        assert!(bindings
+            .iter()
+            .any(|binding| binding.name == "name" && binding.kind == LocalBindingKind::Variable));
+        assert!(bindings
+            .iter()
+            .any(|binding| binding.name == "item" && binding.kind == LocalBindingKind::ForEach));
+        assert!(bindings
+            .iter()
+            .any(|binding| binding.name == "reader" && binding.kind == LocalBindingKind::Resource));
     }
 
     #[test]

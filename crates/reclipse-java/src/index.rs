@@ -72,6 +72,18 @@ impl ProjectIndex {
         self.recompute_derived();
     }
 
+    /// Update/remove several files and recompute derived tables only once.
+    pub fn update_files(&mut self, removed: &[PathBuf], updates: Vec<(PathBuf, String)>) {
+        for path in removed {
+            self.files.remove(path);
+        }
+        for (path, source) in updates {
+            let parsed = parse_source(&path, &source);
+            self.files.insert(path, parsed);
+        }
+        self.recompute_derived();
+    }
+
     pub fn remove_file(&mut self, path: &Path) {
         if self.files.remove(path).is_some() {
             self.recompute_derived();
@@ -235,6 +247,30 @@ mod tests {
             &app_path,
             "package demo; public class App { void start() {} }",
         );
+        assert!(index.find_symbols("start").is_some());
+        assert!(index.find_symbols("run").is_none());
+    }
+
+    #[test]
+    fn updates_and_renames_files_in_one_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("App.java"), "class App { void run() {} }").unwrap();
+        fs::write(root.join("Other.java"), "class Other { App app; }").unwrap();
+        let project = reclipse_core::discover_project(root).unwrap();
+        let mut index = build_index(project, None);
+        let app = index
+            .files
+            .keys()
+            .find(|path| path.ends_with("App.java"))
+            .unwrap()
+            .clone();
+        let renamed = root.join("Main.java");
+        index.update_files(
+            &[app],
+            vec![(renamed.clone(), "class Main { void start() {} }".to_owned())],
+        );
+        assert!(index.files.contains_key(&renamed));
         assert!(index.find_symbols("start").is_some());
         assert!(index.find_symbols("run").is_none());
     }

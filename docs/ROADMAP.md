@@ -57,7 +57,7 @@ Limitações residuais (M1.1, sem bloquear M2):
 - “select next occurrence” e column mode por teclado;
 - replace no projeto ignora buffers sujos.
 
-## M2 — Núcleo semântico Java (em andamento; completion/hover entregues)
+## M2 — Núcleo semântico Java (em andamento; completion/hover/referências/rename entregues)
 
 Entregue:
 
@@ -70,15 +70,17 @@ Entregue:
 - resolução de tipos por import, mesmo pacote, wildcard e `java.lang`;
 - diagnóstico de imports não resolvidos no painel Problemas;
 - inferência de variáveis (linhas anteriores, generics e arrays);
-- **completion de membros inline** por `.`/`Ctrl+Space`, com herança do classpath;
+- **completion de membros inline** por `.`/`Ctrl+Space`, com herança do projeto e do classpath e retorno encadeado;
 - **hover semântico** de tipos, variáveis e símbolos;
-- **referências semânticas de tipos** (`Ctrl+Shift+G`), com fallback textual.
+- **referências semânticas de tipos** e de **métodos/campos** (`Ctrl+Shift+G`), com method references e fallback textual;
+- **rename conservador** de tipos, métodos, campos e variáveis locais (`Alt+Shift+R`), com rename de arquivo, imports e proteção de overrides/shadowing;
+- inferência de `var` e hierarquia de tipos do projeto;
+- **RECLIPSE Studio**: 3 temas comutáveis, activity bar, toolbar, breadcrumb e console de diagnóstico.
 
 Pendente:
 
-- rename conservador de tipos/variáveis;
-- referências semânticas de métodos/campos;
-- resolução completa de escopos/herança/generics/overloads e completion de retorno encadeado;
+- Generics/overloads completos e desambiguação de static imports concorrentes;
+- rename de pacote/move e atualização de Javadoc/recursos;
 - diagnósticos semânticos nativos; fallback opcional para `javac`/JDT LS;
 - Gradle Tooling API, bundles de version catalog e dependências de plugins;
 - Javadoc e perfis Maven.
@@ -173,7 +175,7 @@ Aceite:
 |---|---:|---:|
 | M0 | concluído | — |
 | M1 | concluído | 3 |
-| M2 | em andamento (referências e fontes entregues) | 15 |
+| M2 | em andamento (referências, rename e fontes entregues) | 15 |
 | M3 | 4–6 | 21 |
 | M4 | 4–6 | 27 |
 | M5 | 4–6 | 33 |

@@ -13,6 +13,7 @@ Este repositório contém o **MVP 0.1.0**, o **M1** do editor e a **fundação d
 ## O que já funciona
 
 - Shell nativo em Rust com **egui/eframe** (GPU), tema escuro e layout de IDE.
+- **RECLIPSE Studio**: identidade visual com emblema desenhado em GPU, activity bar, toolbar de ações, breadcrumb, console de diagnóstico e **3 temas** comutáveis (`Exibir → Tema`): Rust Oxide, Eclipse Dark Cósmico e Cyber Solar Eclipse. Persistidos na sessão.
 - Abertura de pasta/projeto com descoberta de fontes Java:
   - Eclipse (`.project` + `.classpath`)
   - Maven (`pom.xml`, `src/main/java`, `src/test/java`)
@@ -31,9 +32,15 @@ Este repositório contém o **MVP 0.1.0**, o **M1** do editor e a **fundação d
 - **Busca no projeto** (`Ctrl+Shift+F`) em thread separada, com resultados clicáveis e substituição no projeto.
 - **Classpath nativo** Eclipse/Maven/Gradle + JDK, com dependências transitivas, BOM/platform, version catalogs e watch de `pom.xml`/`.classpath`/`build.gradle`; o JDK é escolhido pelo target do projeto.
 - **Open Type** inclui tipos do projeto e do classpath; **F3** em tipo externo abre o visualizador de metadados e, quando há `-sources.jar`/`src.zip`, o código-fonte.
-- **Completion inline** de membros (`Ctrl+Space` ou após `.`), com herança do classpath, filtro incremental e aceite por Enter/Tab.
+- **Completion inline** de membros (`Ctrl+Space` ou após `.`), com herança de classes/interface do projeto **e** do classpath, filtro incremental, aceite por Enter/Tab e **tipos de retorno encadeados** (`service.find().`).
 - **Hover semântico** de tipos, variáveis e símbolos.
-- **Referências** no projeto (`Ctrl+Shift+G`): semânticas para tipos, textuais para os demais identificadores.
+- **Referências** no projeto (`Ctrl+Shift+G`): semânticas para tipos, métodos, campos e constantes (incluindo herança e method references), referências locais no buffer e fallback textual.
+- **Rename conservador** (`Alt+Shift+R`) de tipos, métodos, campos e variáveis locais/parâmetros:
+  - atualiza declaração, referências e imports;
+  - renomeia o `.java` de tipos top-level e atualiza o índice sem recarregar o classpath;
+  - recusa classpath/JDK, colisões, sombreamento de locais e métodos sobrescritos/implementados;
+  - aplica edits em lote e um único passo de undo para rename local.
+- **Inferência de `var`** em inicializadores simples (`new Type(...)`, literais) para completion/hover.
 - Diagnóstico de **imports não resolvidos** no painel de problemas.
 - **File watcher**: recarga automática de arquivos limpos alterados no disco e banner de conflito para buffers sujos.
 - **Recuperação de buffers sujos** após fechar/crash, com diálogo de recuperação.
@@ -46,7 +53,7 @@ Este repositório contém o **MVP 0.1.0**, o **M1** do editor e a **fundação d
 - Painéis de **Projeto**, **Estrutura (outline)** e **Problemas**.
 - **Open Resource** (`Ctrl+Shift+R`) com busca fuzzy.
 - **Quick Access** (`Ctrl+3`).
-- **Ir para definição** (`F3`) no índice sintático e em tipos do classpath.
+- **Ir para definição** (`F3`) com prioridade semântica (local → tipo → membro do projeto/classpath) e fallback sintático quando há um único candidato.
 - **Plugins nativos em Rust** com ABI C versionada (`v1`) e comandos JSON.
 - Plugin de exemplo (`hello-plugin`) que insere texto e mostra estatísticas do arquivo.
 
@@ -70,12 +77,29 @@ Recuperação de buffers após uma sessão anterior:
 
 ![100 abas](docs/screenshot-100tabs.png)
 
+## Temas (RECLIPSE Studio)
+
+O motor de tema troca paleta, cores de sintaxe, seleção, linha atual, emblema e barra de status em tempo real. O design system completo está em [docs/DESIGN_SYSTEM.md](docs/DESIGN_SYSTEM.md).
+
+Rust Oxide Industrial (padrão):
+
+![Tema Rust Oxide](docs/screenshot-theme-rust.png)
+
+Eclipse Dark Cósmico:
+
+![Tema Eclipse Cosmic](docs/screenshot-theme-eclipse.png)
+
+Cyber Solar Eclipse:
+
+![Tema Cyber Solar](docs/screenshot-theme-cyber.png)
+
 ## O que ainda não existe
 
 Este MVP é deliberadamente honesto sobre o escopo:
 
 - Não compila, não roda testes e não depura projetos Java ainda.
-- A semântica Java cobre imports/tipos, completion de membros, hover e referências semânticas de tipos, mas ainda não tem generics/overloads completos, referências de membros ou rename.
+- A semântica Java cobre imports/tipos, completion de membros, hover, referências semânticas de tipos/membros e rename conservador, mas ainda não tem resolução completa de generics/overloads ou rename de membros do classpath.
+- Rename não reescreve Javadoc, strings, configuração por reflexão ou nomes em arquivos de recursos; overrides/implementações e locais sombreados são recusados por segurança, e o rename de workspace exige buffers Java salvos.
 - Maven/Gradle resolvem dependências transitivas do repositório local; não há download, perfis Maven nem Tooling API/bundles avançados do Gradle.
 - Multi-cursor agrupa undo de digitação, mas backspace/delete multi ainda são por tecla.
 - Não é um substituto completo do Eclipse para projetos corporativos.
@@ -121,7 +145,8 @@ Também é possível abrir a IDE sem argumentos e escolher **Arquivo → Abrir p
 | `Ctrl+Shift+F` | Buscar no projeto |
 | `Ctrl+K` / `Ctrl+Shift+K` | Próxima / anterior ocorrência |
 | `Ctrl+Space` | Completion de tipos/membros |
-| `Ctrl+Shift+G` | Referências (semânticas para tipos; textuais para o resto) |
+| `Ctrl+Shift+G` | Referências (semânticas para tipos/membros; locais no buffer) |
+| `Alt+Shift+R` | Renomear tipo/método/campo/variável local |
 | `Ctrl+Shift+L` | Ajuda de atalhos |
 | `F3` | Ir para definição |
 | `F5` | Reindexar |
@@ -134,11 +159,13 @@ Também é possível abrir a IDE sem argumentos e escolher **Arquivo → Abrir p
 | `Ctrl+Z` / `Ctrl+Y` | Desfazer / refazer no editor |
 | `Esc` | Fechar palette/busca ou reduzir cursores |
 
-Os atalhos de arquivo, navegação, busca e projeto podem ser redefinidos em `%APPDATA%\Reclipse\session.json` (ou `~/.config/reclipse/session.json`). Atalhos de edição de texto permanecem fixos nesta versão.
+Os atalhos de arquivo, navegação, busca e projeto podem ser redefinidos em `%APPDATA%\Reclipse\session.json` (ou `~/.config/reclipse/session.json`). Atalhos de edição de texto e refactor (rename) permanecem fixos nesta versão.
 
 ## Sessão e configuração
 
-A IDE salva projeto, abas, cursor, visibilidade dos painéis, tamanho da fonte e keybindings ao sair. Abra **Ajuda → Abrir configuração (session.json)** para editar. Alterações de keybinding exigem reinício; edições externas de keybindings são preservadas ao fechar a IDE.
+A IDE salva projeto, abas, cursor, visibilidade dos painéis (incluindo o console), tema, tamanho da fonte e keybindings ao sair. Abra **Ajuda → Abrir configuração (session.json)** para editar. Alterações de keybinding exigem reinício; edições externas de keybindings são preservadas ao fechar a IDE.
+
+O campo `theme` aceita `rust-oxide` (padrão), `eclipse-cosmic` ou `cyber-solar`. Também é possível iniciar com `RECLIPSE_THEME=cyber-solar`.
 
 Buffers sujos são gravados em backups para recuperação; a sessão guarda abas, cursor, folds, painéis e keybindings.
 
@@ -166,7 +193,7 @@ Detalhes do ABI, ownership de strings, ciclo de vida e versionamento: [docs/PLUG
 crates/
   reclipse-core/        descoberta de projetos e modelo de workspace
   reclipse-classpath/   classpath Eclipse/Maven/Gradle + índice de JARs/JMODs
-  reclipse-java/        parser tree-sitter, índice de símbolos e semântica inicial
+  reclipse-java/        parser tree-sitter, índice de símbolos, semântica e refactors
   reclipse-editor/      documento, cursor, lexer de destaque
   reclipse-plugin-api/  ABI C v1 e protocolo JSON
   reclipse-plugin-host/ carregamento e despacho de plugins
@@ -182,6 +209,7 @@ docs/
   ROADMAP.md            marcos, estimativas e critérios
   PLUGIN_SDK.md         guia do ABI de plugins
   ECLIPSE_COMPAT.md     estratégia realista para plugins Eclipse
+  DESIGN_SYSTEM.md      identidade visual, temas, tipografia e componentes
 ```
 
 ## M1 — Editor de produção
@@ -190,11 +218,11 @@ O marco M1 substituiu o `TextEdit` por um editor próprio com rope, virtualizaç
 
 Detalhes técnicos, métricas e limitações: [docs/M1.md](docs/M1.md).
 
-## M2 — Motor Java (completion e hover entregues)
+## M2 — Motor Java (completion, referências e rename entregues)
 
 O M2 cobre classpath Eclipse/Maven/Gradle/JDK com dependências transitivas, escolha de JDK pelo target, índice nativo de classes de JARs/JMODs, Open Type com tipos externos, F3 abrindo metadados do classpath e diagnóstico de imports não resolvidos.
 
-A camada semântica adiciona inferência de variáveis (inclusive generics e arrays), completion de membros inline com herança do classpath, hover de tipos/variáveis, referências semânticas de tipos e leitura de fontes de JARs/JDK. Ainda faltam rename, referências de membros, generics/overloads completos e diagnósticos do javac/JDT. Plano e limitações: [docs/M2.md](docs/M2.md).
+A camada semântica adiciona inferência de variáveis (inclusive generics, arrays e `var`), completion de membros inline com herança de tipos do projeto e do classpath, tipos de retorno encadeados, hover de tipos/variáveis, referências semânticas de tipos/métodos/campos (com static imports) e rename conservador com atualização de imports e arquivo. Ainda faltam generics/overloads completos, desambiguação de static imports concorrentes e diagnósticos do javac/JDT. Plano e limitações: [docs/M2.md](docs/M2.md).
 
 ![Classpath e índice de tipos](docs/screenshot-classpath.png)
 
@@ -209,6 +237,10 @@ Hover semântico de um tipo do projeto:
 Referências semânticas de `MessageService`:
 
 ![Referências semânticas](docs/screenshot-references.png)
+
+Rename de `MessageService` com prévia de ocorrências e rename do arquivo:
+
+![Rename de tipo](docs/screenshot-rename.png)
 
 Código-fonte de `java.lang.String` lido do `src.zip` do JDK:
 

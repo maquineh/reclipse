@@ -530,6 +530,12 @@ impl Document {
         self.multi_edit_ranges(ranges, inserted)
     }
 
+    /// Replace several character ranges with the same text as a single undo
+    /// step. Used by rename and other multi-occurrence refactors.
+    pub fn replace_ranges(&mut self, ranges: Vec<(usize, usize)>, inserted: &str) -> usize {
+        self.multi_edit_ranges(ranges, inserted)
+    }
+
     fn multi_edit_ranges(&mut self, ranges: Vec<(usize, usize)>, inserted: &str) -> usize {
         let len = self.len_chars();
         let mut ranges: Vec<(usize, usize)> = ranges

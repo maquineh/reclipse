@@ -60,7 +60,9 @@ pub struct Session {
     pub show_project: bool,
     pub show_outline: bool,
     pub show_problems: bool,
+    pub show_console: bool,
     pub font_size: f32,
+    pub theme: String,
     pub keybindings: Keybindings,
 }
 
@@ -73,7 +75,9 @@ impl Default for Session {
             show_project: true,
             show_outline: true,
             show_problems: true,
+            show_console: true,
             font_size: 14.5,
+            theme: "rust-oxide".to_owned(),
             keybindings: Keybindings::default(),
         }
     }

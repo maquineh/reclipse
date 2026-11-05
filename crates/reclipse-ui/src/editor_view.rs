@@ -126,6 +126,12 @@ impl Tab {
         self.folded.clear();
     }
 
+    /// Rebuild token/galley caches after a palette change without losing folds.
+    pub fn invalidate_theme(&mut self) {
+        self.highlight_revision = u64::MAX;
+        self.galley_revision = u64::MAX;
+    }
+
     pub fn folded_ranges(&self) -> Vec<(usize, usize)> {
         self.folded
             .iter()
@@ -331,13 +337,13 @@ impl Tab {
             Pos2::new(clip.left(), clip.top()),
             Pos2::new(clip.left() + gutter_width, clip.bottom()),
         );
-        painter.rect_filled(gutter_rect, 0.0, theme::PANEL);
+        painter.rect_filled(gutter_rect, 0.0, theme::panel());
         painter.line_segment(
             [
                 Pos2::new(gutter_rect.right(), clip.top()),
                 Pos2::new(gutter_rect.right(), clip.bottom()),
             ],
-            Stroke::new(1.0_f32, theme::BORDER),
+            Stroke::new(1.0_f32, theme::border()),
         );
 
         let text_clip = Rect::from_min_max(
@@ -373,7 +379,7 @@ impl Tab {
                         Pos2::new(text_clip.right(), y + row_height),
                     ),
                     0.0,
-                    Color32::from_rgba_unmultiplied(91, 157, 245, 16),
+                    with_alpha(theme::accent(), 16),
                 );
             }
 
@@ -396,7 +402,7 @@ impl Tab {
                             Pos2::new(x_end.max(x_start + 1.0), y + row_height),
                         ),
                         0.0,
-                        Color32::from_rgba_unmultiplied(91, 157, 245, 70),
+                        with_alpha(theme::accent(), 70),
                     );
                 }
             }
@@ -409,9 +415,9 @@ impl Tab {
                     let x_start = text_left + visual_col(&text, start_col) as f32 * char_width;
                     let x_end = text_left + visual_col(&text, end_col) as f32 * char_width;
                     let fill = if current {
-                        Color32::from_rgba_unmultiplied(245, 190, 90, 90)
+                        with_alpha(theme::yellow(), 90)
                     } else {
-                        Color32::from_rgba_unmultiplied(220, 200, 100, 40)
+                        with_alpha(theme::yellow(), 40)
                     };
                     let match_rect = Rect::from_min_max(
                         Pos2::new(x_start, y),
@@ -422,7 +428,7 @@ impl Tab {
                         painter.rect_stroke(
                             match_rect,
                             2.0,
-                            Stroke::new(1.0_f32, theme::YELLOW),
+                            Stroke::new(1.0_f32, theme::yellow()),
                             egui::StrokeKind::Outside,
                         );
                     }
@@ -444,12 +450,12 @@ impl Tab {
                 self.galleys.insert(line, galley.clone());
                 galley
             };
-            text_painter.galley(Pos2::new(text_left, y), galley, theme::TEXT);
+            text_painter.galley(Pos2::new(text_left, y), galley, theme::text());
 
             let gutter_color = if line == cursor_line {
-                theme::ACCENT
+                theme::accent()
             } else {
-                theme::MUTED
+                theme::muted()
             };
             painter.text(
                 Pos2::new(gutter_rect.right() - GUTTER_PAD, y),
@@ -477,7 +483,7 @@ impl Tab {
                 };
                 painter.add(egui::Shape::convex_polygon(
                     points,
-                    theme::MUTED,
+                    theme::muted(),
                     Stroke::NONE,
                 ));
             }
@@ -517,7 +523,7 @@ impl Tab {
                 if cursor.cursor == self.doc.cursor_char {
                     self.cursor_screen_rect = Some(cursor_rect);
                 }
-                text_painter.rect_filled(cursor_rect, 0.0, theme::ACCENT);
+                text_painter.rect_filled(cursor_rect, 0.0, theme::accent());
             }
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(500));
@@ -1146,15 +1152,19 @@ fn push_section(job: &mut LayoutJob, start: usize, end: usize, format: TextForma
     });
 }
 
+fn with_alpha(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
 fn format_for(kind: TokenKind, font: &FontId, italic: bool) -> TextFormat {
     let (color, italics) = match kind {
-        TokenKind::Keyword => (theme::CLR_KEYWORD, false),
-        TokenKind::TypeName => (theme::CLR_TYPE, false),
-        TokenKind::String | TokenKind::Char => (theme::CLR_STRING, false),
-        TokenKind::Comment => (theme::CLR_COMMENT, true),
-        TokenKind::Number => (theme::CLR_NUMBER, false),
-        TokenKind::Annotation => (theme::CLR_ANNOTATION, false),
-        TokenKind::Literal => (theme::CLR_LITERAL, false),
+        TokenKind::Keyword => (theme::clr_keyword(), false),
+        TokenKind::TypeName => (theme::clr_type(), false),
+        TokenKind::String | TokenKind::Char => (theme::clr_string(), false),
+        TokenKind::Comment => (theme::clr_comment(), true),
+        TokenKind::Number => (theme::clr_number(), false),
+        TokenKind::Annotation => (theme::clr_annotation(), false),
+        TokenKind::Literal => (theme::clr_literal(), false),
     };
     let mut format = plain_format(font);
     format.color = color;
@@ -1165,7 +1175,7 @@ fn format_for(kind: TokenKind, font: &FontId, italic: bool) -> TextFormat {
 fn plain_format(font: &FontId) -> TextFormat {
     TextFormat {
         font_id: font.clone(),
-        color: theme::TEXT,
+        color: theme::text(),
         ..Default::default()
     }
 }

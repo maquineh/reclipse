@@ -13,10 +13,14 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use reclipse_classpath::{ClasspathIndex, ClasspathStats};
 use reclipse_core::{discover_project, Project, IGNORED_DIRS};
 use reclipse_editor::{Document, SearchMatcher, SearchOptions};
+use reclipse_java::refactor::{
+    apply_text_edits, local_binding_at, plan_local_rename, plan_member_rename, plan_type_rename,
+    LocalRenamePlan, RenameKind, RenamePlan,
+};
 use reclipse_java::semantic::{
-    completion_context, find_type_references, infer_variable_type,
-    resolve_type as resolve_semantic_type, unresolved_imports, CompletionItem, CompletionKind,
-    ProjectTypes, ResolvedType,
+    completion_context, find_member_references, find_type_references, infer_variable_type,
+    member_target_at, resolve_type as resolve_semantic_type, unresolved_imports, CompletionItem,
+    CompletionKind, MemberTarget, ProjectTypes, ResolvedType,
 };
 use reclipse_java::{build_index, IndexedProblem, ProjectIndex, SymbolKind};
 use reclipse_plugin_api::InvokeContext;
@@ -66,6 +70,55 @@ struct CompletionState {
     receiver: Option<String>,
 }
 
+enum RenameTarget {
+    Type(String),
+    Member(MemberTarget),
+    Local { path: PathBuf, cursor: usize },
+}
+
+impl Clone for RenameTarget {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Type(fqn) => Self::Type(fqn.clone()),
+            Self::Member(target) => Self::Member(target.clone()),
+            Self::Local { path, cursor } => Self::Local {
+                path: path.clone(),
+                cursor: *cursor,
+            },
+        }
+    }
+}
+
+struct RenameState {
+    target: RenameTarget,
+    old_name: String,
+    new_name: String,
+    kind: RenameKind,
+    preview: Option<usize>,
+    focus_pending: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsoleTab {
+    Output,
+    Rust,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+struct LogLine {
+    at: Duration,
+    level: LogLevel,
+    text: String,
+}
+
 struct IndexPayload {
     project: Project,
     index: ProjectIndex,
@@ -108,6 +161,9 @@ struct ScreenshotState {
     source_class: Option<String>,
     references_word: Option<String>,
     references_done: bool,
+    rename_word: Option<String>,
+    rename_new_name: Option<String>,
+    rename_done: bool,
     search_query: Option<String>,
     project_search_query: Option<String>,
 }
@@ -139,6 +195,7 @@ pub struct ReclipseApp {
     classpath_reload_at: Option<Instant>,
     completion: Option<CompletionState>,
     last_completion_revision: Option<(PathBuf, u64)>,
+    rename: Option<RenameState>,
     egui_ctx: Context,
     watcher: Option<RecommendedWatcher>,
     watch_rx: Option<Receiver<PathBuf>>,
@@ -154,6 +211,10 @@ pub struct ReclipseApp {
     show_project: bool,
     show_outline: bool,
     show_problems: bool,
+    show_console: bool,
+    console_tab: ConsoleTab,
+    console: Vec<LogLine>,
+    app_started_at: Instant,
     plugins: PluginHost,
     plugin_commands: Vec<PluginCommand>,
     status_message: Option<Toast>,
@@ -162,6 +223,8 @@ pub struct ReclipseApp {
     project_replace_confirm: bool,
     close_confirm: Option<usize>,
     font_size: f32,
+    theme: crate::theme::ThemeKind,
+    theme_label: String,
     recovery_entries: Vec<crate::recovery::RecoveryEntry>,
     recovery_open: bool,
     backup_state: HashMap<PathBuf, (u64, Instant)>,
@@ -171,12 +234,16 @@ pub struct ReclipseApp {
 
 impl ReclipseApp {
     pub fn new(cc: &CreationContext<'_>, initial: Option<PathBuf>) -> Self {
-        theme::configure(&cc.egui_ctx);
+        let session = crate::session::load();
+        let theme = std::env::var("RECLIPSE_THEME")
+            .ok()
+            .map(|name| crate::theme::ThemeKind::from_name(&name))
+            .unwrap_or_else(|| crate::theme::ThemeKind::from_name(session.theme.as_str()));
+        crate::theme::configure(&cc.egui_ctx, theme);
 
         let mut plugins = PluginHost::new();
         plugins.load_default_paths();
         let plugin_commands = plugins.commands();
-        let session = crate::session::load();
         let recovery_entries = crate::recovery::list();
         let recovery_open = !recovery_entries.is_empty();
 
@@ -196,6 +263,7 @@ impl ReclipseApp {
             classpath_reload_at: None,
             completion: None,
             last_completion_revision: None,
+            rename: None,
             egui_ctx: cc.egui_ctx.clone(),
             watcher: None,
             watch_rx: None,
@@ -211,6 +279,10 @@ impl ReclipseApp {
             show_project: session.show_project,
             show_outline: session.show_outline,
             show_problems: session.show_problems,
+            show_console: session.show_console,
+            console_tab: ConsoleTab::Output,
+            console: Vec::new(),
+            app_started_at: Instant::now(),
             plugins,
             plugin_commands,
             status_message: None,
@@ -219,6 +291,8 @@ impl ReclipseApp {
             project_replace_confirm: false,
             close_confirm: None,
             font_size: session.font_size.clamp(10.0, 28.0),
+            theme,
+            theme_label: theme.short_label().to_owned(),
             recovery_entries,
             recovery_open,
             backup_state: HashMap::new(),
@@ -262,6 +336,9 @@ impl ReclipseApp {
                 source_class: std::env::var("RECLIPSE_SCREENSHOT_SOURCE").ok(),
                 references_word: std::env::var("RECLIPSE_SCREENSHOT_REFERENCES").ok(),
                 references_done: false,
+                rename_word: std::env::var("RECLIPSE_SCREENSHOT_RENAME").ok(),
+                rename_new_name: std::env::var("RECLIPSE_SCREENSHOT_RENAME_NEW").ok(),
+                rename_done: false,
                 search_query: std::env::var("RECLIPSE_SCREENSHOT_SEARCH").ok(),
                 project_search_query: std::env::var("RECLIPSE_SCREENSHOT_PROJECT_SEARCH").ok(),
             },
@@ -351,6 +428,10 @@ impl ReclipseApp {
         self.index_status = IndexStatus::Indexing { done: 0, total: 0 };
         self.index_rx = Some(spawn_index(root.clone()));
         self.start_watcher(&root);
+        self.log(
+            LogLevel::Info,
+            format!("Abrindo projeto: {}", root.display()),
+        );
     }
 
     fn start_watcher(&mut self, root: &Path) {
@@ -427,6 +508,13 @@ impl ReclipseApp {
                         elapsed_ms: stats.elapsed_ms,
                     };
                     self.index_rx = None;
+                    self.log(
+                        LogLevel::Success,
+                        format!(
+                            "Rust core: {} arquivos Java, {} símbolos em {} ms ({} problema(s))",
+                            stats.java_files, stats.symbols, stats.elapsed_ms, stats.problems
+                        ),
+                    );
 
                     // Keep outlines useful for files edited before indexing
                     // finished: merge their in-memory contents into the index.
@@ -631,7 +719,7 @@ impl ReclipseApp {
         egui::TopBottomPanel::top("reclipse_external_change")
             .frame(
                 egui::Frame::NONE
-                    .fill(Color32::from_rgb(0x3a, 0x32, 0x1c))
+                    .fill(tint(theme::yellow(), 28))
                     .inner_margin(egui::Margin::symmetric(10, 4)),
             )
             .show(ctx, |ui| {
@@ -640,9 +728,9 @@ impl ReclipseApp {
                         RichText::new("ARQUIVO ALTERADO NO DISCO")
                             .small()
                             .strong()
-                            .color(theme::YELLOW),
+                            .color(theme::yellow()),
                     );
-                    ui.label(RichText::new(message).small().color(theme::TEXT));
+                    ui.label(RichText::new(message).small().color(theme::text()));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.button("Manter minha versão").clicked() {
                             keep = true;
@@ -668,6 +756,7 @@ impl ReclipseApp {
         self.classpath_status = ClasspathStatus::Indexing { done: 0, total: 0 };
         self.semantic_problems.clear();
         self.classpath_rx = Some(spawn_classpath(project));
+        self.log(LogLevel::Info, "Resolvendo classpath e indexando JARs/JDK…");
     }
 
     fn refresh_semantics(&mut self) {
@@ -714,9 +803,22 @@ impl ReclipseApp {
                         self.project_types.as_ref(),
                         &index,
                     );
-                    self.classpath_status = ClasspathStatus::Ready(stats);
+                    self.classpath_status = ClasspathStatus::Ready(stats.clone());
                     self.classpath_index = Some(*index);
                     self.classpath_rx = None;
+                    self.log(
+                        LogLevel::Success,
+                        format!(
+                            "Classpath: {} archives, {} classes em {} ms{}",
+                            stats.archives,
+                            stats.classes,
+                            stats.elapsed_ms,
+                            stats
+                                .jdk_target
+                                .map(|target| format!(" · Java {target}"))
+                                .unwrap_or_default()
+                        ),
+                    );
                 }
                 ClasspathMessage::Failed(error) => {
                     self.classpath_status = ClasspathStatus::Failed(error.clone());
@@ -896,47 +998,118 @@ impl ReclipseApp {
             self.toast("Nenhum arquivo ativo");
             return;
         };
-        let tab = &self.tabs[active];
-        let Some((word, _, _)) = tab.doc.identifier_at_cursor() else {
-            self.toast("Coloque o cursor sobre um identificador");
+        let (word, start, cursor, path, text, file) = {
+            let tab = &self.tabs[active];
+            let Some((word, start, _)) = tab.doc.identifier_at_cursor() else {
+                self.toast("Coloque o cursor sobre um identificador");
+                return;
+            };
+            let path = tab.doc.path.clone();
+            let text = tab.doc.text();
+            let file = reclipse_java::parse_source(&path, &text);
+            (word, start, tab.doc.cursor_char, path, text, file)
+        };
+
+        if let Some((local, declaration)) = local_binding_at(&text, cursor) {
+            if local == word {
+                let (line, column) = reclipse_editor::line_col_at_char(&text, declaration);
+                self.open_at(path, line, column);
+                return;
+            }
+        }
+
+        let types = self.project_types.as_ref();
+        let classpath = self.classpath_index.as_ref();
+        let empty = ClasspathIndex::default();
+        let classpath = classpath.unwrap_or(&empty);
+        let Some(types) = types else {
+            self.toast("Índice semântico ainda não está pronto");
             return;
         };
-        let from_file = tab.doc.path.clone();
-        let location = self
-            .index
-            .as_ref()
-            .and_then(|index| index.find_best(&word, &from_file))
-            .cloned();
 
-        if let Some(location) = location {
-            self.open_at(location.file, location.symbol.line, location.symbol.column);
+        if cursor_is_type_reference(&file, &text, start) {
+            if let Some(resolved) = resolve_semantic_type(&word, &file, types, classpath) {
+                self.open_resolved_type(resolved);
+                return;
+            }
+        }
+
+        if let Some(index) = self.index.as_ref() {
+            if let Some(target) = member_target_at(&text, &file, cursor, types, index, classpath) {
+                match target {
+                    MemberTarget::Project {
+                        path: target_path,
+                        container,
+                        name,
+                        is_call,
+                        ..
+                    } => {
+                        if let Some(symbol) = index.files.get(&target_path).and_then(|file| {
+                            file.symbols.iter().find(|symbol| {
+                                symbol.name == name
+                                    && symbol.container.as_deref() == Some(container.as_str())
+                                    && (if is_call {
+                                        symbol.kind == SymbolKind::Method
+                                    } else {
+                                        matches!(
+                                            symbol.kind,
+                                            SymbolKind::Field | SymbolKind::EnumConstant
+                                        )
+                                    })
+                            })
+                        }) {
+                            let text = fs::read_to_string(&target_path).unwrap_or_default();
+                            let (line, column) = line_col_of_byte(&text, symbol.name_start_byte);
+                            self.open_at(target_path, line, column);
+                            return;
+                        }
+                    }
+                    MemberTarget::Classpath { class, .. } => {
+                        self.classpath_view = Some(class);
+                        return;
+                    }
+                }
+            }
+        }
+
+        if let Some(resolved) = resolve_semantic_type(&word, &file, types, classpath) {
+            self.open_resolved_type(resolved);
             return;
         }
 
-        let resolved = {
-            let file = self
-                .index
-                .as_ref()
-                .and_then(|index| index.symbols_for(&from_file));
-            let types = self.project_types.as_ref();
-            let classpath = self.classpath_index.as_ref();
-            match (file, types, classpath) {
-                (Some(file), Some(types), Some(classpath)) => {
-                    resolve_semantic_type(&word, file, types, classpath)
-                }
-                _ => None,
-            }
-        };
-        match resolved {
-            Some(ResolvedType::Project(location)) => {
-                self.open_at(location.path, location.line, location.column);
-            }
-            Some(ResolvedType::Classpath(name)) => {
-                self.classpath_view = Some(name);
+        let fallback = self.index.as_ref().and_then(|index| {
+            let candidates = index.find_symbols(&word)?;
+            let same_file: Vec<_> = candidates
+                .iter()
+                .filter(|location| location.file == path)
+                .collect();
+            let location = if same_file.len() == 1 {
+                same_file[0]
+            } else if candidates.len() == 1 {
+                &candidates[0]
+            } else {
+                return None;
+            };
+            Some(location.clone())
+        });
+        match fallback {
+            Some(location) => {
+                self.open_at(location.file, location.symbol.line, location.symbol.column);
             }
             None => self.toast(format!(
-                "Definição de '{word}' não encontrada no índice sintático/classpath"
+                "Definição de '{word}' não encontrada (ambígua ou sem índice)"
             )),
+        }
+    }
+
+    fn open_resolved_type(&mut self, resolved: ResolvedType) {
+        match resolved {
+            ResolvedType::Project(location) => {
+                self.open_at(location.path, location.line, location.column);
+            }
+            ResolvedType::Classpath(name) => {
+                self.classpath_view = Some(name);
+            }
         }
     }
 
@@ -945,62 +1118,55 @@ impl ReclipseApp {
             self.toast("Nenhum arquivo ativo");
             return;
         };
-        let Some((word, _, _)) = self.tabs[active].doc.identifier_at_cursor() else {
-            self.toast("Coloque o cursor sobre um identificador");
+        let (word, start, cursor, path, text, file) = {
+            let tab = &self.tabs[active];
+            let Some((word, start, _)) = tab.doc.identifier_at_cursor() else {
+                self.toast("Coloque o cursor sobre um identificador");
+                return;
+            };
+            let path = tab.doc.path.clone();
+            let text = tab.doc.text();
+            let file = reclipse_java::parse_source(&path, &text);
+            (word, start, tab.doc.cursor_char, path, text, file)
+        };
+
+        // Local variables: occurrences inside the current buffer.
+        if let Some((local, _)) = local_binding_at(&text, cursor) {
+            if local == word {
+                if let Ok(plan) = plan_local_rename(&text, cursor, &format!("{word}_refs")) {
+                    let matches = local_plan_matches(&path, &text, &plan, &word);
+                    if !matches.is_empty() {
+                        let count = matches.len();
+                        self.project_search.show_results(word.clone(), matches);
+                        self.toast(format!("{count} referência(s) da variável local '{word}'"));
+                        return;
+                    }
+                }
+                // Shadowed/ambiguous local: do not fall through to a field
+                // with the same name; use textual search instead.
+                self.textual_references(word);
+                return;
+            }
+        }
+
+        let types = self.project_types.as_ref();
+        let classpath = self.classpath_index.as_ref();
+        let empty = ClasspathIndex::default();
+        let classpath = classpath.unwrap_or(&empty);
+        let Some(types) = types else {
+            self.toast("Índice semântico ainda não está pronto");
             return;
         };
-        let path = self.tabs[active].doc.path.clone();
-
-        let semantic = {
-            let file = self
-                .index
-                .as_ref()
-                .and_then(|index| index.symbols_for(&path));
-            let types = self.project_types.as_ref();
-            let classpath = self.classpath_index.as_ref();
-            match (file, types, classpath) {
-                (Some(file), Some(types), Some(classpath)) => {
-                    resolve_semantic_type(&word, file, types, classpath)
-                        .map(|resolved| resolved.name().to_owned())
-                }
-                _ => None,
-            }
+        let Some(index) = self.index.as_ref() else {
+            self.toast("Índice semântico ainda não está pronto");
+            return;
         };
 
-        if let Some(fqn) = semantic {
-            if let (Some(index), Some(types), Some(classpath)) = (
-                self.index.as_ref(),
-                self.project_types.as_ref(),
-                self.classpath_index.as_ref(),
-            ) {
-                let references = find_type_references(&fqn, types, index, classpath);
-                if !references.is_empty() {
-                    let count = references.len();
-                    let mut cache: HashMap<PathBuf, String> = HashMap::new();
-                    let matches: Vec<ProjectMatch> = references
-                        .into_iter()
-                        .map(|reference| {
-                            let text = cache.entry(reference.file.clone()).or_insert_with(|| {
-                                fs::read_to_string(&reference.file).unwrap_or_default()
-                            });
-                            let preview = text
-                                .split('\n')
-                                .nth(reference.line.saturating_sub(1))
-                                .unwrap_or_default()
-                                .trim()
-                                .chars()
-                                .take(160)
-                                .collect();
-                            ProjectMatch {
-                                file: reference.file,
-                                line: reference.line,
-                                column: reference.column,
-                                start: 0,
-                                end: reference.name.chars().count(),
-                                preview,
-                            }
-                        })
-                        .collect();
+        if cursor_is_type_reference(&file, &text, start) {
+            if let Some(resolved) = resolve_semantic_type(&word, &file, types, classpath) {
+                let fqn = resolved.name().to_owned();
+                if let Some(matches) = self.type_reference_matches(&fqn, types, index, classpath) {
+                    let count = matches.len();
                     self.project_search.show_results(word.clone(), matches);
                     self.toast(format!("{count} referência(s) semânticas de {fqn}"));
                     return;
@@ -1008,6 +1174,31 @@ impl ReclipseApp {
             }
         }
 
+        if let Some(target) = member_target_at(&text, &file, cursor, types, index, classpath) {
+            if let Some((matches, label)) =
+                self.member_reference_matches(&target, types, index, classpath)
+            {
+                let count = matches.len();
+                self.project_search.show_results(word.clone(), matches);
+                self.toast(format!("{count} referência(s) semânticas de {label}"));
+                return;
+            }
+        }
+
+        if let Some(resolved) = resolve_semantic_type(&word, &file, types, classpath) {
+            let fqn = resolved.name().to_owned();
+            if let Some(matches) = self.type_reference_matches(&fqn, types, index, classpath) {
+                let count = matches.len();
+                self.project_search.show_results(word.clone(), matches);
+                self.toast(format!("{count} referência(s) semânticas de {fqn}"));
+                return;
+            }
+        }
+
+        self.textual_references(word);
+    }
+
+    fn textual_references(&mut self, word: String) {
         self.project_search.query = word.clone();
         self.project_search.case_sensitive = true;
         self.project_search.whole_word = true;
@@ -1016,6 +1207,505 @@ impl ReclipseApp {
         self.project_search.open();
         self.run_project_search();
         self.toast(format!("Referências textuais de '{word}'"));
+    }
+
+    fn type_reference_matches(
+        &self,
+        fqn: &str,
+        types: &ProjectTypes,
+        index: &ProjectIndex,
+        classpath: &ClasspathIndex,
+    ) -> Option<Vec<ProjectMatch>> {
+        let references = find_type_references(fqn, types, index, classpath);
+        if references.is_empty() {
+            return None;
+        }
+        let mut cache: HashMap<PathBuf, String> = HashMap::new();
+        let matches: Vec<ProjectMatch> = references
+            .into_iter()
+            .map(|reference| {
+                let text = cache
+                    .entry(reference.file.clone())
+                    .or_insert_with(|| fs::read_to_string(&reference.file).unwrap_or_default());
+                ProjectMatch {
+                    preview: preview_line(text, reference.line),
+                    file: reference.file,
+                    line: reference.line,
+                    column: reference.column,
+                    start: 0,
+                    end: reference.name.chars().count(),
+                }
+            })
+            .collect();
+        Some(matches)
+    }
+
+    fn member_reference_matches(
+        &self,
+        target: &MemberTarget,
+        types: &ProjectTypes,
+        index: &ProjectIndex,
+        classpath: &ClasspathIndex,
+    ) -> Option<(Vec<ProjectMatch>, String)> {
+        let references = find_member_references(target, types, index, classpath);
+        let label = format!("{}.{}", target.owner_name(), target.name());
+        let mut matches: Vec<ProjectMatch> = Vec::new();
+        if let MemberTarget::Project {
+            path,
+            container,
+            name,
+            is_call,
+            ..
+        } = target
+        {
+            if let Some(file) = index.files.get(path) {
+                let text = fs::read_to_string(path).unwrap_or_default();
+                for symbol in &file.symbols {
+                    if symbol.name == *name
+                        && symbol.container.as_deref() == Some(container.as_str())
+                        && (if *is_call {
+                            symbol.kind == SymbolKind::Method
+                        } else {
+                            matches!(symbol.kind, SymbolKind::Field | SymbolKind::EnumConstant)
+                        })
+                    {
+                        let (line, column) = line_col_of_byte(&text, symbol.name_start_byte);
+                        matches.push(ProjectMatch {
+                            file: path.clone(),
+                            line,
+                            column,
+                            start: 0,
+                            end: symbol.name.chars().count(),
+                            preview: preview_line(&text, line),
+                        });
+                    }
+                }
+            }
+        }
+        let mut cache: HashMap<PathBuf, String> = HashMap::new();
+        for reference in references {
+            let text = cache
+                .entry(reference.file.clone())
+                .or_insert_with(|| fs::read_to_string(&reference.file).unwrap_or_default());
+            matches.push(ProjectMatch {
+                preview: preview_line(text, reference.line),
+                file: reference.file,
+                line: reference.line,
+                column: reference.column,
+                start: 0,
+                end: reference.name.chars().count(),
+            });
+        }
+        if matches.is_empty() {
+            return None;
+        }
+        matches.sort_by(|left, right| {
+            left.file
+                .cmp(&right.file)
+                .then(left.line.cmp(&right.line))
+                .then(left.column.cmp(&right.column))
+        });
+        matches.dedup_by(|left, right| {
+            left.file == right.file && left.line == right.line && left.column == right.column
+        });
+        Some((matches, label))
+    }
+
+    fn begin_rename(&mut self) {
+        if self.rename.is_some() {
+            return;
+        }
+        self.completion = None;
+        let Some(active) = self.active_tab else {
+            self.toast("Nenhum arquivo ativo");
+            return;
+        };
+        let (word, start, cursor, path, text, file) = {
+            let tab = &self.tabs[active];
+            let Some((word, start, _)) = tab.doc.identifier_at_cursor() else {
+                self.toast("Coloque o cursor sobre um identificador");
+                return;
+            };
+            let path = tab.doc.path.clone();
+            let text = tab.doc.text();
+            let file = reclipse_java::parse_source(&path, &text);
+            (word, start, tab.doc.cursor_char, path, text, file)
+        };
+
+        if let Some((local, _)) = local_binding_at(&text, cursor) {
+            if local == word {
+                let preview = plan_local_rename(&text, cursor, &format!("{word}_"))
+                    .ok()
+                    .map(|plan| plan.edits.len());
+                self.rename = Some(RenameState {
+                    target: RenameTarget::Local { path, cursor },
+                    old_name: word.clone(),
+                    new_name: word,
+                    kind: RenameKind::Local,
+                    preview,
+                    focus_pending: true,
+                    error: None,
+                });
+                return;
+            }
+        }
+
+        let types = self.project_types.as_ref();
+        let classpath = self.classpath_index.as_ref();
+        let empty = ClasspathIndex::default();
+        let classpath = classpath.unwrap_or(&empty);
+        let Some(types) = types else {
+            self.toast("Índice semântico ainda não está pronto");
+            return;
+        };
+        let Some(index) = self.index.as_ref() else {
+            self.toast("Índice semântico ainda não está pronto");
+            return;
+        };
+
+        if cursor_is_type_reference(&file, &text, start) {
+            if let Some(ResolvedType::Project(location)) =
+                resolve_semantic_type(&word, &file, types, classpath)
+            {
+                let preview =
+                    plan_type_rename(&location.fqn, &format!("{word}_"), types, index, classpath)
+                        .ok()
+                        .map(|plan| plan.total_edits());
+                self.rename = Some(RenameState {
+                    target: RenameTarget::Type(location.fqn.clone()),
+                    old_name: word.clone(),
+                    new_name: word,
+                    kind: RenameKind::Type,
+                    preview,
+                    focus_pending: true,
+                    error: None,
+                });
+                return;
+            }
+        }
+
+        if let Some(target) = member_target_at(&text, &file, cursor, types, index, classpath) {
+            let (member_name, is_call) = match &target {
+                MemberTarget::Project { name, is_call, .. } => (name.clone(), *is_call),
+                MemberTarget::Classpath { .. } => {
+                    self.toast("Membros do classpath/JDK são somente leitura");
+                    return;
+                }
+            };
+            let preview =
+                plan_member_rename(&target, &format!("{member_name}_"), types, index, classpath)
+                    .ok()
+                    .map(|plan| plan.total_edits());
+            self.rename = Some(RenameState {
+                target: RenameTarget::Member(target),
+                old_name: word.clone(),
+                new_name: word,
+                kind: if is_call {
+                    RenameKind::Method
+                } else {
+                    RenameKind::Field
+                },
+                preview,
+                focus_pending: true,
+                error: None,
+            });
+            return;
+        }
+
+        if let Some(ResolvedType::Project(location)) =
+            resolve_semantic_type(&word, &file, types, classpath)
+        {
+            let preview =
+                plan_type_rename(&location.fqn, &format!("{word}_"), types, index, classpath)
+                    .ok()
+                    .map(|plan| plan.total_edits());
+            self.rename = Some(RenameState {
+                target: RenameTarget::Type(location.fqn.clone()),
+                old_name: word.clone(),
+                new_name: word,
+                kind: RenameKind::Type,
+                preview,
+                focus_pending: true,
+                error: None,
+            });
+            return;
+        }
+        self.toast("Nada renomeável sob o cursor");
+    }
+
+    fn apply_rename(&mut self) {
+        let Some(state) = self.rename.as_ref() else {
+            return;
+        };
+        let target = state.target.clone();
+        let old_name = state.old_name.clone();
+        let new_name = state.new_name.trim().to_owned();
+        if new_name.is_empty() {
+            if let Some(state) = &mut self.rename {
+                state.error = Some("informe um nome".to_owned());
+            }
+            return;
+        }
+
+        if let RenameTarget::Local { path, cursor } = &target {
+            let Some(index) = self.tabs.iter().position(|tab| tab.doc.path == *path) else {
+                self.rename = None;
+                self.toast("A aba do arquivo foi fechada");
+                return;
+            };
+            let source = self.tabs[index].doc.text();
+            match plan_local_rename(&source, *cursor, &new_name) {
+                Ok(plan) if plan.old_name != old_name => {
+                    if let Some(state) = &mut self.rename {
+                        state.error = Some(
+                            "o buffer mudou desde a abertura do diálogo; tente novamente"
+                                .to_owned(),
+                        );
+                    }
+                }
+                Ok(plan) => {
+                    let ranges: Vec<(usize, usize)> = plan
+                        .edits
+                        .iter()
+                        .map(|edit| {
+                            (
+                                source[..edit.start_byte].chars().count(),
+                                source[..edit.end_byte].chars().count(),
+                            )
+                        })
+                        .collect();
+                    self.tabs[index].doc.replace_ranges(ranges, &plan.new_name);
+                    self.tabs[index].invalidate_highlight();
+                    self.tabs[index].focus();
+                    self.rename = None;
+                    self.toast(format!(
+                        "{} renomeado para {} ({} ocorrência(s))",
+                        plan.old_name,
+                        plan.new_name,
+                        plan.edits.len()
+                    ));
+                }
+                Err(error) => {
+                    if let Some(state) = &mut self.rename {
+                        state.error = Some(error);
+                    }
+                }
+            }
+            return;
+        }
+
+        let types = self.project_types.as_ref();
+        let classpath = self.classpath_index.as_ref();
+        let empty = ClasspathIndex::default();
+        let classpath = classpath.unwrap_or(&empty);
+        let Some(types) = types else {
+            return;
+        };
+        let Some(index) = self.index.as_ref() else {
+            return;
+        };
+        let plan = match &target {
+            RenameTarget::Type(fqn) => plan_type_rename(fqn, &new_name, types, index, classpath),
+            RenameTarget::Member(target) => {
+                plan_member_rename(target, &new_name, types, index, classpath)
+            }
+            RenameTarget::Local { .. } => unreachable!(),
+        };
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                if let Some(state) = &mut self.rename {
+                    state.error = Some(error);
+                }
+                return;
+            }
+        };
+
+        let dirty = self
+            .tabs
+            .iter()
+            .find(|tab| tab.doc.dirty && is_java_path(&tab.doc.path))
+            .map(|tab| tab.doc.path.clone());
+        if let Some(path) = dirty {
+            if let Some(state) = &mut self.rename {
+                state.error = Some(format!(
+                    "salve {} antes de renomear (workspace rename exige buffers limpos)",
+                    path.display()
+                ));
+            }
+            return;
+        }
+
+        match self.apply_workspace_rename(&plan) {
+            Ok(()) => {
+                let count = plan.total_edits();
+                let renamed_file = plan.rename_file.as_ref().map(|(_, to)| {
+                    to.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                });
+                self.rename = None;
+                match renamed_file {
+                    Some(name) => self.toast(format!(
+                        "{} renomeado para {new_name} ({count} edições; arquivo {name})",
+                        plan.old_name
+                    )),
+                    None => self.toast(format!(
+                        "{} renomeado para {new_name} ({count} ocorrência(s))",
+                        plan.old_name
+                    )),
+                }
+            }
+            Err(error) => {
+                if let Some(state) = &mut self.rename {
+                    state.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn apply_workspace_rename(&mut self, plan: &RenamePlan) -> Result<(), String> {
+        let mut new_texts: Vec<(PathBuf, String)> = Vec::new();
+        for file in &plan.files {
+            // Disk is the source of truth for workspace edits; dirty buffers are
+            // rejected before this point.
+            let text = fs::read_to_string(&file.path)
+                .map_err(|error| format!("falha ao ler {}: {error}", file.path.display()))?;
+            let updated = apply_text_edits(&text, &file.edits)?;
+            fs::write(&file.path, &updated)
+                .map_err(|error| format!("falha ao salvar {}: {error}", file.path.display()))?;
+            new_texts.push((file.path.clone(), updated));
+        }
+        if let Some((from, to)) = &plan.rename_file {
+            fs::rename(from, to).map_err(|error| {
+                format!(
+                    "falha ao renomear {} para {}: {error}",
+                    from.display(),
+                    to.display()
+                )
+            })?;
+        }
+        for (old_path, _) in &new_texts {
+            let new_path = plan
+                .rename_file
+                .as_ref()
+                .filter(|(from, _)| from == old_path)
+                .map(|(_, to)| to.clone())
+                .unwrap_or_else(|| old_path.clone());
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| &tab.doc.path == old_path) {
+                tab.doc.path = new_path.clone();
+                let _ = tab.reload_from_disk();
+                tab.external_change = None;
+                tab.invalidate_highlight();
+            }
+            self.watch_ignored
+                .insert(old_path.clone(), Instant::now() + Duration::from_secs(2));
+            self.watch_ignored
+                .insert(new_path, Instant::now() + Duration::from_secs(2));
+        }
+        self.tree.invalidate();
+        if let Some(index) = &mut self.index {
+            let mut removed = Vec::new();
+            let mut updates = Vec::new();
+            for (old_path, text) in &new_texts {
+                let new_path = plan
+                    .rename_file
+                    .as_ref()
+                    .filter(|(from, _)| from == old_path)
+                    .map(|(_, to)| to.clone())
+                    .unwrap_or_else(|| old_path.clone());
+                if new_path != *old_path {
+                    removed.push(old_path.clone());
+                }
+                updates.push((new_path, text.clone()));
+            }
+            index.update_files(&removed, updates);
+            if let Some(project) = &mut self.project {
+                replace_project_paths(project, plan.rename_file.as_ref());
+            }
+            replace_project_paths(&mut index.project, plan.rename_file.as_ref());
+            let stats = index.stats.clone();
+            self.index_status = IndexStatus::Ready {
+                files: stats.java_files,
+                symbols: stats.symbols,
+                problems: stats.problems,
+                elapsed_ms: stats.elapsed_ms,
+            };
+            self.refresh_semantics();
+        } else if self.root.is_some() {
+            self.reindex();
+        }
+        Ok(())
+    }
+
+    fn show_rename(&mut self, ctx: &Context) {
+        if self.rename.is_none() {
+            return;
+        }
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("Renomear")
+            .id(egui::Id::new("reclipse_rename"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_width(420.0);
+                let state = self.rename.as_mut().expect("rename state");
+                ui.label(
+                    RichText::new(format!("{} · {}", state.old_name, state.kind.label()))
+                        .strong()
+                        .color(theme::accent()),
+                );
+                ui.add_space(4.0);
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut state.new_name)
+                        .hint_text("novo nome")
+                        .desired_width(f32::INFINITY),
+                );
+                if state.focus_pending {
+                    response.request_focus();
+                    if response.has_focus() {
+                        state.focus_pending = false;
+                    }
+                }
+                if response.changed() {
+                    state.error = None;
+                }
+                if let Some(preview) = state.preview {
+                    ui.label(
+                        RichText::new(format!("prévia: ~{preview} ocorrência(s)"))
+                            .small()
+                            .color(theme::muted()),
+                    );
+                }
+                if let Some(error) = &state.error {
+                    ui.label(RichText::new(error).small().color(theme::red()));
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Renomear").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Cancelar").clicked() {
+                        cancel = true;
+                    }
+                });
+                let enter = ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
+                let escape = ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
+                if enter {
+                    apply = true;
+                }
+                if escape {
+                    cancel = true;
+                }
+            });
+        if cancel {
+            self.rename = None;
+        } else if apply {
+            self.apply_rename();
+        }
     }
 
     fn undo_active(&mut self) {
@@ -1059,9 +1749,19 @@ impl ReclipseApp {
             show_project: self.show_project,
             show_outline: self.show_outline,
             show_problems: self.show_problems,
+            show_console: self.show_console,
             font_size: self.font_size,
+            theme: self.theme.config_name().to_owned(),
             keybindings: self.keybindings.clone(),
         }
+    }
+
+    fn set_theme(&mut self, kind: crate::theme::ThemeKind) {
+        self.theme = kind;
+        self.theme_label = kind.short_label().to_owned();
+        crate::theme::configure(&self.egui_ctx, kind);
+        self.tabs.iter_mut().for_each(Tab::invalidate_theme);
+        self.toast(format!("Tema: {}", kind.label()));
     }
 
     fn open_settings(&mut self) {
@@ -1319,7 +2019,7 @@ impl ReclipseApp {
                          Recupere os buffers desejados ou descarte-os.",
                     )
                     .small()
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
                 );
                 ui.add_space(6.0);
                 egui::ScrollArea::vertical()
@@ -1335,7 +2035,7 @@ impl ReclipseApp {
                                 ui.label(
                                     RichText::new(format!("{size} bytes"))
                                         .small()
-                                        .color(theme::MUTED),
+                                        .color(theme::muted()),
                                 );
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if ui.small_button("Descartar").clicked() {
@@ -1500,7 +2200,7 @@ impl ReclipseApp {
                          Em modo regex, grupos como $1 e ${name} são expandidos.",
                     )
                     .small()
-                    .color(theme::YELLOW),
+                    .color(theme::yellow()),
                 );
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -1668,12 +2368,17 @@ impl ReclipseApp {
             .default_height(if self.file_search.replace { 96.0 } else { 62.0 })
             .frame(
                 egui::Frame::NONE
-                    .fill(theme::PANEL)
+                    .fill(theme::panel())
                     .inner_margin(egui::Margin::symmetric(10, 6)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("BUSCAR").small().strong().color(theme::MUTED));
+                    ui.label(
+                        RichText::new("BUSCAR")
+                            .small()
+                            .strong()
+                            .color(theme::muted()),
+                    );
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut self.file_search.query)
                             .id(egui::Id::new("reclipse_file_search_query"))
@@ -1717,7 +2422,7 @@ impl ReclipseApp {
                             format!("{current} de {matches}")
                         })
                         .small()
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                     );
                     if ui.button("Anterior").clicked() {
                         previous = true;
@@ -1732,7 +2437,7 @@ impl ReclipseApp {
 
                 if self.file_search.replace {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Substituir por").color(theme::MUTED));
+                        ui.label(RichText::new("Substituir por").color(theme::muted()));
                         let response = ui.add(
                             egui::TextEdit::singleline(&mut self.file_search.replacement)
                                 .id(egui::Id::new("reclipse_file_replace_query"))
@@ -1751,7 +2456,7 @@ impl ReclipseApp {
                 }
 
                 if let Some(error) = &self.file_search.error {
-                    ui.label(RichText::new(error).small().color(theme::RED));
+                    ui.label(RichText::new(error).small().color(theme::red()));
                 }
 
                 if search_has_focus && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
@@ -1803,7 +2508,7 @@ impl ReclipseApp {
             .default_height(220.0)
             .frame(
                 egui::Frame::NONE
-                    .fill(theme::PANEL)
+                    .fill(theme::panel())
                     .inner_margin(egui::Margin::symmetric(10, 6)),
             )
             .show(ctx, |ui| {
@@ -1812,10 +2517,10 @@ impl ReclipseApp {
                         RichText::new("BUSCAR NO PROJETO")
                             .small()
                             .strong()
-                            .color(theme::MUTED),
+                            .color(theme::muted()),
                     );
                     if let Some(name) = &project_name {
-                        ui.label(RichText::new(name).small().color(theme::MUTED));
+                        ui.label(RichText::new(name).small().color(theme::muted()));
                     }
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut self.project_search.query)
@@ -1854,7 +2559,7 @@ impl ReclipseApp {
                     ui.label(
                         RichText::new(format!("{total} resultado(s)"))
                             .small()
-                            .color(theme::MUTED),
+                            .color(theme::muted()),
                     );
                     if ui.button("Fechar").clicked() {
                         close = true;
@@ -1866,11 +2571,11 @@ impl ReclipseApp {
                 }
 
                 if let Some(error) = &error {
-                    ui.label(RichText::new(error).color(theme::RED));
+                    ui.label(RichText::new(error).color(theme::red()));
                 }
 
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Substituir por").color(theme::MUTED));
+                    ui.label(RichText::new("Substituir por").color(theme::muted()));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.project_search.replacement)
                             .id(egui::Id::new("reclipse_project_replace_query"))
@@ -1882,7 +2587,7 @@ impl ReclipseApp {
                     ui.label(
                         RichText::new("buffers sujos são ignorados; regex expande grupos $1")
                             .small()
-                            .color(theme::MUTED),
+                            .color(theme::muted()),
                     );
                 });
 
@@ -1899,7 +2604,7 @@ impl ReclipseApp {
                                     "Digite e pressione Enter para buscar"
                                 })
                                 .small()
-                                .color(theme::MUTED),
+                                .color(theme::muted()),
                             );
                         }
                         for (index, found) in results.iter().enumerate() {
@@ -2002,10 +2707,39 @@ impl ReclipseApp {
     }
 
     fn toast(&mut self, message: impl Into<String>) {
+        let text = message.into();
+        let level = if text.contains("Falha")
+            || text.contains("falhou")
+            || text.contains("não foi possível")
+            || text.contains("Erro")
+        {
+            LogLevel::Error
+        } else if text.contains("Salvo")
+            || text.contains("renomeado")
+            || text.contains("Recarregado")
+        {
+            LogLevel::Success
+        } else if text.contains("aviso") || text.contains("warning") {
+            LogLevel::Warning
+        } else {
+            LogLevel::Info
+        };
+        self.log(level, text.clone());
         self.status_message = Some(Toast {
-            text: message.into(),
+            text,
             until: Instant::now() + Duration::from_secs(5),
         });
+    }
+
+    fn log(&mut self, level: LogLevel, text: impl Into<String>) {
+        self.console.push(LogLine {
+            at: self.app_started_at.elapsed(),
+            level,
+            text: text.into(),
+        });
+        if self.console.len() > 300 {
+            self.console.remove(0);
+        }
     }
 
     fn palette_entries(&self) -> Vec<PaletteEntry> {
@@ -2041,6 +2775,12 @@ impl ReclipseApp {
                         "Ir para definição",
                         self.keymap.label(KeyAction::GoToDefinition),
                         Action::GoToDefinition,
+                    ),
+                    PaletteEntry::new("Editar: renomear", "Alt+Shift+R", Action::Rename),
+                    PaletteEntry::new(
+                        "Navegar: referências",
+                        "Ctrl+Shift+G",
+                        Action::FindReferences,
                     ),
                     PaletteEntry::new(
                         "Editar: localizar",
@@ -2229,7 +2969,13 @@ impl ReclipseApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &Context) {
-        if self.palette.open || self.close_confirm.is_some() {
+        if self.palette.open || self.close_confirm.is_some() || self.rename.is_some() {
+            return;
+        }
+
+        if ctx.input_mut(|input| input.consume_key(Modifiers::ALT | Modifiers::SHIFT, Key::R)) {
+            self.completion = None;
+            self.begin_rename();
             return;
         }
 
@@ -2593,8 +3339,8 @@ impl ReclipseApp {
                 .fixed_pos(position)
                 .show(ctx, |ui| {
                     egui::Frame::NONE
-                        .fill(theme::PANEL)
-                        .stroke(egui::Stroke::new(1.0_f32, theme::ACCENT))
+                        .fill(theme::panel())
+                        .stroke(egui::Stroke::new(1.0_f32, theme::accent()))
                         .inner_margin(6.0)
                         .show(ui, |ui| {
                             ui.set_min_width(320.0);
@@ -2605,7 +3351,7 @@ impl ReclipseApp {
                                 }
                                 None => format!("Completion · {} sugestões", visible.len()),
                             };
-                            ui.label(RichText::new(title).small().color(theme::MUTED));
+                            ui.label(RichText::new(title).small().color(theme::muted()));
                             egui::ScrollArea::vertical()
                                 .max_height(230.0)
                                 .auto_shrink([false, false])
@@ -2618,9 +3364,9 @@ impl ReclipseApp {
                                             CompletionKind::Method => "m",
                                         };
                                         let color = match item.kind {
-                                            CompletionKind::Type => theme::CLR_TYPE,
-                                            CompletionKind::Field => theme::MUTED,
-                                            CompletionKind::Method => theme::YELLOW,
+                                            CompletionKind::Type => theme::clr_type(),
+                                            CompletionKind::Field => theme::muted(),
+                                            CompletionKind::Method => theme::yellow(),
                                         };
                                         let detail = truncate_detail(&item.detail, 72);
                                         let response = ui.selectable_label(
@@ -2641,7 +3387,7 @@ impl ReclipseApp {
                             ui.label(
                                 RichText::new("Ctrl+Space · Enter/Tab aceitar · Esc fechar")
                                     .small()
-                                    .color(theme::MUTED),
+                                    .color(theme::muted()),
                             );
                         });
                 });
@@ -2655,6 +3401,7 @@ impl ReclipseApp {
     fn show_hover(&mut self, ctx: &Context) {
         if self.completion.is_some()
             || self.palette.open
+            || self.rename.is_some()
             || self.classpath_view.is_some()
             || self.classpath_source.is_some()
             || self.about_open
@@ -2777,11 +3524,13 @@ impl ReclipseApp {
         egui::TopBottomPanel::top("reclipse_menu")
             .frame(
                 egui::Frame::NONE
-                    .fill(theme::PANEL)
+                    .fill(theme::panel())
                     .inner_margin(egui::Margin::symmetric(8, 3)),
             )
             .show(ctx, |ui| {
                 egui::menu::bar(ui, |ui| {
+                    draw_emblem(ui, self.theme, 18.0).on_hover_text("RECLIPSE Studio v1.0");
+                    ui.add_space(4.0);
                     ui.menu_button("Arquivo", |ui| {
                         if ui
                             .add(
@@ -2840,6 +3589,14 @@ impl ReclipseApp {
                         {
                             ui.close_menu();
                             self.redo_active();
+                        }
+                        ui.separator();
+                        if ui
+                            .add(egui::Button::new("Renomear…").shortcut_text("Alt+Shift+R"))
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.begin_rename();
                         }
                         ui.separator();
                         if ui
@@ -2951,10 +3708,7 @@ impl ReclipseApp {
                             self.goto_definition();
                         }
                         if ui
-                            .add(
-                                egui::Button::new("Referências (texto)")
-                                    .shortcut_text("Ctrl+Shift+G"),
-                            )
+                            .add(egui::Button::new("Referências").shortcut_text("Ctrl+Shift+G"))
                             .clicked()
                         {
                             ui.close_menu();
@@ -2975,7 +3729,7 @@ impl ReclipseApp {
                             ui.label(
                                 RichText::new(root.display().to_string())
                                     .small()
-                                    .color(theme::MUTED),
+                                    .color(theme::muted()),
                             );
                         }
                     });
@@ -2984,6 +3738,25 @@ impl ReclipseApp {
                         ui.checkbox(&mut self.show_project, "Projeto");
                         ui.checkbox(&mut self.show_outline, "Estrutura");
                         ui.checkbox(&mut self.show_problems, "Problemas");
+                        ui.checkbox(&mut self.show_console, "Console");
+                        ui.separator();
+                        ui.label(
+                            RichText::new("Tema (RECLIPSE Studio)")
+                                .small()
+                                .strong()
+                                .color(theme::muted()),
+                        );
+                        for kind in [
+                            crate::theme::ThemeKind::RustOxide,
+                            crate::theme::ThemeKind::EclipseCosmic,
+                            crate::theme::ThemeKind::CyberSolar,
+                        ] {
+                            let selected = self.theme == kind;
+                            if ui.selectable_label(selected, kind.label()).clicked() {
+                                ui.close_menu();
+                                self.set_theme(kind);
+                            }
+                        }
                         ui.separator();
                         if ui.button("Aumentar fonte").clicked() {
                             ui.close_menu();
@@ -3001,14 +3774,14 @@ impl ReclipseApp {
                             ui.label(
                                 RichText::new("Nenhum plugin carregado")
                                     .small()
-                                    .color(theme::MUTED),
+                                    .color(theme::muted()),
                             );
                             ui.label(
                                 RichText::new(
                                     "Coloque reclipse_plugin_*.dll ao lado do executável",
                                 )
                                 .small()
-                                .color(theme::MUTED),
+                                .color(theme::muted()),
                             );
                         } else {
                             for plugin in &plugins {
@@ -3053,17 +3826,343 @@ impl ReclipseApp {
                         ui.label(
                             RichText::new("RECLIPSE")
                                 .strong()
-                                .color(theme::ACCENT)
+                                .color(theme::accent())
                                 .size(13.0),
                         );
                         ui.label(
                             RichText::new("Rust-native Java IDE")
                                 .small()
-                                .color(theme::MUTED),
+                                .color(theme::muted()),
                         );
+                        ui.separator();
+                        for kind in [
+                            crate::theme::ThemeKind::CyberSolar,
+                            crate::theme::ThemeKind::EclipseCosmic,
+                            crate::theme::ThemeKind::RustOxide,
+                        ] {
+                            let selected = self.theme == kind;
+                            if ui
+                                .selectable_label(
+                                    selected,
+                                    RichText::new(kind.short_label()).size(10.5),
+                                )
+                                .on_hover_text(kind.label())
+                                .clicked()
+                            {
+                                self.set_theme(kind);
+                            }
+                        }
                     });
                 });
             });
+    }
+
+    fn quick_toolbar(&mut self, ctx: &Context) {
+        let mut actions = Vec::new();
+        let syntax_problems = self
+            .index
+            .as_ref()
+            .map(|index| index.problems.len())
+            .unwrap_or(0);
+        let semantic_problems = self.semantic_problems.len();
+        let index_text = match &self.index_status {
+            IndexStatus::Ready { elapsed_ms, .. } => {
+                (format!("Rust core · {elapsed_ms} ms"), theme::green())
+            }
+            IndexStatus::Indexing { .. } => ("Indexando…".to_owned(), theme::yellow()),
+            IndexStatus::Failed(_) => ("Índice falhou".to_owned(), theme::red()),
+            IndexStatus::Idle => ("Rust core · idle".to_owned(), theme::muted()),
+        };
+        let cp_text = match &self.classpath_status {
+            ClasspathStatus::Ready(stats) => stats
+                .jdk_target
+                .map(|target| format!("Java {target}"))
+                .unwrap_or_else(|| "classpath pronto".to_owned()),
+            ClasspathStatus::Indexing { .. } => "classpath…".to_owned(),
+            ClasspathStatus::Failed(_) => "classpath falhou".to_owned(),
+            ClasspathStatus::Idle => "classpath —".to_owned(),
+        };
+        let cp_color = match &self.classpath_status {
+            ClasspathStatus::Ready(_) => theme::green(),
+            ClasspathStatus::Indexing { .. } => theme::yellow(),
+            ClasspathStatus::Failed(_) => theme::red(),
+            ClasspathStatus::Idle => theme::muted(),
+        };
+
+        egui::TopBottomPanel::top("reclipse_toolbar")
+            .exact_height(34.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme::panel_alt())
+                    .inner_margin(egui::Margin::symmetric(8, 3)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if toolbar_button(ui, "Salvar", "Salvar arquivo ativo (Ctrl+S)") {
+                        actions.push(Action::Save);
+                    }
+                    if toolbar_button(ui, "Reindexar", "Reindexar projeto (F5)") {
+                        actions.push(Action::Reindex);
+                    }
+                    if toolbar_button(ui, "Buscar", "Buscar no projeto (Ctrl+Shift+F)") {
+                        actions.push(Action::FindInProject);
+                    }
+                    if toolbar_button(ui, "Referências", "Referências (Ctrl+Shift+G)") {
+                        actions.push(Action::FindReferences);
+                    }
+                    if toolbar_button(ui, "Renomear", "Renomear (Alt+Shift+R)") {
+                        actions.push(Action::Rename);
+                    }
+                    ui.separator();
+                    ui.label(
+                        RichText::new("JAVA")
+                            .monospace()
+                            .size(10.0)
+                            .color(theme::clr_type()),
+                    );
+                    if let Some(project) = &self.project {
+                        ui.label(RichText::new(&project.name).small().color(theme::muted()))
+                            .on_hover_text(project.root.display().to_string());
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(cp_text).small().color(cp_color));
+                        ui.separator();
+                        ui.label(RichText::new(index_text.0).small().color(index_text.1));
+                        ui.separator();
+                        problem_badge(ui, "erros", syntax_problems, theme::red());
+                        problem_badge(ui, "avisos", semantic_problems, theme::yellow());
+                    });
+                });
+            });
+
+        for action in actions {
+            self.execute_action(action);
+        }
+    }
+
+    fn activity_bar(&mut self, ctx: &Context) {
+        let problem_count = self
+            .index
+            .as_ref()
+            .map(|index| index.problems.len())
+            .unwrap_or(0)
+            + self.semantic_problems.len();
+        let mut open_settings = false;
+        let mut toggle_console = false;
+        egui::SidePanel::left("reclipse_activity")
+            .exact_width(42.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme::panel_alt())
+                    .inner_margin(egui::Margin::symmetric(3, 6)),
+            )
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    if activity_button(ui, ActivityIcon::Project, self.show_project, "Projeto")
+                        .clicked()
+                    {
+                        self.show_project = !self.show_project;
+                    }
+                    if activity_button(ui, ActivityIcon::Outline, self.show_outline, "Estrutura")
+                        .clicked()
+                    {
+                        self.show_outline = !self.show_outline;
+                    }
+                    let response = activity_button(
+                        ui,
+                        ActivityIcon::Problems,
+                        self.show_problems,
+                        "Problemas",
+                    );
+                    if problem_count > 0 {
+                        let badge_pos = response.rect.right_top() + egui::vec2(-8.0, 3.0);
+                        ui.painter().circle_filled(badge_pos, 4.0, theme::red());
+                    }
+                    if response.clicked() {
+                        self.show_problems = !self.show_problems;
+                    }
+                    if activity_button(ui, ActivityIcon::Console, self.show_console, "Console")
+                        .clicked()
+                    {
+                        toggle_console = true;
+                    }
+                    ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+                        if activity_button(ui, ActivityIcon::Settings, false, "Configurações")
+                            .clicked()
+                        {
+                            open_settings = true;
+                        }
+                    });
+                });
+            });
+        if toggle_console {
+            self.show_console = !self.show_console;
+        }
+        if open_settings {
+            self.open_settings();
+        }
+    }
+
+    fn console_panel(&mut self, ctx: &Context) {
+        if !self.show_console {
+            return;
+        }
+        let mut clear = false;
+        let mut close = false;
+        let index_line = match &self.index_status {
+            IndexStatus::Ready {
+                files,
+                symbols,
+                problems,
+                elapsed_ms,
+            } => format!(
+                "Índice Rust: {files} arquivos · {symbols} símbolos · {problems} problemas · {elapsed_ms} ms"
+            ),
+            IndexStatus::Indexing { done, total } => {
+                format!("Indexação em andamento: {done}/{total}")
+            }
+            IndexStatus::Failed(error) => format!("Falha na indexação: {error}"),
+            IndexStatus::Idle => "Índice ocioso".to_owned(),
+        };
+        let classpath_line = match &self.classpath_status {
+            ClasspathStatus::Ready(stats) => format!(
+                "Classpath: {} archives · {} classes · {} ms · Java {}",
+                stats.archives,
+                stats.classes,
+                stats.elapsed_ms,
+                stats
+                    .jdk_target
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "—".to_owned())
+            ),
+            ClasspathStatus::Indexing { done, total } => {
+                format!("Classpath: {done}/{total} archives")
+            }
+            ClasspathStatus::Failed(error) => format!("Classpath falhou: {error}"),
+            ClasspathStatus::Idle => "Classpath ocioso".to_owned(),
+        };
+        egui::TopBottomPanel::bottom("reclipse_console")
+            .resizable(true)
+            .default_height(132.0)
+            .min_height(72.0)
+            .max_height(360.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme::panel())
+                    .inner_margin(egui::Margin::symmetric(8, 4)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(
+                            self.console_tab == ConsoleTab::Output,
+                            RichText::new("Console").size(12.0).strong(),
+                        )
+                        .clicked()
+                    {
+                        self.console_tab = ConsoleTab::Output;
+                    }
+                    if ui
+                        .selectable_label(
+                            self.console_tab == ConsoleTab::Rust,
+                            RichText::new("Rust Engine").size(12.0).strong(),
+                        )
+                        .clicked()
+                    {
+                        self.console_tab = ConsoleTab::Rust;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("Fechar console")
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                        if ui.small_button("Limpar").clicked() {
+                            clear = true;
+                        }
+                        ui.label(
+                            RichText::new("Rust-native diagnostics")
+                                .small()
+                                .color(theme::muted()),
+                        );
+                    });
+                });
+                ui.separator();
+                match self.console_tab {
+                    ConsoleTab::Output => {
+                        egui::ScrollArea::vertical()
+                            .stick_to_bottom(true)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if self.console.is_empty() {
+                                    ui.label(
+                                        RichText::new("Sem saída ainda.")
+                                            .small()
+                                            .color(theme::muted()),
+                                    );
+                                }
+                                for line in &self.console {
+                                    let color = match line.level {
+                                        LogLevel::Info => theme::muted(),
+                                        LogLevel::Success => theme::green(),
+                                        LogLevel::Warning => theme::yellow(),
+                                        LogLevel::Error => theme::red(),
+                                    };
+                                    let seconds = line.at.as_secs();
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "[{:02}:{:02}] {}",
+                                            seconds / 60,
+                                            seconds % 60,
+                                            line.text
+                                        ))
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(color),
+                                    );
+                                }
+                            });
+                    }
+                    ConsoleTab::Rust => {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(index_line).monospace().size(11.5));
+                                ui.label(RichText::new(classpath_line).monospace().size(11.5));
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Semântica: {} import(s) não resolvido(s) · tema {}",
+                                        self.semantic_problems.len(),
+                                        self.theme.label()
+                                    ))
+                                    .monospace()
+                                    .size(11.5)
+                                    .color(theme::muted()),
+                                );
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Plugins: {} · fonte {:.1} pt · abas {}",
+                                        self.plugins.plugin_count(),
+                                        self.font_size,
+                                        self.tabs.len()
+                                    ))
+                                    .monospace()
+                                    .size(11.5)
+                                    .color(theme::muted()),
+                                );
+                            });
+                    }
+                }
+            });
+        if clear {
+            self.console.clear();
+        }
+        if close {
+            self.show_console = false;
+        }
     }
 
     fn status_bar(&mut self, ctx: &Context) {
@@ -3071,18 +4170,26 @@ impl ReclipseApp {
             .exact_height(27.0)
             .frame(
                 egui::Frame::NONE
-                    .fill(theme::PANEL)
+                    .fill(theme::panel())
                     .inner_margin(egui::Margin::symmetric(8, 2)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if let Some(toast) = &self.status_message {
-                        ui.label(RichText::new(&toast.text).color(theme::ACCENT));
+                        ui.label(RichText::new(&toast.text).color(theme::accent()));
                     } else {
                         if let Some(project) = &self.project {
                             ui.label(RichText::new(&project.name).strong());
                             ui.separator();
                         }
+                        ui.label(
+                            RichText::new("RUST")
+                                .monospace()
+                                .size(10.0)
+                                .strong()
+                                .color(theme::accent()),
+                        );
+                        ui.separator();
                         self.index_status_ui(ui);
                         ui.separator();
                         self.classpath_status_ui(ui);
@@ -3100,7 +4207,7 @@ impl ReclipseApp {
                                 });
                                 ui.separator();
                                 if tab.doc.dirty {
-                                    ui.label(RichText::new("não salvo").color(theme::YELLOW));
+                                    ui.label(RichText::new("não salvo").color(theme::yellow()));
                                     ui.separator();
                                 }
                             }
@@ -3108,6 +4215,9 @@ impl ReclipseApp {
                         ui.label(format!("{} plugin(s)", self.plugins.plugin_count()));
                         ui.separator();
                         ui.label("UTF-8");
+                        ui.separator();
+                        ui.label(RichText::new(&self.theme_label).color(theme::muted()))
+                            .on_hover_text(self.theme.label());
                     });
                 });
             });
@@ -3116,7 +4226,7 @@ impl ReclipseApp {
     fn classpath_status_ui(&self, ui: &mut Ui) {
         match &self.classpath_status {
             ClasspathStatus::Idle => {
-                ui.label(RichText::new("cp: —").small().color(theme::MUTED));
+                ui.label(RichText::new("cp: —").small().color(theme::muted()));
             }
             ClasspathStatus::Indexing { done, total } => {
                 ui.spinner();
@@ -3125,7 +4235,7 @@ impl ReclipseApp {
                 } else {
                     format!("classpath: {done}/{total} archives")
                 };
-                ui.label(RichText::new(label).small().color(theme::MUTED));
+                ui.label(RichText::new(label).small().color(theme::muted()));
             }
             ClasspathStatus::Ready(stats) => {
                 let target = stats
@@ -3138,7 +4248,7 @@ impl ReclipseApp {
                         stats.archives, stats.classes, stats.elapsed_ms, target
                     ))
                     .small()
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
                 )
                 .on_hover_text(format!(
                     "JDK: {} · {} warning(s) de classpath",
@@ -3150,8 +4260,12 @@ impl ReclipseApp {
                 ));
             }
             ClasspathStatus::Failed(error) => {
-                ui.label(RichText::new("classpath falhou").small().color(theme::RED))
-                    .on_hover_text(error);
+                ui.label(
+                    RichText::new("classpath falhou")
+                        .small()
+                        .color(theme::red()),
+                )
+                .on_hover_text(error);
             }
         }
     }
@@ -3159,16 +4273,16 @@ impl ReclipseApp {
     fn index_status_ui(&self, ui: &mut Ui) {
         match &self.index_status {
             IndexStatus::Idle => {
-                ui.label(RichText::new("Pronto").color(theme::MUTED));
+                ui.label(RichText::new("Pronto").color(theme::muted()));
             }
             IndexStatus::Indexing { done, total } => {
                 ui.spinner();
                 if *total == 0 {
-                    ui.label(RichText::new("Indexando…").color(theme::MUTED));
+                    ui.label(RichText::new("Indexando…").color(theme::muted()));
                 } else {
                     ui.label(
                         RichText::new(format!("Indexando {done}/{total} arquivos Java"))
-                            .color(theme::MUTED),
+                            .color(theme::muted()),
                     );
                 }
             }
@@ -3182,11 +4296,11 @@ impl ReclipseApp {
                     RichText::new(format!(
                         "{files} arquivos Java · {symbols} símbolos · {problems} problemas · {elapsed_ms} ms"
                     ))
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
                 );
             }
             IndexStatus::Failed(error) => {
-                ui.label(RichText::new("Falha na indexação").color(theme::RED))
+                ui.label(RichText::new("Falha na indexação").color(theme::red()))
                     .on_hover_text(error);
             }
         }
@@ -3205,7 +4319,7 @@ impl ReclipseApp {
             .default_width(300.0)
             .frame(
                 egui::Frame::NONE
-                    .fill(theme::PANEL)
+                    .fill(theme::panel())
                     .inner_margin(egui::Margin::symmetric(8, 6)),
             )
             .show(ctx, |ui| {
@@ -3232,7 +4346,7 @@ impl ReclipseApp {
     fn project_section(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         section_header(ui, "PROJETO");
         let Some(root) = self.root.clone() else {
-            ui.label(RichText::new("Nenhum projeto aberto").color(theme::MUTED));
+            ui.label(RichText::new("Nenhum projeto aberto").color(theme::muted()));
             if ui.button("Abrir pasta…").clicked() {
                 actions.push(Action::OpenFolder);
             }
@@ -3263,13 +4377,13 @@ impl ReclipseApp {
                     project.java_files.len()
                 ))
                 .small()
-                .color(theme::MUTED),
+                .color(theme::muted()),
             );
         } else if matches!(self.index_status, IndexStatus::Indexing { .. }) {
             ui.label(
                 RichText::new("descobrindo fontes…")
                     .small()
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
             );
         }
 
@@ -3281,19 +4395,19 @@ impl ReclipseApp {
     fn outline_section(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         section_header(ui, "ESTRUTURA");
         let Some(active) = self.active_tab else {
-            ui.label(RichText::new("Nenhum arquivo ativo").color(theme::MUTED));
+            ui.label(RichText::new("Nenhum arquivo ativo").color(theme::muted()));
             return;
         };
         let path = self.tabs[active].doc.path.clone();
         let Some(index) = &self.index else {
-            ui.label(RichText::new("Índice em construção…").color(theme::MUTED));
+            ui.label(RichText::new("Índice em construção…").color(theme::muted()));
             return;
         };
         let Some(file) = index.symbols_for(&path) else {
             ui.label(
                 RichText::new("Este arquivo ainda não está no índice (salve-o)")
                     .small()
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
             );
             return;
         };
@@ -3302,10 +4416,10 @@ impl ReclipseApp {
         let symbols: Vec<_> = file.symbols.iter().take(1_000).cloned().collect();
 
         if let Some(package) = package {
-            ui.label(RichText::new(package).small().color(theme::MUTED));
+            ui.label(RichText::new(package).small().color(theme::muted()));
         }
         if symbols.is_empty() {
-            ui.label(RichText::new("Nenhum símbolo encontrado").color(theme::MUTED));
+            ui.label(RichText::new("Nenhum símbolo encontrado").color(theme::muted()));
             return;
         }
 
@@ -3315,9 +4429,9 @@ impl ReclipseApp {
                 | SymbolKind::Interface
                 | SymbolKind::Enum
                 | SymbolKind::Record
-                | SymbolKind::Annotation => theme::CLR_TYPE,
-                SymbolKind::Method | SymbolKind::Constructor => theme::YELLOW,
-                _ => theme::MUTED,
+                | SymbolKind::Annotation => theme::clr_type(),
+                SymbolKind::Method | SymbolKind::Constructor => theme::yellow(),
+                _ => theme::muted(),
             };
             ui.horizontal(|ui| {
                 ui.add_space((symbol.depth as f32) * 12.0);
@@ -3341,7 +4455,7 @@ impl ReclipseApp {
             ui.label(
                 RichText::new(format!("mostrando 1.000 de {total_symbols} símbolos"))
                     .small()
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
             );
         }
     }
@@ -3349,7 +4463,7 @@ impl ReclipseApp {
     fn problems_section(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         section_header(ui, "PROBLEMAS");
         let Some(index) = &self.index else {
-            ui.label(RichText::new("Sem dados de indexação").color(theme::MUTED));
+            ui.label(RichText::new("Sem dados de indexação").color(theme::muted()));
             return;
         };
         let total = index.problems.len();
@@ -3362,7 +4476,11 @@ impl ReclipseApp {
         ui.label(
             RichText::new(format!("{total} problema(s) de sintaxe"))
                 .small()
-                .color(if total == 0 { theme::GREEN } else { theme::RED }),
+                .color(if total == 0 {
+                    theme::green()
+                } else {
+                    theme::red()
+                }),
         );
         if total == 0 && semantic_total == 0 {
             return;
@@ -3388,7 +4506,7 @@ impl ReclipseApp {
                 problem.message
             );
             if ui
-                .selectable_label(false, RichText::new(label).size(12.0).color(theme::RED))
+                .selectable_label(false, RichText::new(label).size(12.0).color(theme::red()))
                 .clicked()
             {
                 actions.push(Action::OpenAt(problem.file, problem.line, problem.column));
@@ -3400,7 +4518,7 @@ impl ReclipseApp {
             ui.label(
                 RichText::new(format!("{semantic_total} import(s) não resolvido(s)"))
                     .small()
-                    .color(theme::YELLOW),
+                    .color(theme::yellow()),
             );
             for problem in semantic {
                 let relative = root
@@ -3421,7 +4539,10 @@ impl ReclipseApp {
                     problem.message
                 );
                 if ui
-                    .selectable_label(false, RichText::new(label).size(12.0).color(theme::YELLOW))
+                    .selectable_label(
+                        false,
+                        RichText::new(label).size(12.0).color(theme::yellow()),
+                    )
                     .clicked()
                 {
                     actions.push(Action::OpenAt(problem.file, problem.line, 1));
@@ -3432,9 +4553,10 @@ impl ReclipseApp {
 
     fn central_panel(&mut self, ctx: &Context) {
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(theme::EDITOR_BG))
+            .frame(egui::Frame::NONE.fill(theme::editor_bg()))
             .show(ctx, |ui| {
                 self.tab_bar(ui);
+                self.breadcrumb(ui);
                 ui.separator();
                 if let Some(active) = self.active_tab {
                     if let Some(tab) = self.tabs.get_mut(active) {
@@ -3447,13 +4569,68 @@ impl ReclipseApp {
             });
     }
 
+    fn breadcrumb(&self, ui: &mut Ui) {
+        let Some(active) = self.active_tab else {
+            return;
+        };
+        let Some(tab) = self.tabs.get(active) else {
+            return;
+        };
+        let path = &tab.doc.path;
+        let project_name = self
+            .project
+            .as_ref()
+            .map(|project| project.name.clone())
+            .unwrap_or_else(|| "workspace".to_owned());
+        let package = self
+            .index
+            .as_ref()
+            .and_then(|index| index.symbols_for(path))
+            .and_then(|file| file.package.clone());
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let cursor_line = tab.cursor_line;
+        let symbol = self
+            .index
+            .as_ref()
+            .and_then(|index| index.symbols_for(path))
+            .and_then(|file| {
+                file.symbols
+                    .iter()
+                    .filter(|symbol| symbol.line <= cursor_line)
+                    .max_by_key(|symbol| (symbol.line, symbol.depth))
+            })
+            .map(|symbol| symbol.name.clone());
+
+        egui::Frame::NONE
+            .fill(theme::panel())
+            .inner_margin(egui::Margin::symmetric(8, 2))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(project_name).small().color(theme::muted()));
+                    ui.label(RichText::new("›").small().color(theme::border()));
+                    if let Some(package) = package {
+                        ui.label(RichText::new(package).small().color(theme::muted()));
+                        ui.label(RichText::new("›").small().color(theme::border()));
+                    }
+                    ui.label(RichText::new(file_name).small().color(theme::text()));
+                    if let Some(symbol) = symbol {
+                        ui.label(RichText::new("›").small().color(theme::border()));
+                        ui.label(RichText::new(symbol).small().color(theme::accent()));
+                    }
+                });
+            });
+    }
+
     fn tab_bar(&mut self, ui: &mut Ui) {
         let mut activate = None;
         let mut close = None;
         let mut open_folder = false;
 
         egui::Frame::NONE
-            .fill(theme::PANEL)
+            .fill(theme::panel())
             .inner_margin(egui::Margin::symmetric(8, 4))
             .show(ui, |ui| {
                 egui::ScrollArea::horizontal()
@@ -3465,7 +4642,7 @@ impl ReclipseApp {
                                     RichText::new("RECLIPSE")
                                         .small()
                                         .strong()
-                                        .color(theme::MUTED),
+                                        .color(theme::muted()),
                                 );
                                 if ui.small_button("Abrir projeto…").clicked() {
                                     open_folder = true;
@@ -3473,22 +4650,52 @@ impl ReclipseApp {
                                 return;
                             }
                             for (index, tab) in self.tabs.iter().enumerate() {
-                                let title = format!(
-                                    "{}{}",
-                                    if tab.doc.dirty { "* " } else { "" },
-                                    tab.title()
-                                );
                                 let is_active = self.active_tab == Some(index);
-                                let response =
-                                    ui.selectable_label(is_active, RichText::new(title).size(13.0));
+                                ui.label(
+                                    RichText::new("J")
+                                        .monospace()
+                                        .size(10.0)
+                                        .strong()
+                                        .color(theme::clr_type()),
+                                );
+                                let title = tab.title();
+                                let text = RichText::new(title).size(12.5).color(if is_active {
+                                    theme::text()
+                                } else {
+                                    theme::muted()
+                                });
+                                let response = ui.selectable_label(is_active, text);
+                                if is_active {
+                                    let rect = response.rect;
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::Pos2::new(rect.left(), rect.bottom()),
+                                            egui::Pos2::new(rect.right(), rect.bottom()),
+                                        ],
+                                        egui::Stroke::new(2.0, theme::accent()),
+                                    );
+                                }
                                 if response.clicked() {
                                     activate = Some(index);
                                 }
                                 response.on_hover_text(tab.doc.path.display().to_string());
-                                if ui.small_button("x").clicked() {
+                                if tab.doc.dirty {
+                                    ui.label(RichText::new("●").size(8.0).color(theme::yellow()))
+                                        .on_hover_text("alterações não salvas");
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("×").size(12.0).color(theme::muted()),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .on_hover_text("Fechar aba")
+                                    .clicked()
+                                {
                                     close = Some(index);
                                 }
-                                ui.add_space(2.0);
+                                ui.add_space(4.0);
                             }
                         });
                     });
@@ -3506,20 +4713,23 @@ impl ReclipseApp {
     }
 
     fn welcome(&mut self, ui: &mut Ui) {
+        let theme_kind = self.theme;
         ui.vertical_centered(|ui| {
-            ui.add_space(70.0);
+            ui.add_space(42.0);
+            draw_emblem(ui, theme_kind, 76.0);
+            ui.add_space(6.0);
             ui.label(
-                RichText::new("RECLIPSE")
-                    .size(42.0)
+                RichText::new("RECLIPSE Studio")
+                    .size(34.0)
                     .strong()
-                    .color(theme::ACCENT),
+                    .color(theme::accent()),
             );
             ui.label(
-                RichText::new("A IDE Java nativa em Rust")
-                    .size(15.0)
-                    .color(theme::MUTED),
+                RichText::new("Rust-native Java IDE · design system v1.0")
+                    .size(14.0)
+                    .color(theme::muted()),
             );
-            ui.add_space(26.0);
+            ui.add_space(22.0);
 
             ui.horizontal(|ui| {
                 if ui.button("Abrir projeto…").clicked() {
@@ -3537,7 +4747,7 @@ impl ReclipseApp {
             if let Some(project) = &self.project {
                 ui.label(
                     RichText::new(format!("{} · {}", project.name, project.build_system.label()))
-                        .color(theme::TEXT),
+                        .color(theme::text()),
                 );
                 ui.label(
                     RichText::new(format!(
@@ -3546,15 +4756,15 @@ impl ReclipseApp {
                         project.all_files.len()
                     ))
                     .small()
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
                 );
             } else if matches!(self.index_status, IndexStatus::Indexing { .. }) {
                 ui.spinner();
-                ui.label(RichText::new("Indexando o projeto…").color(theme::MUTED));
+                ui.label(RichText::new("Indexando o projeto…").color(theme::muted()));
             } else {
                 ui.label(
                     RichText::new("Abra uma pasta com um projeto Java para começar")
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                 );
             }
 
@@ -3563,16 +4773,16 @@ impl ReclipseApp {
             ui.add_space(12.0);
             ui.label(
                 RichText::new(
-                    "Ctrl+Shift+R  abrir recurso     Ctrl+Shift+T  abrir tipo     Ctrl+Space  completion     F3  definição",
+                    "Ctrl+Shift+R  recurso   Ctrl+Shift+T  tipo   Ctrl+Shift+G  referências   Alt+Shift+R  rename   F3  definição   Ctrl+Space  completion",
                 )
                 .small()
-                .color(theme::MUTED),
+                .color(theme::muted()),
             );
             ui.add_space(8.0);
             ui.label(
                 RichText::new("MVP nativo: tree-sitter-java · egui · plugins Rust ABI v1")
                     .small()
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
             );
         });
     }
@@ -3648,7 +4858,7 @@ impl ReclipseApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if filtered.is_empty() {
-                            ui.label(RichText::new("Nenhum resultado").color(theme::MUTED));
+                            ui.label(RichText::new("Nenhum resultado").color(theme::muted()));
                         }
                         for (index, entry) in filtered.iter().enumerate() {
                             let selected = index == self.palette.selected;
@@ -3668,7 +4878,7 @@ impl ReclipseApp {
                 ui.label(
                     RichText::new("Setas: navegar   Enter: abrir   Esc: fechar")
                         .small()
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                 );
             });
 
@@ -3710,7 +4920,7 @@ impl ReclipseApp {
                     RichText::new(&class.name)
                         .monospace()
                         .strong()
-                        .color(theme::ACCENT),
+                        .color(theme::accent()),
                 );
                 ui.label(
                     RichText::new(format!(
@@ -3720,20 +4930,20 @@ impl ReclipseApp {
                         class.origin
                     ))
                     .small()
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
                 );
                 if let Some(super_name) = &class.super_name {
                     ui.label(
                         RichText::new(format!("extends {super_name}"))
                             .small()
-                            .color(theme::MUTED),
+                            .color(theme::muted()),
                     );
                 }
                 if !class.interfaces.is_empty() {
                     ui.label(
                         RichText::new(format!("implements {}", class.interfaces.join(", ")))
                             .small()
-                            .color(theme::MUTED),
+                            .color(theme::muted()),
                     );
                 }
                 ui.separator();
@@ -3748,9 +4958,9 @@ impl ReclipseApp {
                     })
                     .small()
                     .color(if has_source {
-                        theme::GREEN
+                        theme::green()
                     } else {
-                        theme::YELLOW
+                        theme::yellow()
                     }),
                 );
                 egui::ScrollArea::vertical()
@@ -3863,7 +5073,7 @@ impl ReclipseApp {
                          Edição de texto usa as teclas convencionais.",
                     )
                     .small()
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
                 );
                 ui.separator();
                 egui::Grid::new("reclipse_shortcut_grid")
@@ -3875,7 +5085,7 @@ impl ReclipseApp {
                             ui.label(
                                 RichText::new(self.keymap.label(action))
                                     .monospace()
-                                    .color(theme::ACCENT),
+                                    .color(theme::accent()),
                             );
                             ui.end_row();
                         }
@@ -3887,33 +5097,33 @@ impl ReclipseApp {
                          Ctrl+Alt+↓ adicionar cursor · Alt+arrastar seleção por coluna · Esc reduzir cursores",
                     )
                     .small()
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
                 );
                 ui.label(
                     RichText::new(
                         "Folding: Ctrl+Shift+[ dobrar · Ctrl+Shift+] desdobrar · Ctrl+Shift+0/9 recolher/expandir tudo",
                     )
                     .small()
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
                 );
                 ui.label(
                     RichText::new(
                         "Completion: Ctrl+Space abre sugestões · digitar após `.` abre membros · Enter/Tab aceita",
                     )
                     .small()
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
                 );
                 ui.label(
-                    RichText::new("Referências textuais no projeto: Ctrl+Shift+G")
+                    RichText::new("Referências semânticas: Ctrl+Shift+G · rename: Alt+Shift+R")
                         .small()
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                 );
                 ui.label(
                     RichText::new(
                         "Busca: Enter próximo · Shift+Enter anterior · Ctrl+F localizar · Ctrl+H substituir",
                     )
                     .small()
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
                 );
             });
         self.shortcuts_open = open;
@@ -3935,11 +5145,11 @@ impl ReclipseApp {
                     RichText::new("RECLIPSE 0.1.0")
                         .size(24.0)
                         .strong()
-                        .color(theme::ACCENT),
+                        .color(theme::accent()),
                 );
                 ui.label(
                     RichText::new("Uma IDE Java nativa, rápida e extensível em Rust.")
-                        .color(theme::TEXT),
+                        .color(theme::text()),
                 );
                 ui.add_space(10.0);
                 ui.separator();
@@ -3957,13 +5167,13 @@ impl ReclipseApp {
                          Este MVP não carrega bundles OSGi nem plugins SWT.",
                     )
                     .small()
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
                 );
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("Projeto independente; não afiliado à Eclipse Foundation.")
                         .small()
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                 );
             });
         self.about_open = open;
@@ -4043,6 +5253,8 @@ impl ReclipseApp {
             Action::ToggleOutline => self.show_outline = !self.show_outline,
             Action::ToggleProblems => self.show_problems = !self.show_problems,
             Action::GoToDefinition => self.goto_definition(),
+            Action::Rename => self.begin_rename(),
+            Action::FindReferences => self.find_references(),
             Action::FindInFile => self.begin_file_search(false),
             Action::ReplaceInFile => self.begin_file_search(true),
             Action::FindInProject => self.begin_project_search(),
@@ -4278,6 +5490,32 @@ impl ReclipseApp {
                             }
                         }
                     }
+                    if !self.screenshot.rename_done {
+                        if let Some(word) = self.screenshot.rename_word.clone() {
+                            if let Some(active) = self.active_tab {
+                                let text = self.tabs[active].doc.text();
+                                if let Some(position) = text.rfind(&word) {
+                                    let inside = position
+                                        + word
+                                            .chars()
+                                            .next()
+                                            .map(|character| character.len_utf8())
+                                            .unwrap_or(0);
+                                    let character = text[..inside].chars().count();
+                                    self.tabs[active].doc.set_cursor(character, false);
+                                    self.tabs[active].pending_cursor = Some(character);
+                                    self.begin_rename();
+                                    if let (Some(state), Some(name)) = (
+                                        self.rename.as_mut(),
+                                        self.screenshot.rename_new_name.clone(),
+                                    ) {
+                                        state.new_name = name;
+                                    }
+                                    self.screenshot.rename_done = true;
+                                }
+                            }
+                        }
+                    }
                     if self.classpath_source.is_none() {
                         if let Some(name) = self.screenshot.source_class.clone() {
                             if let Some(location) = self
@@ -4362,14 +5600,18 @@ impl eframe::App for ReclipseApp {
         self.sync_file_search();
         self.handle_shortcuts(ctx);
         self.top_bar(ctx);
+        self.quick_toolbar(ctx);
         self.status_bar(ctx);
+        self.console_panel(ctx);
         self.external_change_bar(ctx);
         self.search_panel(ctx);
+        self.activity_bar(ctx);
         self.left_panel(ctx);
         self.central_panel(ctx);
         self.maybe_auto_complete();
         self.show_completion(ctx);
         self.show_hover(ctx);
+        self.show_rename(ctx);
         self.show_palette(ctx);
         self.show_shortcuts(ctx);
         self.show_classpath_view(ctx);
@@ -4394,7 +5636,7 @@ impl eframe::App for ReclipseApp {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        let [red, green, blue, alpha] = theme::BG.to_array();
+        let [red, green, blue, alpha] = theme::bg().to_array();
         [
             red as f32 / 255.0,
             green as f32 / 255.0,
@@ -4419,12 +5661,347 @@ impl Drop for ReclipseApp {
 
 fn section_header(ui: &mut Ui, title: &str) {
     ui.add_space(4.0);
-    ui.label(RichText::new(title).small().strong().color(theme::MUTED));
+    ui.label(RichText::new(title).small().strong().color(theme::muted()));
     ui.separator();
+}
+
+fn toolbar_button(ui: &mut Ui, label: &str, hint: &str) -> bool {
+    ui.add(egui::Button::new(RichText::new(label).size(12.0)).min_size(egui::vec2(0.0, 22.0)))
+        .on_hover_text(hint)
+        .clicked()
+}
+
+fn problem_badge(ui: &mut Ui, label: &str, count: usize, color: Color32) {
+    egui::Frame::NONE
+        .fill(color.gamma_multiply(0.14))
+        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.45)))
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .corner_radius(8.0)
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(format!("{count} {label}"))
+                    .small()
+                    .color(color),
+            );
+        });
+}
+
+#[derive(Clone, Copy)]
+enum ActivityIcon {
+    Project,
+    Outline,
+    Problems,
+    Console,
+    Settings,
+}
+
+fn activity_button(ui: &mut Ui, icon: ActivityIcon, active: bool, tooltip: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(34.0, 32.0), egui::Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 4.0, theme::hover());
+    }
+    if active {
+        ui.painter().rect_filled(rect, 4.0, theme::accent_dim());
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                rect.left_top() + egui::vec2(0.0, 5.0),
+                egui::vec2(2.0, (rect.height() - 10.0).max(2.0)),
+            ),
+            1.0,
+            theme::accent(),
+        );
+    }
+    let color = if active {
+        theme::accent()
+    } else if response.hovered() {
+        theme::text()
+    } else {
+        theme::muted()
+    };
+    let painter = ui.painter();
+    let center = rect.center();
+    let stroke = egui::Stroke::new(1.4, color);
+    match icon {
+        ActivityIcon::Project => {
+            let left = center.x - 7.0;
+            let right = center.x + 7.0;
+            let top = center.y - 5.0;
+            let bottom = center.y + 6.0;
+            painter.line_segment(
+                [
+                    egui::Pos2::new(left, top + 3.0),
+                    egui::Pos2::new(left + 4.0, top),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::Pos2::new(left + 4.0, top),
+                    egui::Pos2::new(right - 2.0, top),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::Pos2::new(right - 2.0, top),
+                    egui::Pos2::new(right, top + 3.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::Pos2::new(right, top + 3.0),
+                    egui::Pos2::new(right, bottom),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::Pos2::new(right, bottom),
+                    egui::Pos2::new(left, bottom),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::Pos2::new(left, bottom),
+                    egui::Pos2::new(left, top + 3.0),
+                ],
+                stroke,
+            );
+        }
+        ActivityIcon::Outline => {
+            for (index, width) in [0.0_f32, 2.0, -1.0].into_iter().enumerate() {
+                let y = center.y - 5.0 + index as f32 * 5.0;
+                painter.circle_filled(egui::Pos2::new(center.x - 7.0, y), 1.2, color);
+                painter.line_segment(
+                    [
+                        egui::Pos2::new(center.x - 4.0, y),
+                        egui::Pos2::new(center.x + 7.0 + width, y),
+                    ],
+                    stroke,
+                );
+            }
+        }
+        ActivityIcon::Problems => {
+            let apex = egui::Pos2::new(center.x, center.y - 7.0);
+            painter.line_segment(
+                [apex, egui::Pos2::new(center.x - 7.0, center.y + 6.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [apex, egui::Pos2::new(center.x + 7.0, center.y + 6.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::Pos2::new(center.x - 7.0, center.y + 6.0),
+                    egui::Pos2::new(center.x + 7.0, center.y + 6.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::Pos2::new(center.x, center.y - 1.0),
+                    egui::Pos2::new(center.x, center.y + 2.0),
+                ],
+                stroke,
+            );
+            painter.circle_filled(egui::Pos2::new(center.x, center.y + 4.5), 1.0, color);
+        }
+        ActivityIcon::Console => {
+            let rect = egui::Rect::from_center_size(center, egui::vec2(14.0, 11.0));
+            painter.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    egui::Pos2::new(center.x - 4.0, center.y - 2.5),
+                    egui::Pos2::new(center.x - 1.0, center.y),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::Pos2::new(center.x - 1.0, center.y),
+                    egui::Pos2::new(center.x - 4.0, center.y + 2.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::Pos2::new(center.x + 1.0, center.y + 2.5),
+                    egui::Pos2::new(center.x + 5.0, center.y + 2.5),
+                ],
+                stroke,
+            );
+        }
+        ActivityIcon::Settings => {
+            painter.circle_stroke(center, 4.0, stroke);
+            for i in 0..4 {
+                let angle = std::f32::consts::FRAC_PI_4 + i as f32 * std::f32::consts::FRAC_PI_2;
+                let direction = egui::vec2(angle.cos(), angle.sin());
+                painter.line_segment([center + direction * 5.0, center + direction * 7.5], stroke);
+            }
+        }
+    }
+    response.on_hover_text(tooltip)
+}
+
+/// Draws the RECLIPSE emblem (corona ring + crab disc + `R`) with painter
+/// primitives, tinted by the active theme.
+fn draw_emblem(ui: &mut Ui, kind: crate::theme::ThemeKind, size: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
+    if !response.rect.is_positive() {
+        return response;
+    }
+    let painter = ui.painter();
+    let center = rect.center();
+    let radius = size * 0.5;
+    let primary = crate::theme::emblem_color(kind, false);
+    let corona = crate::theme::emblem_color(kind, true);
+    // Crab shell disc.
+    painter.circle_filled(center, radius * 0.64, theme::editor_bg());
+    painter.circle_stroke(center, radius * 0.64, egui::Stroke::new(1.5, primary));
+    // Corona ring (dashed arc).
+    let segments = 12_u32;
+    for i in 0..segments {
+        if i % 2 == 1 {
+            continue;
+        }
+        let a0 = std::f32::consts::TAU * i as f32 / segments as f32;
+        let a1 = std::f32::consts::TAU * (i as f32 + 0.6) / segments as f32;
+        let p0 = center + egui::Vec2::new(a0.cos(), a0.sin()) * radius * 0.88;
+        let p1 = center + egui::Vec2::new(a1.cos(), a1.sin()) * radius * 0.88;
+        painter.line_segment([p0, p1], egui::Stroke::new(1.5, corona));
+    }
+    // Crescent hint.
+    painter.circle_filled(
+        center + egui::Vec2::new(radius * 0.28, -radius * 0.10),
+        radius * 0.42,
+        corona.gamma_multiply(0.35),
+    );
+    // `R` monogram with painter primitives: vertical stem, bowl, leg.
+    let stem_x = center.x - radius * 0.30;
+    let top = center.y - radius * 0.36;
+    let mid = center.y;
+    let bottom = center.y + radius * 0.36;
+    let bowl_right = center.x + radius * 0.28;
+    let stroke = egui::Stroke::new(2.0, primary);
+    painter.line_segment(
+        [
+            egui::Pos2::new(stem_x, top),
+            egui::Pos2::new(stem_x, bottom),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::Pos2::new(stem_x, top),
+            egui::Pos2::new(bowl_right, top),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::Pos2::new(stem_x, mid),
+            egui::Pos2::new(bowl_right, mid),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::Pos2::new(bowl_right, top),
+            egui::Pos2::new(bowl_right, mid),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::Pos2::new(bowl_right, mid),
+            egui::Pos2::new(center.x + radius * 0.34, bottom),
+        ],
+        stroke,
+    );
+    response
 }
 
 fn short_file(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+fn replace_project_paths(project: &mut Project, rename: Option<&(PathBuf, PathBuf)>) {
+    let Some((from, to)) = rename else {
+        return;
+    };
+    for path in project.java_files.iter_mut() {
+        if path == from {
+            *path = to.clone();
+        }
+    }
+    for path in project.all_files.iter_mut() {
+        if path == from {
+            *path = to.clone();
+        }
+    }
+}
+
+fn byte_index_of_char(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
+}
+
+fn tint(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
+fn preview_line(text: &str, line: usize) -> String {
+    text.split('\n')
+        .nth(line.saturating_sub(1))
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(160)
+        .collect()
+}
+
+fn line_col_of_byte(text: &str, byte: usize) -> (usize, usize) {
+    let char_index = text[..byte.min(text.len())].chars().count();
+    reclipse_editor::line_col_at_char(text, char_index)
+}
+
+fn cursor_is_type_reference(
+    file: &reclipse_java::FileSymbols,
+    text: &str,
+    start_char: usize,
+) -> bool {
+    let start_byte = byte_index_of_char(text, start_char);
+    file.type_refs
+        .iter()
+        .any(|reference| reference.start_byte == start_byte)
+}
+
+fn local_plan_matches(
+    path: &Path,
+    text: &str,
+    plan: &LocalRenamePlan,
+    word: &str,
+) -> Vec<ProjectMatch> {
+    plan.edits
+        .iter()
+        .map(|edit| {
+            let char_index = text[..edit.start_byte.min(text.len())].chars().count();
+            let (line, column) = reclipse_editor::line_col_at_char(text, char_index);
+            ProjectMatch {
+                file: path.to_path_buf(),
+                line,
+                column,
+                start: 0,
+                end: word.chars().count(),
+                preview: preview_line(text, line),
+            }
+        })
+        .collect()
 }
 
 fn is_completion_identifier(character: char) -> bool {
@@ -4510,8 +6087,8 @@ fn show_hover_popup(ctx: &Context, position: egui::Pos2, title: &str, lines: &[S
         .fixed_pos(position)
         .show(ctx, |ui| {
             egui::Frame::NONE
-                .fill(theme::PANEL)
-                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                .fill(theme::panel())
+                .stroke(egui::Stroke::new(1.0_f32, theme::border()))
                 .inner_margin(7.0)
                 .show(ui, |ui| {
                     ui.set_max_width(420.0);
@@ -4519,10 +6096,10 @@ fn show_hover_popup(ctx: &Context, position: egui::Pos2, title: &str, lines: &[S
                         RichText::new(title)
                             .monospace()
                             .strong()
-                            .color(theme::ACCENT),
+                            .color(theme::accent()),
                     );
                     for line in lines {
-                        ui.label(RichText::new(line).small().color(theme::MUTED));
+                        ui.label(RichText::new(line).small().color(theme::muted()));
                     }
                 });
         });

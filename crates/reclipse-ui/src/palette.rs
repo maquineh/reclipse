@@ -14,6 +14,8 @@ pub enum Action {
     ToggleOutline,
     ToggleProblems,
     GoToDefinition,
+    Rename,
+    FindReferences,
     FindInFile,
     ReplaceInFile,
     FindInProject,
