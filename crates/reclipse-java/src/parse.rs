@@ -89,6 +89,8 @@ pub struct JavaMemberReference {
     pub container: Option<String>,
     /// True for method calls/references, false for fields/constants.
     pub is_call: bool,
+    /// Number of arguments for method calls; `None` for fields/references.
+    pub argument_count: Option<usize>,
     /// 1-based line.
     pub line: usize,
     /// 1-based column.
@@ -132,6 +134,8 @@ pub struct JavaReference {
 pub struct FileSymbols {
     pub path: PathBuf,
     pub package: Option<String>,
+    /// Byte range of the whole `package ...;` declaration.
+    pub package_range: Option<(usize, usize)>,
     pub imports: Vec<String>,
     pub import_lines: Vec<usize>,
     /// Byte ranges of each import declaration (same order as `imports`).
@@ -139,6 +143,8 @@ pub struct FileSymbols {
     pub symbols: Vec<JavaSymbol>,
     /// Type-identifier occurrences (including declarations) for semantic refs.
     pub type_refs: Vec<JavaReference>,
+    /// Fully-qualified/scoped type occurrences (e.g. `com.acme.User`).
+    pub scoped_type_refs: Vec<JavaReference>,
     /// Method/field occurrences used by member references and rename.
     pub member_refs: Vec<JavaMemberReference>,
     /// Raw superclass/interface names declared in this file.
@@ -157,11 +163,13 @@ impl FileSymbols {
         Self {
             path: path.to_path_buf(),
             package: None,
+            package_range: None,
             imports: Vec::new(),
             import_lines: Vec::new(),
             import_ranges: Vec::new(),
             symbols: Vec::new(),
             type_refs: Vec::new(),
+            scoped_type_refs: Vec::new(),
             member_refs: Vec::new(),
             type_relations: Vec::new(),
             local_type_names: Vec::new(),
@@ -224,6 +232,18 @@ fn visit_children(
 fn visit_type_refs(node: Node<'_>, source: &[u8], file: &mut FileSymbols) {
     if node.kind() == "type_identifier" {
         push_type_ref(node, source, file);
+    } else if node.kind() == "scoped_type_identifier" {
+        let name = text(node, source);
+        if !name.is_empty() {
+            let position = node.start_position();
+            file.scoped_type_refs.push(JavaReference {
+                name,
+                line: position.row + 1,
+                column: position.column + 1,
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+            });
+        }
     } else if matches!(
         node.kind(),
         "class_declaration"
@@ -371,7 +391,7 @@ fn classify_member_reference(
         return None;
     }
 
-    let (qualifier, is_call) = match parent.kind() {
+    let (qualifier, is_call, argument_count) = match parent.kind() {
         "method_invocation" => {
             if parent
                 .child_by_field_name("name")
@@ -384,6 +404,10 @@ fn classify_member_reference(
                     .child_by_field_name("object")
                     .map(|object| text(object, source)),
                 true,
+                parent.child_by_field_name("arguments").map(|arguments| {
+                    let mut cursor = arguments.walk();
+                    arguments.named_children(&mut cursor).count()
+                }),
             )
         }
         "field_access" => {
@@ -398,14 +422,15 @@ fn classify_member_reference(
                     .child_by_field_name("object")
                     .map(|object| text(object, source)),
                 false,
+                None,
             )
         }
         "method_reference" => {
             let raw = text(parent, source);
             let before = raw.split("::").next().unwrap_or(&raw).trim();
-            ((!before.is_empty()).then(|| before.to_owned()), true)
+            ((!before.is_empty()).then(|| before.to_owned()), true, None)
         }
-        _ => (None, false),
+        _ => (None, false, None),
     };
 
     let position = node.start_position();
@@ -414,6 +439,7 @@ fn classify_member_reference(
         qualifier: qualifier.filter(|value| !value.is_empty()),
         container: container_name(container),
         is_call,
+        argument_count,
         line: position.row + 1,
         column: position.column + 1,
         start_byte: node.start_byte(),
@@ -467,6 +493,7 @@ fn visit_node(
     match node.kind() {
         "package_declaration" => {
             if file.package.is_none() {
+                file.package_range = Some((node.start_byte(), node.end_byte()));
                 file.package = node
                     .child_by_field_name("name")
                     .map(|name| text(name, source))
@@ -1114,6 +1141,27 @@ class App extends Base implements Runnable {
             .unwrap();
         assert!(relation.super_types.contains(&"Base".to_owned()));
         assert!(relation.super_types.contains(&"Runnable".to_owned()));
+    }
+
+    #[test]
+    fn records_method_argument_counts() {
+        let source = r#"
+class App {
+    void run() {
+        service.save();
+        service.save(1, 2);
+        service.save(name, list.of(1, 2));
+    }
+}
+"#;
+        let file = parse_source(Path::new("App.java"), source);
+        let counts: Vec<_> = file
+            .member_refs
+            .iter()
+            .filter(|reference| reference.name == "save")
+            .map(|reference| reference.argument_count)
+            .collect();
+        assert_eq!(counts, vec![Some(0), Some(2), Some(2)]);
     }
 
     #[test]

@@ -113,6 +113,8 @@ O índice sintático é reconstruído por completo nesta versão. A próxima evo
 
 - **egui/eframe** com backend glow. A UI é imediata; o estado persistente fica em `ReclipseApp`.
 - **RECLIPSE Studio**: paleta ativa em `theme.rs` (`ThemeKind` + `Palette` + acessores dinâmicos); title bar com emblema vetorial, seletor de 3 temas, toolbar, activity bar, breadcrumb, console de diagnóstico e status bar. O tema escolhido é persistido em `session.json`.
+- **Build/run (M3 inicial)**: `build.rs` chama `javac` por argfile com o classpath resolvido, publica diagnósticos no painel Problemas e executa a `main` com `java`; stdout/stderr vão para o console. Debug JDWP/JDI é M4.
+- **Split editor**: dois painéis com abas arrastáveis via `dnd_drag_source`/`dnd_drop_zone`; o painel secundário é ajustado ao fechar abas.
 - **Palette** usa ranking fuzzy próprio, sem dependências, com bônus para prefixos, limites de palavra e matches consecutivos.
 - **Editor (M1)**: widget próprio desenhado com `Painter` e `Galley`. O buffer é um `Rope` (ropey), e apenas as linhas visíveis no viewport são tokenizadas, layoutadas e pintadas.
 - **Gutter** é pintado diretamente, com posição fixa durante o scroll horizontal; a linha atual, a seleção, o cursor e os matches de busca são desenhados como retângulos/linhas.
@@ -162,7 +164,7 @@ O índice lê `.class` sem JVM (`classfile.rs`): constant pool, acesso, supercla
 
 `reclipse-java::semantic` implementa a camada de consulta: `ProjectTypes` (com relações `extends`/`implements`), resolução por import/pacote/wildcard/`java.lang`, diagnóstico de imports, inferência reversa de variáveis (inclusive generics/arrays/`var`), completion de membros com herança do projeto e do classpath, retorno encadeado e hover de tipos/variáveis/símbolos. O parser coleta `type_identifier`, membros (`method_invocation`, `field_access`, `method_reference`), escopos locais e relações de tipo. A UI usa isso no `Ctrl+Shift+G` (tipos e membros) e no rename (`Alt+Shift+R`), com fallback textual quando não há resolução.
 
-`reclipse-java::refactor` planeja rename em byte offsets: declaração, referências semânticas, imports e arquivo (`Type`), sobrecargas/refs (`Method`), campos/constantes e locais/parâmetros com análise de escopo. A aplicação é conservadora: recusa classpath, colisões, shadowing e métodos que sobrescrevem/implementam; a UI grava os arquivos, renomeia o `.java`, recarrega abas e reindexa.
+`reclipse-java::refactor` planeja rename em byte offsets: declaração, referências semânticas, imports e arquivo (`Type`), pacotes com subpacotes e move de arquivos (`Package`), sobrecargas/refs (`Method`), campos/constantes e locais/parâmetros com análise de escopo. A aplicação é conservadora: recusa classpath, colisões, shadowing e métodos que sobrescrevem/implementam; a UI grava os arquivos, move/renomeia `.java`, recarrega abas e atualiza o índice.
 
 `reclipse-java::semantic` consulta os dois índices:
 

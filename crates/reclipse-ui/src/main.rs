@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod build;
 mod editor_view;
 mod keymap;
 mod palette;

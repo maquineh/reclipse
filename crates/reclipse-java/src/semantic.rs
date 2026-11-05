@@ -192,11 +192,26 @@ pub fn resolve_member_of_type(
     project_index: Option<&ProjectIndex>,
     classpath: &ClasspathIndex,
 ) -> Option<ResolvedMember> {
+    resolve_member_of_type_with_arity(ty, name, is_call, None, project, project_index, classpath)
+}
+
+/// Like [`resolve_member_of_type`], preferring an overload with `argument_count`
+/// arguments when several methods share the same name.
+pub fn resolve_member_of_type_with_arity(
+    ty: &ResolvedType,
+    name: &str,
+    is_call: Option<bool>,
+    argument_count: Option<usize>,
+    project: &ProjectTypes,
+    project_index: Option<&ProjectIndex>,
+    classpath: &ClasspathIndex,
+) -> Option<ResolvedMember> {
     let mut visited = HashSet::new();
     resolve_member_of_type_inner(
         ty,
         name,
         is_call,
+        argument_count,
         project,
         project_index,
         classpath,
@@ -204,10 +219,12 @@ pub fn resolve_member_of_type(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_member_of_type_inner(
     ty: &ResolvedType,
     name: &str,
     is_call: Option<bool>,
+    argument_count: Option<usize>,
     project: &ProjectTypes,
     project_index: Option<&ProjectIndex>,
     classpath: &ClasspathIndex,
@@ -221,11 +238,29 @@ fn resolve_member_of_type_inner(
             let index = project_index?;
             let file = index.files.get(&location.path)?;
             let container = type_container(file, location);
-            let symbol = file.symbols.iter().find(|symbol| {
+            let mut candidates = file.symbols.iter().filter(|symbol| {
                 symbol.name == name
                     && symbol.container.as_deref() == Some(container.as_str())
                     && member_kind_matches(symbol.kind, is_call)
             });
+            let first = candidates.next();
+            let symbol = if is_call == Some(true) {
+                first.and_then(|first| {
+                    let Some(argument_count) = argument_count else {
+                        return Some(first);
+                    };
+                    std::iter::once(first)
+                        .chain(candidates)
+                        .find(|symbol| {
+                            symbol.detail.as_deref().is_some_and(|detail| {
+                                parameter_count(detail) == Some(argument_count)
+                            })
+                        })
+                        .or(Some(first))
+                })
+            } else {
+                first
+            };
             if let Some(symbol) = symbol {
                 return Some(ResolvedMember {
                     owner: ty.clone(),
@@ -248,6 +283,7 @@ fn resolve_member_of_type_inner(
                     &super_type,
                     name,
                     is_call,
+                    argument_count,
                     project,
                     project_index,
                     classpath,
@@ -278,11 +314,27 @@ fn resolve_member_of_type_inner(
                     declaring_file: None,
                 });
             }
-            let method = class.methods.iter().find(|method| {
+            let mut methods = class.methods.iter().filter(|method| {
                 method.name == name
                     && !method.name.starts_with('<')
                     && is_call.is_none_or(|is_call| is_call)
             });
+            let first_method = methods.next();
+            let method = if is_call == Some(true) {
+                first_method.and_then(|first| {
+                    let Some(argument_count) = argument_count else {
+                        return Some(first);
+                    };
+                    std::iter::once(first)
+                        .chain(methods)
+                        .find(|method| {
+                            method_argument_count(&method.descriptor) == Some(argument_count)
+                        })
+                        .or(Some(first))
+                })
+            } else {
+                first_method
+            };
             if let Some(method) = method {
                 return Some(ResolvedMember {
                     owner: ty.clone(),
@@ -310,6 +362,7 @@ fn resolve_member_of_type_inner(
                     &super_type,
                     name,
                     is_call,
+                    argument_count,
                     project,
                     project_index,
                     classpath,
@@ -794,10 +847,11 @@ fn resolve_reference_member(
             );
         }
     };
-    resolve_member_of_type(
+    resolve_member_of_type_with_arity(
         &ty,
         &reference.name,
         Some(reference.is_call),
+        reference.argument_count,
         project,
         index,
         classpath,
@@ -1308,7 +1362,14 @@ pub fn resolve_expression_type(
     } else if let Some(name) = method_call_name(first) {
         let fqn = active_type_fqn_at(file, source, cursor)?;
         let owner = resolve_fqn(&fqn, project, classpath)?;
-        member_type(&owner, name, project, project_index, classpath)?
+        member_type(
+            &owner,
+            name,
+            project,
+            project_index,
+            classpath,
+            segment_argument_count(first),
+        )?
     } else {
         match resolve_type(first, file, project, classpath) {
             Some(resolved) => resolved,
@@ -1320,7 +1381,14 @@ pub fn resolve_expression_type(
     };
     for segment in &segments[1..] {
         let name = member_segment_name(segment);
-        current = member_type(&current, name, project, project_index, classpath)?;
+        current = member_type(
+            &current,
+            name,
+            project,
+            project_index,
+            classpath,
+            segment_argument_count(segment),
+        )?;
     }
     Some(current)
 }
@@ -1345,6 +1413,71 @@ fn method_call_name(segment: &str) -> Option<&str> {
     let (name, _) = segment.trim().split_once('(')?;
     let name = name.trim();
     (!name.is_empty()).then_some(name)
+}
+
+fn segment_argument_count(segment: &str) -> Option<usize> {
+    let open = segment.find('(')?;
+    let close = segment.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    Some(count_arguments(&segment[open + 1..close]))
+}
+
+fn count_arguments(inner: &str) -> usize {
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return 0;
+    }
+    let mut depth = 0_i32;
+    let mut count = 1;
+    for character in inner.chars() {
+        match character {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth = (depth - 1).max(0),
+            ',' if depth == 0 => count += 1,
+            _ => {}
+        }
+    }
+    count
+}
+
+fn parameter_count(detail: &str) -> Option<usize> {
+    let open = detail.find('(')?;
+    let close = detail[open..].find(')')? + open;
+    Some(count_arguments(&detail[open + 1..close]))
+}
+
+fn method_argument_count(descriptor: &str) -> Option<usize> {
+    let bytes = descriptor.as_bytes();
+    if bytes.first() != Some(&b'(') {
+        return None;
+    }
+    let mut index = 1;
+    let mut count = 0;
+    while index < bytes.len() && bytes[index] != b')' {
+        match bytes[index] {
+            b'[' => {
+                index += 1;
+                continue;
+            }
+            b'L' => {
+                while index < bytes.len() && bytes[index] != b';' {
+                    index += 1;
+                }
+                index += 1;
+            }
+            b'T' => {
+                while index < bytes.len() && bytes[index] != b';' {
+                    index += 1;
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+        count += 1;
+    }
+    Some(count)
 }
 
 fn active_type_fqn_at(file: &FileSymbols, source: &str, cursor: usize) -> Option<String> {
@@ -1396,9 +1529,17 @@ fn member_type(
     project: &ProjectTypes,
     project_index: Option<&ProjectIndex>,
     classpath: &ClasspathIndex,
+    argument_count: Option<usize>,
 ) -> Option<ResolvedType> {
-    let resolved =
-        resolve_member_of_type(receiver, member, None, project, project_index, classpath)?;
+    let resolved = resolve_member_of_type_with_arity(
+        receiver,
+        member,
+        None,
+        argument_count,
+        project,
+        project_index,
+        classpath,
+    )?;
     let declared = resolved.declared_type?;
     match &resolved.owner {
         ResolvedType::Project(location) => {
@@ -1898,6 +2039,61 @@ mod tests {
             .insert("String".to_owned(), vec!["java.lang.String".to_owned()]);
         classpath.type_names = vec!["java.lang.Object".to_owned(), "java.lang.String".to_owned()];
         classpath
+    }
+
+    #[test]
+    fn resolves_overloads_by_argument_count() {
+        let method = |name: &str, descriptor: &str, signature: &str| MemberInfo {
+            name: name.to_owned(),
+            descriptor: descriptor.to_owned(),
+            signature: signature.to_owned(),
+            kind: MemberKind::Method,
+            is_static: false,
+            is_public: true,
+        };
+        let mut classpath = ClasspathIndex::default();
+        classpath.classes.insert(
+            "com.acme.Factory".to_owned(),
+            ClassInfo {
+                name: "com.acme.Factory".to_owned(),
+                display_name: "Factory".to_owned(),
+                package: "com.acme".to_owned(),
+                kind: TypeKind::Class,
+                is_public: true,
+                super_name: None,
+                interfaces: Vec::new(),
+                fields: Vec::new(),
+                methods: vec![
+                    method("make", "()Ljava/lang/String;", "String make()"),
+                    method("make", "(I)Ljava/lang/Integer;", "Integer make(int)"),
+                ],
+                origin: "test".to_owned(),
+            },
+        );
+        let project = ProjectTypes::default();
+        let target = ResolvedType::Classpath("com.acme.Factory".to_owned());
+        let no_args = resolve_member_of_type_with_arity(
+            &target,
+            "make",
+            Some(true),
+            Some(0),
+            &project,
+            None,
+            &classpath,
+        )
+        .unwrap();
+        assert_eq!(no_args.declared_type.as_deref(), Some("java.lang.String"));
+        let one_arg = resolve_member_of_type_with_arity(
+            &target,
+            "make",
+            Some(true),
+            Some(1),
+            &project,
+            None,
+            &classpath,
+        )
+        .unwrap();
+        assert_eq!(one_arg.declared_type.as_deref(), Some("java.lang.Integer"));
     }
 
     #[test]

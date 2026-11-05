@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use reclipse_classpath::ClasspathIndex;
+use reclipse_core::Project;
 use tree_sitter::{Node, Parser};
 
 use crate::semantic::{
@@ -44,6 +45,7 @@ pub enum RenameKind {
     Type,
     Method,
     Field,
+    Package,
     Local,
 }
 
@@ -53,6 +55,7 @@ impl RenameKind {
             Self::Type => "tipo",
             Self::Method => "método",
             Self::Field => "campo",
+            Self::Package => "pacote",
             Self::Local => "variável local",
         }
     }
@@ -64,8 +67,8 @@ pub struct RenamePlan {
     pub new_name: String,
     pub kind: RenameKind,
     pub files: Vec<FileEdits>,
-    /// `(from, to)` when a top-level type also renames its `.java` file.
-    pub rename_file: Option<(PathBuf, PathBuf)>,
+    /// File moves (package rename, type rename). Paths are old -> new.
+    pub moves: Vec<(PathBuf, PathBuf)>,
     pub warnings: Vec<String>,
 }
 
@@ -225,7 +228,7 @@ pub fn plan_type_rename(
         }
     }
 
-    let mut rename_file = None;
+    let mut moves = Vec::new();
     let stem = location
         .path
         .file_stem()
@@ -245,7 +248,7 @@ pub fn plan_type_rename(
             if target.exists() {
                 return Err(format!("o arquivo {} já existe", target.display()));
             }
-            rename_file = Some((location.path.clone(), target));
+            moves.push((location.path.clone(), target));
         }
     }
 
@@ -264,9 +267,190 @@ pub fn plan_type_rename(
         new_name: new_name.to_owned(),
         kind: RenameKind::Type,
         files,
-        rename_file,
+        moves,
         warnings: rename_warnings(),
     })
+}
+
+/// Plan a package rename/move. Supports the package itself and its direct and
+/// nested subpackages: package declarations, imports, qualified type refs and
+/// `.java` file locations are updated.
+pub fn plan_package_rename(
+    old_package: &str,
+    new_package: &str,
+    project: &Project,
+    index: &ProjectIndex,
+    classpath: &ClasspathIndex,
+) -> Result<RenamePlan, String> {
+    if old_package.trim().is_empty() {
+        return Err("rename do pacote default não é suportado".to_owned());
+    }
+    if new_package.trim().is_empty() {
+        return Err("informe o novo pacote".to_owned());
+    }
+    if old_package == new_package {
+        return Err("o novo pacote é igual ao atual".to_owned());
+    }
+    for segment in new_package.split('.') {
+        validate_identifier(segment)?;
+    }
+    if new_package == "java"
+        || new_package.starts_with("java.")
+        || new_package.starts_with("javax.")
+    {
+        return Err("não é permitido renomear para o namespace java/javax".to_owned());
+    }
+    if classpath.package_exists(new_package)
+        && !index.files.values().any(|file| {
+            file.package
+                .as_deref()
+                .is_some_and(|package| package == new_package)
+        })
+    {
+        return Err(format!(
+            "já existe o pacote {new_package} no classpath; rename cancelado"
+        ));
+    }
+
+    let mut files: Vec<FileEdits> = Vec::new();
+    let mut moves: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut targets = std::collections::HashSet::new();
+    let mut moved_files = 0;
+    for (path, file) in &index.files {
+        let Some(package) = file.package.as_deref() else {
+            continue;
+        };
+        if package != old_package && !package.starts_with(&format!("{old_package}.")) {
+            continue;
+        }
+        let suffix = package.strip_prefix(old_package).unwrap_or("");
+        let new_package_for_file = format!("{new_package}{suffix}");
+        let Some((start, end)) = file.package_range else {
+            return Err(format!(
+                "não foi possível localizar a declaração de pacote em {}",
+                path.display()
+            ));
+        };
+        let Some(source) = read_source(path) else {
+            return Err(format!("não foi possível ler {}", path.display()));
+        };
+        if end > source.len() || start >= end {
+            return Err(format!("faixa de pacote inválida em {}", path.display()));
+        }
+        let raw = &source[start..end];
+        let Some(offset) = raw.find(package) else {
+            return Err(format!(
+                "declaração de pacote inesperada em {}",
+                path.display()
+            ));
+        };
+        push_edit(
+            &mut files,
+            path,
+            start + offset,
+            start + offset + package.len(),
+            &new_package_for_file,
+        );
+
+        let root = source_root_for(path, project);
+        let new_path = root
+            .join(new_package_for_file.replace('.', std::path::MAIN_SEPARATOR_STR))
+            .join(path.file_name().unwrap_or_default());
+        if new_path != *path {
+            if new_path.exists() || !targets.insert(new_path.clone()) {
+                return Err(format!(
+                    "o destino {} já existe ou colide com outro arquivo",
+                    new_path.display()
+                ));
+            }
+            moves.push((path.clone(), new_path));
+            moved_files += 1;
+        }
+    }
+    if files.is_empty() {
+        return Err(format!("nenhum arquivo encontrado no pacote {old_package}"));
+    }
+
+    let old_prefix = format!("{old_package}.");
+    for (path, file) in &index.files {
+        let needs_imports = file.imports.iter().any(|import| {
+            let path = import.strip_prefix("static ").unwrap_or(import).trim();
+            path == old_package || path.starts_with(&old_prefix)
+        });
+        let needs_scoped = file
+            .scoped_type_refs
+            .iter()
+            .any(|reference| reference.name.starts_with(&old_prefix));
+        if !needs_imports && !needs_scoped {
+            continue;
+        }
+        let Some(source) = read_source(path) else {
+            continue;
+        };
+        if needs_imports {
+            for (index, import) in file.imports.iter().enumerate() {
+                let import_path = import.strip_prefix("static ").unwrap_or(import).trim();
+                if import_path != old_package && !import_path.starts_with(&old_prefix) {
+                    continue;
+                }
+                let (start, end) = file.import_ranges.get(index).copied().unwrap_or((0, 0));
+                if end <= start || end > source.len() {
+                    continue;
+                }
+                let raw = &source[start..end];
+                if let Some(offset) = raw.find(old_package) {
+                    push_edit(
+                        &mut files,
+                        path,
+                        start + offset,
+                        start + offset + old_package.len(),
+                        new_package,
+                    );
+                }
+            }
+        }
+        for reference in &file.scoped_type_refs {
+            if reference.name.starts_with(&old_prefix) {
+                push_edit(
+                    &mut files,
+                    path,
+                    reference.start_byte,
+                    reference.start_byte + old_package.len(),
+                    new_package,
+                );
+            }
+        }
+    }
+
+    files.retain(|file| !file.edits.is_empty());
+    for file in &mut files {
+        file.edits
+            .sort_by(|left, right| right.start_byte.cmp(&left.start_byte));
+        file.edits
+            .dedup_by(|left, right| left.start_byte == right.start_byte);
+    }
+    let mut warnings = rename_warnings();
+    warnings.push(format!(
+        "Pacote renomeado com {moved_files} arquivo(s) movido(s); revise referências em strings/Javadoc."
+    ));
+    Ok(RenamePlan {
+        old_name: old_package.to_owned(),
+        new_name: new_package.to_owned(),
+        kind: RenameKind::Package,
+        files,
+        moves,
+        warnings,
+    })
+}
+
+fn source_root_for(path: &Path, project: &Project) -> PathBuf {
+    project
+        .source_roots
+        .iter()
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.as_os_str().len())
+        .cloned()
+        .unwrap_or_else(|| project.root.clone())
 }
 
 /// Plan a method/field rename using semantic member references.
@@ -410,7 +594,7 @@ pub fn plan_member_rename(
             RenameKind::Field
         },
         files,
-        rename_file: None,
+        moves: Vec::new(),
         warnings: rename_warnings(),
     })
 }
@@ -1022,7 +1206,7 @@ class App {
         .unwrap();
         assert_eq!(plan.total_edits(), 2);
         assert_eq!(
-            plan.rename_file.as_ref().map(|(_, to)| to.clone()),
+            plan.moves.first().map(|(_, to)| to.clone()),
             Some(user_path.with_file_name("Account.java"))
         );
     }
@@ -1046,6 +1230,48 @@ class App {
         let updated = apply_text_edits(source, &plan.edits).unwrap();
         assert!(updated.contains("String value"));
         assert!(updated.contains("println(value)"));
+    }
+
+    #[test]
+    fn package_rename_moves_files_and_updates_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_path = dir.path().join("src/com/acme/App.java");
+        let service_path = dir.path().join("src/com/acme/service/Service.java");
+        std::fs::create_dir_all(service_path.parent().unwrap()).unwrap();
+        let app_source = "package com.acme; import com.acme.service.Service; class App { Service service; com.acme.service.Service other; }";
+        let service_source = "package com.acme.service; public class Service {}";
+        std::fs::write(&app_path, app_source).unwrap();
+        std::fs::write(&service_path, service_source).unwrap();
+        let project = reclipse_core::discover_project(dir.path()).unwrap();
+        let index = crate::build_index(project.clone(), None);
+        let types = ProjectTypes::build(&index);
+        let plan = plan_package_rename(
+            "com.acme",
+            "org.demo",
+            &project,
+            &index,
+            &ClasspathIndex::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.kind, RenameKind::Package);
+        assert_eq!(plan.moves.len(), 2);
+        for file in &plan.files {
+            let text = std::fs::read_to_string(&file.path).unwrap();
+            let updated = apply_text_edits(&text, &file.edits).unwrap();
+            std::fs::write(&file.path, updated).unwrap();
+        }
+        for (from, to) in &plan.moves {
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::rename(from, to).unwrap();
+        }
+        let app_source = std::fs::read_to_string(dir.path().join("src/org/demo/App.java")).unwrap();
+        assert!(app_source.contains("package org.demo;"));
+        assert!(app_source.contains("import org.demo.service.Service;"));
+        assert!(app_source.contains("org.demo.service.Service other"));
+        let service_source =
+            std::fs::read_to_string(dir.path().join("src/org/demo/service/Service.java")).unwrap();
+        assert!(service_source.contains("package org.demo.service;"));
+        let _ = types;
     }
 
     #[test]
@@ -1127,7 +1353,7 @@ class App {
             let updated = apply_text_edits(&text, &file.edits).unwrap();
             std::fs::write(&file.path, updated).unwrap();
         }
-        let (from, to) = plan.rename_file.clone().unwrap();
+        let (from, to) = plan.moves[0].clone();
         std::fs::rename(&from, &to).unwrap();
 
         let project = reclipse_core::discover_project(dir.path()).unwrap();

@@ -40,6 +40,9 @@ Este repositório contém o **MVP 0.1.0**, o **M1** do editor e a **fundação d
   - renomeia o `.java` de tipos top-level e atualiza o índice sem recarregar o classpath;
   - recusa classpath/JDK, colisões, sombreamento de locais e métodos sobrescritos/implementados;
   - aplica edits em lote e um único passo de undo para rename local.
+- **Compilação e execução**: **Compilar** com `javac` (classpath do projeto + `--release` do target), diagnósticos no painel Problemas e **Executar** a classe `main` com `java`, com saída no console (`Ctrl+F11`). Debug JDWP/JDI fica para o M4.
+- **Editor dividido** com dois painéis e **abas arrastáveis** (drag-and-drop) entre eles.
+- **Rename de pacote** (com subpacotes): atualiza `package`, imports, referências qualificadas e move os `.java` entre source roots.
 - **Inferência de `var`** em inicializadores simples (`new Type(...)`, literais) para completion/hover.
 - Diagnóstico de **imports não resolvidos** no painel de problemas.
 - **File watcher**: recarga automática de arquivos limpos alterados no disco e banner de conflito para buffers sujos.
@@ -93,11 +96,21 @@ Cyber Solar Eclipse:
 
 ![Tema Cyber Solar](docs/screenshot-theme-cyber.png)
 
+## Build, execução e editor dividido
+
+Compilação real com `javac`, diagnósticos no painel de problemas e execução da `main` no console:
+
+![Executar](docs/screenshot-run.png)
+
+Dois editores lado a lado com abas arrastáveis:
+
+![Editor dividido](docs/screenshot-split.png)
+
 ## O que ainda não existe
 
 Este MVP é deliberadamente honesto sobre o escopo:
 
-- Não compila, não roda testes e não depura projetos Java ainda.
+- Compila e executa `main` via `javac`/`java`, mas ainda não roda testes JUnit, não depura (JDWP/JDI) e não executa ciclos de build Maven/Gradle completos.
 - A semântica Java cobre imports/tipos, completion de membros, hover, referências semânticas de tipos/membros e rename conservador, mas ainda não tem resolução completa de generics/overloads, desambiguação de static imports concorrentes ou rename de membros do classpath. Tipos locais são detectados; tipos anônimos ainda não são modelados.
 - Rename não reescreve Javadoc, strings, configuração por reflexão ou nomes em arquivos de recursos; overrides/implementações e locais sombreados são recusados por segurança, e o rename de workspace exige buffers Java salvos.
 - Maven/Gradle resolvem dependências transitivas do repositório local; não há download, perfis Maven nem Tooling API/bundles avançados do Gradle.
@@ -147,6 +160,8 @@ Também é possível abrir a IDE sem argumentos e escolher **Arquivo → Abrir p
 | `Ctrl+Space` | Completion de tipos/membros |
 | `Ctrl+Shift+G` | Referências (semânticas para tipos/membros; locais no buffer) |
 | `Alt+Shift+R` | Renomear tipo/método/campo/variável local |
+| `Ctrl+F11` | Compilar e executar a classe `main` |
+| `F11` | Debug (planejado para o M4) |
 | `Ctrl+Shift+L` | Ajuda de atalhos |
 | `F3` | Ir para definição |
 | `F5` | Reindexar |
@@ -206,6 +221,7 @@ docs/
   ARCHITECTURE.md       arquitetura e metas de performance
   M1.md                 editor rope, busca, watcher, sessão e keybindings
   M2.md                 classpath nativo, índice de classes e semântica inicial
+  M3.md                 compilação javac, execução de main e split editor
   ROADMAP.md            marcos, estimativas e critérios
   PLUGIN_SDK.md         guia do ABI de plugins
   ECLIPSE_COMPAT.md     estratégia realista para plugins Eclipse

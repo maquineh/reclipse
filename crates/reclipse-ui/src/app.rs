@@ -14,8 +14,8 @@ use reclipse_classpath::{ClasspathIndex, ClasspathStats};
 use reclipse_core::{discover_project, Project, IGNORED_DIRS};
 use reclipse_editor::{Document, SearchMatcher, SearchOptions};
 use reclipse_java::refactor::{
-    apply_text_edits, local_binding_at, plan_local_rename, plan_member_rename, plan_type_rename,
-    LocalRenamePlan, RenameKind, RenamePlan,
+    apply_text_edits, local_binding_at, plan_local_rename, plan_member_rename, plan_package_rename,
+    plan_type_rename, LocalRenamePlan, RenameKind, RenamePlan,
 };
 use reclipse_java::semantic::{
     completion_context, find_member_references, find_type_references, infer_variable_type,
@@ -26,6 +26,7 @@ use reclipse_java::{build_index, IndexedProblem, ProjectIndex, SymbolKind};
 use reclipse_plugin_api::InvokeContext;
 use reclipse_plugin_host::{PluginCommand, PluginHost};
 
+use crate::build::{self, BuildEnv};
 use crate::editor_view::Tab;
 use crate::keymap::{KeyAction, Keymap};
 use crate::palette::{rank, Action, Palette, PaletteEntry, PaletteMode};
@@ -43,6 +44,16 @@ enum IndexMessage {
 enum ClasspathMessage {
     Progress { done: usize, total: usize },
     Ready(Box<ClasspathIndex>),
+    Failed(String),
+}
+
+enum BuildMessage {
+    Compiled(Box<build::CompileResult>),
+    RunFinished {
+        compile: Box<build::CompileResult>,
+        run: build::RunResult,
+        main: String,
+    },
     Failed(String),
 }
 
@@ -73,6 +84,7 @@ struct CompletionState {
 enum RenameTarget {
     Type(String),
     Member(MemberTarget),
+    Package { old: String },
     Local { path: PathBuf, cursor: usize },
 }
 
@@ -81,6 +93,7 @@ impl Clone for RenameTarget {
         match self {
             Self::Type(fqn) => Self::Type(fqn.clone()),
             Self::Member(target) => Self::Member(target.clone()),
+            Self::Package { old } => Self::Package { old: old.clone() },
             Self::Local { path, cursor } => Self::Local {
                 path: path.clone(),
                 cursor: *cursor,
@@ -97,6 +110,11 @@ struct RenameState {
     preview: Option<usize>,
     focus_pending: bool,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TabDrag {
+    index: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +182,10 @@ struct ScreenshotState {
     rename_word: Option<String>,
     rename_new_name: Option<String>,
     rename_done: bool,
+    run_project: bool,
+    run_done: bool,
+    split: bool,
+    split_done: bool,
     search_query: Option<String>,
     project_search_query: Option<String>,
 }
@@ -190,6 +212,11 @@ pub struct ReclipseApp {
     classpath_rx: Option<Receiver<ClasspathMessage>>,
     project_types: Option<ProjectTypes>,
     semantic_problems: Vec<SemanticProblem>,
+    javac_problems: Vec<build::JavacDiagnostic>,
+    main_classes: Vec<String>,
+    build_running: bool,
+    build_rx: Option<Receiver<BuildMessage>>,
+    last_build: Option<(bool, u128)>,
     classpath_view: Option<String>,
     classpath_source: Option<(String, String)>,
     classpath_reload_at: Option<Instant>,
@@ -203,6 +230,7 @@ pub struct ReclipseApp {
     tree: FileTree,
     tabs: Vec<Tab>,
     active_tab: Option<usize>,
+    secondary_tab: Option<usize>,
     palette: Palette,
     keymap: Keymap,
     keybindings: Keybindings,
@@ -259,6 +287,11 @@ impl ReclipseApp {
             classpath_rx: None,
             project_types: None,
             semantic_problems: Vec::new(),
+            javac_problems: Vec::new(),
+            main_classes: Vec::new(),
+            build_running: false,
+            build_rx: None,
+            last_build: None,
             classpath_view: None,
             classpath_source: None,
             classpath_reload_at: None,
@@ -272,6 +305,7 @@ impl ReclipseApp {
             tree: FileTree::default(),
             tabs: Vec::new(),
             active_tab: None,
+            secondary_tab: None,
             palette: Palette::default(),
             keymap: Keymap::from_config(&session.keybindings),
             keybindings: session.keybindings.clone(),
@@ -340,6 +374,10 @@ impl ReclipseApp {
                 rename_word: std::env::var("RECLIPSE_SCREENSHOT_RENAME").ok(),
                 rename_new_name: std::env::var("RECLIPSE_SCREENSHOT_RENAME_NEW").ok(),
                 rename_done: false,
+                run_project: std::env::var_os("RECLIPSE_SCREENSHOT_RUN").is_some(),
+                run_done: false,
+                split: std::env::var_os("RECLIPSE_SCREENSHOT_SPLIT").is_some(),
+                split_done: false,
                 search_query: std::env::var("RECLIPSE_SCREENSHOT_SEARCH").ok(),
                 project_search_query: std::env::var("RECLIPSE_SCREENSHOT_PROJECT_SEARCH").ok(),
             },
@@ -415,6 +453,9 @@ impl ReclipseApp {
         self.classpath_rx = None;
         self.project_types = None;
         self.semantic_problems.clear();
+        self.javac_problems.clear();
+        self.main_classes.clear();
+        self.last_build = None;
         self.classpath_view = None;
         self.classpath_source = None;
         self.classpath_reload_at = None;
@@ -422,6 +463,7 @@ impl ReclipseApp {
         self.last_completion_revision = None;
         self.tabs.clear();
         self.active_tab = None;
+        self.secondary_tab = None;
         self.file_search.close();
         self.project_search.close();
         self.watch_ignored.clear();
@@ -534,6 +576,11 @@ impl ReclipseApp {
                     if let Some(index) = &self.index {
                         self.project_types = Some(ProjectTypes::build(index));
                     }
+                    self.main_classes = self
+                        .index
+                        .as_ref()
+                        .map(build::main_classes)
+                        .unwrap_or_default();
                     if self.frame_bench.is_none() {
                         if let Some(project) = self.project.clone() {
                             self.start_classpath(project);
@@ -773,6 +820,221 @@ impl ReclipseApp {
         };
         self.project_types = project_types;
         self.semantic_problems = problems;
+        self.main_classes = self
+            .index
+            .as_ref()
+            .map(build::main_classes)
+            .unwrap_or_default();
+    }
+
+    fn compile_project(&mut self) {
+        if self.build_running {
+            self.toast("Build já em andamento");
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            self.toast("Abra um projeto antes de compilar");
+            return;
+        };
+        let env = self
+            .classpath_index
+            .as_ref()
+            .map(BuildEnv::from_classpath)
+            .unwrap_or_default();
+        self.javac_problems.clear();
+        self.build_running = true;
+        let (sender, receiver) = mpsc::channel();
+        self.build_rx = Some(receiver);
+        self.log(
+            LogLevel::Info,
+            format!("javac: compilando {} arquivo(s)…", project.java_files.len()),
+        );
+        thread::spawn(move || {
+            let message = match build::compile(&project, &env) {
+                Ok(result) => BuildMessage::Compiled(Box::new(result)),
+                Err(error) => BuildMessage::Failed(error),
+            };
+            let _ = sender.send(message);
+        });
+    }
+
+    fn run_project(&mut self) {
+        if self.build_running {
+            self.toast("Build já em andamento");
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            self.toast("Abra um projeto antes de executar");
+            return;
+        };
+        let mut mains = self
+            .index
+            .as_ref()
+            .map(build::main_classes)
+            .unwrap_or_default();
+        self.main_classes = mains.clone();
+        if mains.is_empty() {
+            self.toast("Nenhuma classe com public static void main encontrada");
+            return;
+        }
+        let main = mains.remove(0);
+        if !mains.is_empty() {
+            self.log(
+                LogLevel::Warning,
+                format!(
+                    "Várias classes main encontradas ({}); executando {main}",
+                    mains.len() + 1
+                ),
+            );
+        }
+        let env = self
+            .classpath_index
+            .as_ref()
+            .map(BuildEnv::from_classpath)
+            .unwrap_or_default();
+        self.javac_problems.clear();
+        self.build_running = true;
+        let (sender, receiver) = mpsc::channel();
+        self.build_rx = Some(receiver);
+        self.log(LogLevel::Info, format!("Compilando e executando {main}…"));
+        thread::spawn(move || match build::compile(&project, &env) {
+            Ok(compiled) if compiled.success => match build::run_main(&main, &env, &compiled) {
+                Ok(run) => {
+                    let _ = sender.send(BuildMessage::RunFinished {
+                        compile: Box::new(compiled),
+                        run,
+                        main,
+                    });
+                }
+                Err(error) => {
+                    let _ = sender.send(BuildMessage::Compiled(Box::new(compiled)));
+                    let _ = sender.send(BuildMessage::Failed(error));
+                }
+            },
+            Ok(compiled) => {
+                let _ = sender.send(BuildMessage::Compiled(Box::new(compiled)));
+            }
+            Err(error) => {
+                let _ = sender.send(BuildMessage::Failed(error));
+            }
+        });
+    }
+
+    fn poll_build(&mut self) {
+        let Some(receiver) = &self.build_rx else {
+            return;
+        };
+        let mut messages = Vec::new();
+        let mut disconnected = false;
+        loop {
+            match receiver.try_recv() {
+                Ok(message) => messages.push(message),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if messages.is_empty() && !disconnected {
+            return;
+        }
+        let had_messages = !messages.is_empty();
+        self.build_rx = None;
+        self.build_running = false;
+        for message in messages {
+            match message {
+                BuildMessage::Compiled(compiled) => {
+                    self.apply_compile_result(&compiled);
+                }
+                BuildMessage::RunFinished { compile, run, main } => {
+                    self.apply_compile_result(&compile);
+                    if run.success {
+                        self.log(
+                            LogLevel::Success,
+                            format!("{main}: execução concluída em {} ms", run.elapsed_ms),
+                        );
+                    } else {
+                        self.log(
+                            LogLevel::Error,
+                            format!("{main}: execução falhou em {} ms", run.elapsed_ms),
+                        );
+                    }
+                    for line in run.output.lines().take(200) {
+                        if !line.trim().is_empty() {
+                            self.log(
+                                if run.success {
+                                    LogLevel::Info
+                                } else {
+                                    LogLevel::Error
+                                },
+                                line,
+                            );
+                        }
+                    }
+                    self.toast(if run.success {
+                        format!("{main}: execução concluída")
+                    } else {
+                        format!("{main}: execução falhou")
+                    });
+                }
+                BuildMessage::Failed(error) => {
+                    self.log(LogLevel::Error, format!("Build: {error}"));
+                    self.toast(error);
+                }
+            }
+        }
+        if disconnected && !had_messages {
+            // The worker always sends at least one message; a silent disconnect
+            // is reported as a build failure so the UI never stays "running".
+            self.toast("O processo de build terminou inesperadamente");
+        }
+    }
+
+    fn apply_compile_result(&mut self, result: &build::CompileResult) {
+        self.last_build = Some((result.success, result.elapsed_ms));
+        self.javac_problems = result.diagnostics.clone();
+        let errors = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.is_error)
+            .count();
+        let warnings = result.diagnostics.len().saturating_sub(errors);
+        for diagnostic in result.diagnostics.iter().take(24) {
+            self.log(
+                if diagnostic.is_error {
+                    LogLevel::Error
+                } else {
+                    LogLevel::Warning
+                },
+                format!(
+                    "javac: {}:{}: {}",
+                    short_file(&diagnostic.file.to_string_lossy()),
+                    diagnostic.line,
+                    diagnostic.message
+                ),
+            );
+        }
+        if result.success {
+            self.log(
+                LogLevel::Success,
+                format!("javac: compilação ok em {} ms", result.elapsed_ms),
+            );
+            self.toast(format!(
+                "javac: compilação ok em {} ms ({warnings} warning(s))",
+                result.elapsed_ms
+            ));
+        } else {
+            self.show_problems = true;
+            if result.diagnostics.is_empty() {
+                for line in result.output.lines().take(24) {
+                    if !line.trim().is_empty() {
+                        self.log(LogLevel::Error, line);
+                    }
+                }
+            }
+            self.toast(format!("javac: {errors} erro(s), {warnings} warning(s)"));
+        }
     }
 
     fn poll_classpath(&mut self) {
@@ -978,6 +1240,11 @@ impl ReclipseApp {
         let _ = crate::recovery::discard(&path);
         self.backup_state.remove(&path);
         self.tabs.remove(index);
+        match self.secondary_tab {
+            Some(secondary) if secondary == index => self.secondary_tab = None,
+            Some(secondary) if secondary > index => self.secondary_tab = Some(secondary - 1),
+            _ => {}
+        }
         match self.active_tab {
             None => {}
             Some(active) if active == index => {
@@ -1351,6 +1618,15 @@ impl ReclipseApp {
             }
         }
 
+        let cursor_byte = byte_index_of_char(&text, cursor);
+        let in_package = file
+            .package_range
+            .is_some_and(|(start, end)| cursor_byte >= start && cursor_byte < end);
+        if in_package {
+            self.begin_package_rename();
+            return;
+        }
+
         let types = self.project_types.as_ref();
         let classpath = self.classpath_index.as_ref();
         let empty = ClasspathIndex::default();
@@ -1434,6 +1710,54 @@ impl ReclipseApp {
         self.toast("Nada renomeável sob o cursor");
     }
 
+    fn begin_package_rename(&mut self) {
+        if self.rename.is_some() {
+            return;
+        }
+        self.completion = None;
+        let Some(active) = self.active_tab else {
+            self.toast("Nenhum arquivo ativo");
+            return;
+        };
+        let path = self.tabs[active].doc.path.clone();
+        let Some(package) = self
+            .index
+            .as_ref()
+            .and_then(|index| index.symbols_for(&path))
+            .and_then(|file| file.package.clone())
+        else {
+            self.toast("O arquivo ativo não declara um pacote");
+            return;
+        };
+        let preview = match (
+            self.project.as_ref(),
+            self.index.as_ref(),
+            self.classpath_index.as_ref(),
+        ) {
+            (Some(project), Some(index), Some(classpath)) => plan_package_rename(
+                &package,
+                &format!("{package}.renamed"),
+                project,
+                index,
+                classpath,
+            )
+            .ok()
+            .map(|plan| plan.total_edits()),
+            _ => None,
+        };
+        self.rename = Some(RenameState {
+            target: RenameTarget::Package {
+                old: package.clone(),
+            },
+            old_name: package.clone(),
+            new_name: package,
+            kind: RenameKind::Package,
+            preview,
+            focus_pending: true,
+            error: None,
+        });
+    }
+
     fn apply_rename(&mut self) {
         let Some(state) = self.rename.as_ref() else {
             return;
@@ -1510,6 +1834,10 @@ impl ReclipseApp {
             RenameTarget::Member(target) => {
                 plan_member_rename(target, &new_name, types, index, classpath)
             }
+            RenameTarget::Package { old } => match self.project.as_ref() {
+                Some(project) => plan_package_rename(old, &new_name, project, index, classpath),
+                None => Err("nenhum projeto aberto".to_owned()),
+            },
             RenameTarget::Local { .. } => unreachable!(),
         };
         let plan = match plan {
@@ -1540,19 +1868,19 @@ impl ReclipseApp {
         match self.apply_workspace_rename(&plan) {
             Ok(()) => {
                 let count = plan.total_edits();
-                let renamed_file = plan.rename_file.as_ref().map(|(_, to)| {
-                    to.file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned()
-                });
+                let moved = plan.moves.len();
+                let kind = plan.kind;
                 self.rename = None;
-                match renamed_file {
-                    Some(name) => self.toast(format!(
-                        "{} renomeado para {new_name} ({count} edições; arquivo {name})",
+                match (kind, moved) {
+                    (RenameKind::Package, moved) => self.toast(format!(
+                        "pacote {} renomeado para {new_name} ({count} edições; {moved} arquivo(s) movido(s))",
                         plan.old_name
                     )),
-                    None => self.toast(format!(
+                    (_, 1) => self.toast(format!(
+                        "{} renomeado para {new_name} ({count} edições; 1 arquivo movido)",
+                        plan.old_name
+                    )),
+                    _ => self.toast(format!(
                         "{} renomeado para {new_name} ({count} ocorrência(s))",
                         plan.old_name
                     )),
@@ -1578,7 +1906,11 @@ impl ReclipseApp {
                 .map_err(|error| format!("falha ao salvar {}: {error}", file.path.display()))?;
             new_texts.push((file.path.clone(), updated));
         }
-        if let Some((from, to)) = &plan.rename_file {
+        for (from, to) in &plan.moves {
+            if let Some(parent) = to.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("falha ao criar {}: {error}", parent.display()))?;
+            }
             fs::rename(from, to).map_err(|error| {
                 format!(
                     "falha ao renomear {} para {}: {error}",
@@ -1587,13 +1919,15 @@ impl ReclipseApp {
                 )
             })?;
         }
-        for (old_path, _) in &new_texts {
-            let new_path = plan
-                .rename_file
-                .as_ref()
-                .filter(|(from, _)| from == old_path)
+        let new_path_for = |path: &Path| {
+            plan.moves
+                .iter()
+                .find(|(from, _)| from == path)
                 .map(|(_, to)| to.clone())
-                .unwrap_or_else(|| old_path.clone());
+                .unwrap_or_else(|| path.to_path_buf())
+        };
+        for (old_path, _) in &new_texts {
+            let new_path = new_path_for(old_path);
             if let Some(tab) = self.tabs.iter_mut().find(|tab| &tab.doc.path == old_path) {
                 tab.doc.path = new_path.clone();
                 let _ = tab.reload_from_disk();
@@ -1610,12 +1944,7 @@ impl ReclipseApp {
             let mut removed = Vec::new();
             let mut updates = Vec::new();
             for (old_path, text) in &new_texts {
-                let new_path = plan
-                    .rename_file
-                    .as_ref()
-                    .filter(|(from, _)| from == old_path)
-                    .map(|(_, to)| to.clone())
-                    .unwrap_or_else(|| old_path.clone());
+                let new_path = new_path_for(old_path);
                 if new_path != *old_path {
                     removed.push(old_path.clone());
                 }
@@ -1623,9 +1952,9 @@ impl ReclipseApp {
             }
             index.update_files(&removed, updates);
             if let Some(project) = &mut self.project {
-                replace_project_paths(project, plan.rename_file.as_ref());
+                replace_project_paths(project, &plan.moves);
             }
-            replace_project_paths(&mut index.project, plan.rename_file.as_ref());
+            replace_project_paths(&mut index.project, &plan.moves);
             let stats = index.stats.clone();
             self.index_status = IndexStatus::Ready {
                 files: stats.java_files,
@@ -1763,6 +2092,27 @@ impl ReclipseApp {
         crate::theme::configure(&self.egui_ctx, kind);
         self.tabs.iter_mut().for_each(Tab::invalidate_theme);
         self.toast(format!("Tema: {}", kind.label()));
+    }
+
+    fn toggle_split(&mut self) {
+        if self.secondary_tab.is_some() {
+            self.secondary_tab = None;
+            self.toast("Editor dividido fechado");
+            return;
+        }
+        let Some(active) = self.active_tab else {
+            self.toast("Nenhum arquivo ativo");
+            return;
+        };
+        if self.tabs.len() < 2 {
+            self.toast("Abra outro arquivo para dividir o editor");
+            return;
+        }
+        let secondary = (0..self.tabs.len())
+            .find(|index| *index != active)
+            .unwrap_or(active);
+        self.secondary_tab = Some(secondary);
+        self.toast("Editor dividido; arraste abas entre os painéis");
     }
 
     fn open_settings(&mut self) {
@@ -2772,12 +3122,16 @@ impl ReclipseApp {
                         self.keymap.label(KeyAction::Reindex),
                         Action::Reindex,
                     ),
+                    PaletteEntry::new("Projeto: compilar com javac", "", Action::Compile),
+                    PaletteEntry::new("Projeto: executar", "F6", Action::Run),
+                    PaletteEntry::new("Projeto: debug (M4)", "", Action::Debug),
                     PaletteEntry::new(
                         "Ir para definição",
                         self.keymap.label(KeyAction::GoToDefinition),
                         Action::GoToDefinition,
                     ),
                     PaletteEntry::new("Editar: renomear", "Alt+Shift+R", Action::Rename),
+                    PaletteEntry::new("Editar: renomear pacote", "", Action::RenamePackage),
                     PaletteEntry::new(
                         "Navegar: referências",
                         "Ctrl+Shift+G",
@@ -2838,6 +3192,7 @@ impl ReclipseApp {
                     PaletteEntry::new("Editar: reduzir cursores", "Esc", Action::ClearExtraCursors),
                     PaletteEntry::new("Exibir: projeto", "", Action::ToggleProject),
                     PaletteEntry::new("Exibir: estrutura", "", Action::ToggleOutline),
+                    PaletteEntry::new("Exibir: editor dividido", "", Action::ToggleSplit),
                     PaletteEntry::new("Exibir: problemas", "", Action::ToggleProblems),
                     PaletteEntry::new("Exibir: aumentar fonte", "", Action::ZoomIn),
                     PaletteEntry::new("Exibir: diminuir fonte", "", Action::ZoomOut),
@@ -2977,6 +3332,15 @@ impl ReclipseApp {
         if ctx.input_mut(|input| input.consume_key(Modifiers::ALT | Modifiers::SHIFT, Key::R)) {
             self.completion = None;
             self.begin_rename();
+            return;
+        }
+
+        if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::F11)) {
+            self.run_project();
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::F11)) {
+            self.toast("Debugger JDWP/JDI planejado para o M4");
             return;
         }
 
@@ -3725,6 +4089,24 @@ impl ReclipseApp {
                             ui.close_menu();
                             self.reindex();
                         }
+                        ui.separator();
+                        if ui.button("Compilar com javac").clicked() {
+                            ui.close_menu();
+                            self.compile_project();
+                        }
+                        if ui
+                            .add(egui::Button::new("Executar").shortcut_text("Ctrl+F11"))
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.run_project();
+                        }
+                        if ui.button("Renomear pacote…").clicked() {
+                            ui.close_menu();
+                            self.begin_package_rename();
+                        }
+                        ui.add_enabled(false, egui::Button::new("Debug (M4)"))
+                            .on_hover_text("Debugger JDWP/JDI planejado para o M4");
                         if let Some(root) = &self.root {
                             ui.separator();
                             ui.label(
@@ -3740,6 +4122,13 @@ impl ReclipseApp {
                         ui.checkbox(&mut self.show_outline, "Estrutura");
                         ui.checkbox(&mut self.show_problems, "Problemas");
                         ui.checkbox(&mut self.show_console, "Console");
+                        if ui
+                            .selectable_label(self.secondary_tab.is_some(), "Editor dividido")
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.toggle_split();
+                        }
                         ui.separator();
                         ui.label(
                             RichText::new("Tema (RECLIPSE Studio)")
@@ -3863,8 +4252,18 @@ impl ReclipseApp {
             .index
             .as_ref()
             .map(|index| index.problems.len())
-            .unwrap_or(0);
-        let semantic_problems = self.semantic_problems.len();
+            .unwrap_or(0)
+            + self
+                .javac_problems
+                .iter()
+                .filter(|diagnostic| diagnostic.is_error)
+                .count();
+        let semantic_problems = self.semantic_problems.len()
+            + self
+                .javac_problems
+                .iter()
+                .filter(|diagnostic| !diagnostic.is_error)
+                .count();
         let index_text = match &self.index_status {
             IndexStatus::Ready { elapsed_ms, .. } => {
                 (format!("Rust core · {elapsed_ms} ms"), theme::green())
@@ -3898,6 +4297,32 @@ impl ReclipseApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    if self.build_running {
+                        ui.spinner();
+                        ui.label(RichText::new("javac…").small().color(theme::yellow()));
+                    } else {
+                        let run = ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Executar").size(12.0).color(theme::bg()),
+                                )
+                                .fill(theme::accent())
+                                .stroke(egui::Stroke::new(1.0, theme::accent())),
+                            )
+                            .on_hover_text("Compilar e executar a classe main (Ctrl+F11)");
+                        if run.clicked() {
+                            actions.push(Action::Run);
+                        }
+                        if toolbar_button(ui, "Compilar", "Compilar com javac") {
+                            actions.push(Action::Compile);
+                        }
+                        let debug = ui.add_enabled(
+                            false,
+                            egui::Button::new(RichText::new("Debug").size(12.0)),
+                        );
+                        debug.on_hover_text("Debugger JDWP/JDI planejado para o M4");
+                    }
+                    ui.separator();
                     if toolbar_button(ui, "Salvar", "Salvar arquivo ativo (Ctrl+S)") {
                         actions.push(Action::Save);
                     }
@@ -3927,6 +4352,26 @@ impl ReclipseApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new(cp_text).small().color(cp_color));
                         ui.separator();
+                        if self.build_running {
+                            ui.label(RichText::new("build…").small().color(theme::yellow()));
+                            ui.separator();
+                        } else if let Some((success, elapsed)) = self.last_build {
+                            ui.label(
+                                RichText::new(format!("javac {} ms", elapsed))
+                                    .small()
+                                    .color(if success {
+                                        theme::green()
+                                    } else {
+                                        theme::red()
+                                    }),
+                            )
+                            .on_hover_text(if success {
+                                "Última compilação concluída"
+                            } else {
+                                "Última compilação falhou"
+                            });
+                            ui.separator();
+                        }
                         ui.label(RichText::new(index_text.0).small().color(index_text.1));
                         ui.separator();
                         problem_badge(ui, "erros", syntax_problems, theme::red());
@@ -3946,7 +4391,8 @@ impl ReclipseApp {
             .as_ref()
             .map(|index| index.problems.len())
             .unwrap_or(0)
-            + self.semantic_problems.len();
+            + self.semantic_problems.len()
+            + self.javac_problems.len();
         let mut open_settings = false;
         let mut toggle_console = false;
         egui::SidePanel::left("reclipse_activity")
@@ -4192,6 +4638,25 @@ impl ReclipseApp {
                         ui.separator();
                         self.index_status_ui(ui);
                         ui.separator();
+                        if self.build_running {
+                            ui.spinner();
+                            ui.label(RichText::new("javac…").small().color(theme::yellow()));
+                        } else if let Some((success, elapsed)) = self.last_build {
+                            ui.label(
+                                RichText::new(format!(
+                                    "javac {} · {} ms",
+                                    if success { "ok" } else { "falhou" },
+                                    elapsed
+                                ))
+                                .small()
+                                .color(if success {
+                                    theme::green()
+                                } else {
+                                    theme::red()
+                                }),
+                            );
+                        }
+                        ui.separator();
                         self.classpath_status_ui(ui);
                     }
 
@@ -4422,6 +4887,17 @@ impl ReclipseApp {
                     "semântica",
                     &format!("{} import(s)", self.semantic_problems.len()),
                 );
+                telemetry_row(
+                    ui,
+                    "javac",
+                    &format!(
+                        "{} erro(s)",
+                        self.javac_problems
+                            .iter()
+                            .filter(|diagnostic| diagnostic.is_error)
+                            .count()
+                    ),
+                );
                 telemetry_row(ui, "tema", self.theme.compact_label());
                 telemetry_row(ui, "plugins", &self.plugins.plugin_count().to_string());
             });
@@ -4584,6 +5060,9 @@ impl ReclipseApp {
         let semantic_total = self.semantic_problems.len();
         let semantic: Vec<SemanticProblem> =
             self.semantic_problems.iter().take(300).cloned().collect();
+        let javac_total = self.javac_problems.len();
+        let javac: Vec<build::JavacDiagnostic> =
+            self.javac_problems.iter().take(300).cloned().collect();
         let root = self.root.clone();
 
         ui.label(
@@ -4595,7 +5074,7 @@ impl ReclipseApp {
                     theme::red()
                 }),
         );
-        if total == 0 && semantic_total == 0 {
+        if total == 0 && semantic_total == 0 && javac_total == 0 {
             return;
         }
 
@@ -4662,6 +5141,56 @@ impl ReclipseApp {
                 }
             }
         }
+
+        if javac_total > 0 {
+            ui.add_space(4.0);
+            let errors = javac
+                .iter()
+                .filter(|diagnostic| diagnostic.is_error)
+                .count();
+            ui.label(
+                RichText::new(format!(
+                    "javac: {errors} erro(s), {} warning(s)",
+                    javac_total.saturating_sub(errors)
+                ))
+                .small()
+                .color(if errors > 0 {
+                    theme::red()
+                } else {
+                    theme::yellow()
+                }),
+            );
+            for diagnostic in javac {
+                let relative = root
+                    .as_ref()
+                    .map(|root| {
+                        diagnostic
+                            .file
+                            .strip_prefix(root)
+                            .unwrap_or(&diagnostic.file)
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .unwrap_or_else(|| diagnostic.file.display().to_string());
+                let label = format!(
+                    "{}:{}  {}",
+                    short_file(&relative),
+                    diagnostic.line,
+                    diagnostic.message
+                );
+                let color = if diagnostic.is_error {
+                    theme::red()
+                } else {
+                    theme::yellow()
+                };
+                if ui
+                    .selectable_label(false, RichText::new(label).size(12.0).color(color))
+                    .clicked()
+                {
+                    actions.push(Action::OpenAt(diagnostic.file, diagnostic.line, 1));
+                }
+            }
+        }
     }
 
     fn central_panel(&mut self, ctx: &Context) {
@@ -4671,15 +5200,110 @@ impl ReclipseApp {
                 self.tab_bar(ui);
                 self.breadcrumb(ui);
                 ui.separator();
-                if let Some(active) = self.active_tab {
-                    if let Some(tab) = self.tabs.get_mut(active) {
-                        let font_size = self.font_size;
-                        tab.show(ui, font_size);
+                if let Some(secondary) = self.secondary_tab.filter(|index| *index < self.tabs.len())
+                {
+                    let left = self
+                        .active_tab
+                        .filter(|index| *index != secondary)
+                        .or_else(|| (0..self.tabs.len()).find(|index| *index != secondary));
+                    let font_size = self.font_size;
+                    let mut drop_left = None;
+                    let mut drop_right = None;
+                    ui.columns(2, |columns| {
+                        let (_, payload) =
+                            columns[0].dnd_drop_zone::<TabDrag, _>(egui::Frame::NONE, |ui| {
+                                if let Some(index) = left {
+                                    self.editor_pane(ui, index, font_size);
+                                } else {
+                                    self.welcome(ui);
+                                }
+                            });
+                        if let Some(payload) = payload {
+                            drop_left = Some(payload.index);
+                        }
+                        let (_, payload) =
+                            columns[1].dnd_drop_zone::<TabDrag, _>(egui::Frame::NONE, |ui| {
+                                self.editor_pane(ui, secondary, font_size);
+                            });
+                        if let Some(payload) = payload {
+                            drop_right = Some(payload.index);
+                        }
+                    });
+                    if let Some(index) = drop_left {
+                        if index < self.tabs.len() {
+                            let old_active = self.active_tab;
+                            self.active_tab = Some(index);
+                            if self.secondary_tab == Some(index) {
+                                self.secondary_tab = old_active.filter(|active| *active != index);
+                            }
+                        }
+                    }
+                    if let Some(index) = drop_right {
+                        if index < self.tabs.len() {
+                            let old_secondary = self.secondary_tab;
+                            self.secondary_tab = Some(index);
+                            if self.active_tab == Some(index) {
+                                self.active_tab = old_secondary.filter(|active| *active != index);
+                            }
+                        }
                     }
                 } else {
-                    self.welcome(ui);
+                    self.secondary_tab = None;
+                    let mut dropped = None;
+                    let font_size = self.font_size;
+                    let (_, payload) = ui.dnd_drop_zone::<TabDrag, _>(egui::Frame::NONE, |ui| {
+                        if let Some(active) = self.active_tab {
+                            self.editor_pane(ui, active, font_size);
+                        } else {
+                            self.welcome(ui);
+                        }
+                    });
+                    if let Some(payload) = payload {
+                        dropped = Some(payload.index);
+                    }
+                    if let Some(index) = dropped {
+                        if index < self.tabs.len() {
+                            self.active_tab = Some(index);
+                        }
+                    }
                 }
             });
+    }
+
+    fn editor_pane(&mut self, ui: &mut Ui, index: usize, font_size: f32) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let title = tab.title();
+        let path = tab.doc.path.display().to_string();
+        egui::Frame::NONE
+            .fill(theme::panel())
+            .inner_margin(egui::Margin::symmetric(8, 2))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("J")
+                            .monospace()
+                            .size(9.0)
+                            .color(theme::clr_type()),
+                    );
+                    ui.label(RichText::new(title).small().color(
+                        if self.active_tab == Some(index) {
+                            theme::text()
+                        } else {
+                            theme::muted()
+                        },
+                    ));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new("arraste abas").small().color(theme::muted()));
+                    });
+                });
+            })
+            .response
+            .on_hover_text(path);
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.show(ui, font_size);
+        }
     }
 
     fn breadcrumb(&self, ui: &mut Ui) {
@@ -4741,6 +5365,7 @@ impl ReclipseApp {
         let mut activate = None;
         let mut close = None;
         let mut open_folder = false;
+        let mut split = false;
 
         egui::Frame::NONE
             .fill(theme::panel())
@@ -4777,7 +5402,12 @@ impl ReclipseApp {
                                 } else {
                                     theme::muted()
                                 });
-                                let response = ui.selectable_label(is_active, text);
+                                let drag = ui.dnd_drag_source(
+                                    egui::Id::new(("reclipse_tab_drag", index)),
+                                    TabDrag { index },
+                                    |ui| ui.selectable_label(is_active, text),
+                                );
+                                let response = drag.inner;
                                 if is_active {
                                     let rect = response.rect;
                                     ui.painter().line_segment(
@@ -4810,6 +5440,18 @@ impl ReclipseApp {
                                 }
                                 ui.add_space(4.0);
                             }
+                            ui.separator();
+                            if ui
+                                .small_button(if self.secondary_tab.is_some() {
+                                    "Split on"
+                                } else {
+                                    "Split"
+                                })
+                                .on_hover_text("Dividir editor / fechar split")
+                                .clicked()
+                            {
+                                split = true;
+                            }
                         });
                     });
             });
@@ -4817,7 +5459,13 @@ impl ReclipseApp {
         if open_folder {
             self.open_folder_dialog();
         }
+        if split {
+            self.toggle_split();
+        }
         if let Some(index) = activate {
+            if self.secondary_tab == Some(index) {
+                self.secondary_tab = self.active_tab.filter(|active| *active != index);
+            }
             self.active_tab = Some(index);
         }
         if let Some(index) = close {
@@ -5362,11 +6010,16 @@ impl ReclipseApp {
                 }
             }
             Action::Reindex => self.reindex(),
+            Action::Compile => self.compile_project(),
+            Action::Run => self.run_project(),
+            Action::Debug => self.toast("Debugger JDWP/JDI planejado para o M4"),
+            Action::ToggleSplit => self.toggle_split(),
             Action::ToggleProject => self.show_project = !self.show_project,
             Action::ToggleOutline => self.show_outline = !self.show_outline,
             Action::ToggleProblems => self.show_problems = !self.show_problems,
             Action::GoToDefinition => self.goto_definition(),
             Action::Rename => self.begin_rename(),
+            Action::RenamePackage => self.begin_package_rename(),
             Action::FindReferences => self.find_references(),
             Action::FindInFile => self.begin_file_search(false),
             Action::ReplaceInFile => self.begin_file_search(true),
@@ -5629,6 +6282,29 @@ impl ReclipseApp {
                             }
                         }
                     }
+                    if self.screenshot.run_project && !self.screenshot.run_done {
+                        if self.classpath_index.is_some() {
+                            self.run_project();
+                            self.screenshot.run_done = true;
+                        }
+                    }
+                    if self.screenshot.split && !self.screenshot.split_done {
+                        if self.tabs.len() < 2 {
+                            if let Some(path) = self.project.as_ref().and_then(|project| {
+                                project
+                                    .java_files
+                                    .iter()
+                                    .find(|path| {
+                                        !self.tabs.iter().any(|tab| &tab.doc.path == *path)
+                                    })
+                                    .cloned()
+                            }) {
+                                self.open_file(path);
+                            }
+                        }
+                        self.toggle_split();
+                        self.screenshot.split_done = true;
+                    }
                     if self.classpath_source.is_none() {
                         if let Some(name) = self.screenshot.source_class.clone() {
                             if let Some(location) = self
@@ -5700,6 +6376,7 @@ impl eframe::App for ReclipseApp {
 
         self.poll_index();
         self.poll_classpath();
+        self.poll_build();
         self.poll_watcher();
         self.maybe_reload_classpath();
         if self.project_search.poll() {
@@ -5742,6 +6419,7 @@ impl eframe::App for ReclipseApp {
             || matches!(self.classpath_status, ClasspathStatus::Indexing { .. })
             || self.classpath_reload_at.is_some()
             || self.project_search.running
+            || self.build_running
         {
             ctx.request_repaint_after(Duration::from_millis(80));
         } else if self.status_message.is_some() {
@@ -6060,18 +6738,17 @@ fn short_file(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
-fn replace_project_paths(project: &mut Project, rename: Option<&(PathBuf, PathBuf)>) {
-    let Some((from, to)) = rename else {
-        return;
-    };
-    for path in project.java_files.iter_mut() {
-        if path == from {
-            *path = to.clone();
+fn replace_project_paths(project: &mut Project, moves: &[(PathBuf, PathBuf)]) {
+    for (from, to) in moves {
+        for path in project.java_files.iter_mut() {
+            if path == from {
+                *path = to.clone();
+            }
         }
-    }
-    for path in project.all_files.iter_mut() {
-        if path == from {
-            *path = to.clone();
+        for path in project.all_files.iter_mut() {
+            if path == from {
+                *path = to.clone();
+            }
         }
     }
 }

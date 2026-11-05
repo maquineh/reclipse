@@ -92,14 +92,23 @@ Aceite final:
 - zero falsos positivos de sintaxe em Java 21;
 - memória < 800 MB em projeto de 1M LOC.
 
-## M3 — Build, run e testes (4–6 semanas)
+## M3 — Build, run e testes (em andamento; compilação/execução entregues)
+
+Entregue:
+
+- compilação do projeto com `javac` usando o classpath resolvido e `--release` do target;
+- diagnósticos do javac no painel Problemas e no console;
+- descoberta de `main` e execução com `java`, com saída no console e `Ctrl+F11`;
+- split editor com abas arrastáveis entre dois painéis.
+
+Pendente:
 
 - Execução de Maven/Gradle com output incremental e hyperlinks.
 - Configurações de execução (main class, args, env, JVM options).
 - Console com ANSI, cancelamento e histórico.
 - JUnit 4/5: descoberta, execução por arquivo/classe, árvore de resultados.
 - Formatter (google-java-format ou Eclipse formatter) e organize imports.
-- Problemas de compilação mapeados para o editor.
+- Problemas de compilação mapeados para o editor (javac já mapeia arquivo/linha).
 
 Aceite:
 
@@ -176,7 +185,7 @@ Aceite:
 | M0 | concluído | — |
 | M1 | concluído | 3 |
 | M2 | em andamento (referências, rename e fontes entregues) | 15 |
-| M3 | 4–6 | 21 |
+| M3 | em andamento (javac/run/split entregues) | 21 |
 | M4 | 4–6 | 27 |
 | M5 | 4–6 | 33 |
 | M6 | 8–12 | 45 |

@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{Cursor, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use zip::ZipArchive;
@@ -26,6 +26,10 @@ pub struct ClasspathIndex {
     pub by_simple: HashMap<String, Vec<String>>,
     pub packages: HashSet<String>,
     pub type_names: Vec<String>,
+    /// JARs resolved for this project, in classpath order.
+    pub jars: Vec<PathBuf>,
+    /// JDK home (for javac/java) when a JDK was resolved.
+    pub jdk_home: Option<PathBuf>,
     pub stats: ClasspathStats,
     pub warnings: Vec<String>,
 }
@@ -102,6 +106,8 @@ pub fn build(
     index.warnings.extend(resolution.warnings.iter().cloned());
     index.stats.jdk_target = resolution.jdk_target;
     index.stats.jdk_version = resolution.jdk.as_ref().map(|jdk| jdk.version.clone());
+    index.jars = resolution.jars.clone();
+    index.jdk_home = resolution.jdk.as_ref().map(|jdk| jdk.home.clone());
 
     let mut archives: Vec<(std::path::PathBuf, bool)> = resolution
         .jars
