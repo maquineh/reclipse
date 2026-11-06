@@ -2893,6 +2893,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "reclipse-debug"
+version = "0.1.0"
+
+[[package]]
 name = "reclipse-editor"
 version = "0.1.0"
 dependencies = [
@@ -2952,6 +2956,7 @@ dependencies = [
  "notify",
  "reclipse-classpath",
  "reclipse-core",
+ "reclipse-debug",
  "reclipse-editor",
  "reclipse-java",
  "reclipse-plugin-api",

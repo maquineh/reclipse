@@ -62,6 +62,7 @@ pub struct Session {
     pub show_problems: bool,
     pub show_console: bool,
     pub console_history: Vec<String>,
+    pub breakpoints: Vec<BreakpointSession>,
     pub font_size: f32,
     pub theme: String,
     pub launch: crate::build::LaunchConfig,
@@ -79,6 +80,7 @@ impl Default for Session {
             show_problems: true,
             show_console: true,
             console_history: Vec::new(),
+            breakpoints: Vec::new(),
             font_size: 14.5,
             theme: "rust-oxide".to_owned(),
             launch: crate::build::LaunchConfig::default(),
@@ -95,6 +97,13 @@ pub struct TabSession {
     pub anchor: usize,
     #[serde(default)]
     pub folded: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BreakpointSession {
+    pub path: PathBuf,
+    pub line: usize,
 }
 
 pub fn load() -> Session {
@@ -160,6 +169,17 @@ pub fn config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_breakpoints_and_old_sessions() {
+        let bytes =
+            br#"{"show_project":true,"breakpoints":[{"path":"C:/work/App.java","line":12}]}"#;
+        let session = parse_session(bytes).unwrap();
+        assert_eq!(session.breakpoints.len(), 1);
+        assert_eq!(session.breakpoints[0].line, 12);
+        let old = br#"{"show_project":false}"#;
+        assert!(parse_session(old).unwrap().breakpoints.is_empty());
+    }
 
     #[test]
     fn accepts_utf8_bom() {

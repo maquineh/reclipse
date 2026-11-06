@@ -1,6 +1,6 @@
 //! Application state and egui composition.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -16,6 +16,10 @@ use egui::{Align, Color32, Context, Key, Layout, Modifiers, RichText, Ui};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use reclipse_classpath::{ClasspathIndex, ClasspathStats};
 use reclipse_core::{discover_project, Project, IGNORED_DIRS};
+use reclipse_debug::{
+    BreakpointSpec, DebugCommand, DebugEvent, DebugSession, FrameInfo, SourceLocation, StepKind,
+    ThreadInfo, VariableInfo,
+};
 use reclipse_editor::{Document, SearchMatcher, SearchOptions};
 use reclipse_java::refactor::{
     apply_text_edits, local_binding_at, organize_imports, plan_local_rename, plan_member_rename,
@@ -57,6 +61,11 @@ enum ClasspathMessage {
 enum BuildMessage {
     Output(String),
     Compiled(Box<build::CompileResult>),
+    DebugStarted {
+        session: Box<DebugSession>,
+        classes: Box<build::CompileResult>,
+        main: String,
+    },
     RunFinished {
         compile: Box<build::CompileResult>,
         run: build::RunResult,
@@ -195,6 +204,47 @@ struct Toast {
     until: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebugUiStatus {
+    Starting,
+    Running,
+    Paused,
+    Exited,
+    Failed,
+}
+
+impl DebugUiStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Starting => "iniciando",
+            Self::Running => "executando",
+            Self::Paused => "pausado",
+            Self::Exited => "encerrado",
+            Self::Failed => "falhou",
+        }
+    }
+
+    fn is_active(self) -> bool {
+        matches!(self, Self::Starting | Self::Running | Self::Paused)
+    }
+}
+
+struct DebugUi {
+    session: DebugSession,
+    status: DebugUiStatus,
+    detail: String,
+    threads: Vec<ThreadInfo>,
+    frames: Vec<FrameInfo>,
+    variables: Vec<VariableInfo>,
+    selected_frame: usize,
+    location: Option<SourceLocation>,
+    paused_thread: Option<u64>,
+    eval_input: String,
+    eval_result: Option<String>,
+    exceptions: bool,
+    breakpoint_errors: Vec<String>,
+}
+
 #[cfg_attr(not(feature = "screenshot"), allow(dead_code))]
 struct ScreenshotState {
     path: Option<PathBuf>,
@@ -220,6 +270,8 @@ struct ScreenshotState {
     split_done: bool,
     search_query: Option<String>,
     project_search_query: Option<String>,
+    debug: bool,
+    debug_done: bool,
 }
 
 struct FrameBench {
@@ -267,6 +319,11 @@ pub struct ReclipseApp {
     launch_open: bool,
     test_failures: Vec<build::TestFailure>,
     test_targets: Vec<reclipse_java::JavaTestMethod>,
+    debug: Option<DebugUi>,
+    debug_classes: Option<build::CompileResult>,
+    debug_pause_exceptions: bool,
+    breakpoints: BTreeMap<PathBuf, BTreeSet<usize>>,
+    source_signatures: HashMap<String, PathBuf>,
     classpath_view: Option<String>,
     classpath_source: Option<(String, String)>,
     classpath_reload_at: Option<Instant>,
@@ -361,6 +418,21 @@ impl ReclipseApp {
             launch_open: false,
             test_failures: Vec::new(),
             test_targets: Vec::new(),
+            debug: None,
+            debug_classes: None,
+            debug_pause_exceptions: false,
+            breakpoints: {
+                let mut map: BTreeMap<PathBuf, BTreeSet<usize>> = BTreeMap::new();
+                for breakpoint in &session.breakpoints {
+                    if breakpoint.line > 0 {
+                        map.entry(breakpoint.path.clone())
+                            .or_default()
+                            .insert(breakpoint.line);
+                    }
+                }
+                map
+            },
+            source_signatures: HashMap::new(),
             classpath_view: None,
             classpath_source: None,
             classpath_reload_at: None,
@@ -458,6 +530,8 @@ impl ReclipseApp {
                 split_done: false,
                 search_query: std::env::var("RECLIPSE_SCREENSHOT_SEARCH").ok(),
                 project_search_query: std::env::var("RECLIPSE_SCREENSHOT_PROJECT_SEARCH").ok(),
+                debug: std::env::var_os("RECLIPSE_SCREENSHOT_DEBUG").is_some(),
+                debug_done: false,
             },
         };
 
@@ -770,6 +844,7 @@ impl ReclipseApp {
                     let stats = payload.index.stats.clone();
                     self.project = Some(payload.project);
                     self.index = Some(payload.index);
+                    self.refresh_source_signatures();
                     self.index_status = IndexStatus::Ready {
                         files: stats.java_files,
                         symbols: stats.symbols,
@@ -1072,6 +1147,83 @@ impl ReclipseApp {
                 tests
             })
             .unwrap_or_default();
+        self.refresh_source_signatures();
+    }
+
+    fn refresh_source_signatures(&mut self) {
+        self.source_signatures = self
+            .index
+            .as_ref()
+            .map(build_source_signatures)
+            .unwrap_or_default();
+    }
+
+    fn class_name_for_line(&self, path: &Path, line: usize) -> Option<String> {
+        if let Some(index) = &self.index {
+            if let Some(file) = index.symbols_for(path) {
+                let mut best: Option<&reclipse_java::JavaSymbol> = None;
+                for symbol in &file.symbols {
+                    if !symbol.kind.is_type()
+                        || symbol.name == "<anonymous>"
+                        || symbol.name.starts_with('<')
+                        || symbol.line > line
+                    {
+                        continue;
+                    }
+                    let better = match best {
+                        None => true,
+                        Some(current) => {
+                            symbol.line > current.line
+                                || (symbol.line == current.line && symbol.depth >= current.depth)
+                        }
+                    };
+                    if better {
+                        best = Some(symbol);
+                    }
+                }
+                let package = file.package.as_deref().unwrap_or("");
+                if let Some(symbol) = best {
+                    let chain = symbol
+                        .container
+                        .as_deref()
+                        .filter(|container| !container.is_empty())
+                        .map_or_else(
+                            || symbol.name.clone(),
+                            |container| format!("{container}.{}", symbol.name),
+                        );
+                    let binary = chain.replace('.', "$");
+                    return Some(if package.is_empty() {
+                        binary
+                    } else {
+                        format!("{package}.{binary}")
+                    });
+                }
+            }
+        }
+        path.file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+    }
+
+    fn breakpoint_specs(&self) -> Vec<BreakpointSpec> {
+        let mut specs = Vec::new();
+        let Some(index) = &self.index else {
+            return specs;
+        };
+        for (path, lines) in &self.breakpoints {
+            if !index.files.contains_key(path) {
+                continue;
+            }
+            for line in lines {
+                if let Some(class_name) = self.class_name_for_line(path, *line) {
+                    specs.push(BreakpointSpec {
+                        path: path.clone(),
+                        line: *line,
+                        class_name,
+                    });
+                }
+            }
+        }
+        specs
     }
 
     fn compile_project(&mut self) {
@@ -1228,6 +1380,399 @@ impl ReclipseApp {
     /// Schedule background `javac` diagnostics (debounced). Called on save;
     /// the actual compile runs in `poll_javac_diagnostics` without blocking
     /// manual builds or the UI thread.
+    fn start_debug(&mut self) {
+        if self.build_running {
+            self.toast("Build já em andamento (cancele para recomeçar)");
+            return;
+        }
+        if self
+            .debug
+            .as_ref()
+            .is_some_and(|debug| debug.status.is_active())
+        {
+            self.toast("Debugger já está ativo");
+            return;
+        }
+        self.debug = None;
+        self.debug_classes = None;
+        let breakpoints = self.breakpoint_specs();
+        let pause = self.debug_pause_exceptions;
+        self.show_console = true;
+        if !self.launch.debug_attach.trim().is_empty() {
+            let address = self.launch.debug_attach.trim().to_owned();
+            match DebugSession::attach(address.clone(), breakpoints, pause) {
+                Ok(session) => {
+                    self.log(LogLevel::Info, format!("Debug: conectando em {address}…"));
+                    self.debug = Some(DebugUi {
+                        session,
+                        status: DebugUiStatus::Starting,
+                        detail: format!("attach {address}"),
+                        threads: Vec::new(),
+                        frames: Vec::new(),
+                        variables: Vec::new(),
+                        selected_frame: 0,
+                        location: None,
+                        paused_thread: None,
+                        eval_input: String::new(),
+                        eval_result: None,
+                        exceptions: pause,
+                        breakpoint_errors: Vec::new(),
+                    });
+                    self.toast(format!("Conectando o debugger em {address}"));
+                }
+                Err(error) => {
+                    self.log(LogLevel::Error, format!("Debug: {error}"));
+                    self.toast(error);
+                }
+            }
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            self.toast("Abra um projeto antes de depurar");
+            return;
+        };
+        let Some(main) = self.effective_main() else {
+            self.toast("Nenhuma classe com public static void main encontrada");
+            return;
+        };
+        let env = self
+            .classpath_index
+            .as_ref()
+            .map(BuildEnv::from_classpath)
+            .unwrap_or_default();
+        let launch = self.launch.clone();
+        self.build_running = true;
+        self.build_label = Some(format!("debug {main}"));
+        self.build_output_buffer.clear();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.build_cancel = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.build_rx = Some(receiver);
+        self.log(
+            LogLevel::Info,
+            format!("Compilando e preparando o debugger para {main}…"),
+        );
+        thread::spawn(move || match build::compile(&project, &env, &cancel) {
+            Ok(compiled) if compiled.success => {
+                let launched = build::java_binary(&env).and_then(|java| {
+                    let spec = reclipse_debug::LaunchSpec {
+                        java,
+                        classpath: build::runtime_classpath_string(&compiled, &env, &project.root),
+                        main_class: main.clone(),
+                        jvm_args: launch.jvm_args_list(),
+                        program_args: launch.program_args_list(),
+                        env: launch.env_map(),
+                        workdir: project.root.clone(),
+                    };
+                    DebugSession::launch(spec, breakpoints, pause)
+                });
+                match launched {
+                    Ok(session) => {
+                        let _ = sender.send(BuildMessage::DebugStarted {
+                            session: Box::new(session),
+                            classes: Box::new(compiled),
+                            main,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = sender.send(BuildMessage::Compiled(Box::new(compiled)));
+                        let _ = sender.send(BuildMessage::Failed(error));
+                    }
+                }
+            }
+            Ok(compiled) => {
+                let _ = sender.send(BuildMessage::Compiled(Box::new(compiled)));
+            }
+            Err(error) => {
+                let _ = sender.send(BuildMessage::Failed(error));
+            }
+        });
+    }
+
+    fn debug_continue(&mut self) {
+        let Some(debug) = self.debug.as_mut() else {
+            self.toast("Nenhuma sessão de debug ativa");
+            return;
+        };
+        if debug.status == DebugUiStatus::Paused {
+            debug.session.send(DebugCommand::Resume);
+            debug.status = DebugUiStatus::Running;
+            debug.detail = "executando…".to_owned();
+        }
+    }
+
+    fn debug_pause(&mut self) {
+        if let Some(debug) = self.debug.as_mut() {
+            if debug.status == DebugUiStatus::Running {
+                debug.session.send(DebugCommand::Pause);
+            }
+        }
+    }
+
+    fn debug_step(&mut self, kind: StepKind) {
+        let Some(debug) = self.debug.as_mut() else {
+            return;
+        };
+        if debug.status == DebugUiStatus::Paused {
+            debug.session.send(DebugCommand::Step(kind));
+            debug.status = DebugUiStatus::Running;
+            debug.detail = "passo…".to_owned();
+        }
+    }
+
+    fn stop_debug(&mut self) {
+        if let Some(debug) = self.debug.take() {
+            debug.session.send(DebugCommand::Disconnect);
+            self.log(LogLevel::Info, "Debug: sessão encerrada");
+        }
+    }
+
+    fn toggle_breakpoint(&mut self, path: PathBuf, line: usize) {
+        if line == 0 || !is_java_path(&path) {
+            return;
+        }
+        let inserted = {
+            let lines = self.breakpoints.entry(path.clone()).or_default();
+            if lines.remove(&line) {
+                false
+            } else {
+                lines.insert(line);
+                true
+            }
+        };
+        if self.breakpoints.get(&path).is_some_and(BTreeSet::is_empty) {
+            self.breakpoints.remove(&path);
+        }
+        if inserted {
+            let Some(class_name) = self.class_name_for_line(&path, line) else {
+                self.toast("Não foi possível determinar a classe do breakpoint");
+                return;
+            };
+            if let Some(debug) = self.debug.as_ref() {
+                if debug.status.is_active() {
+                    debug
+                        .session
+                        .send(DebugCommand::SetBreakpoint(BreakpointSpec {
+                            path: path.clone(),
+                            line,
+                            class_name,
+                        }));
+                }
+            }
+            self.log(
+                LogLevel::Info,
+                format!(
+                    "Breakpoint em {}:{}",
+                    short_file(&path.to_string_lossy()),
+                    line
+                ),
+            );
+        } else {
+            if let Some(debug) = self.debug.as_ref() {
+                if debug.status.is_active() {
+                    debug.session.send(DebugCommand::ClearBreakpoint {
+                        path: path.clone(),
+                        line,
+                    });
+                }
+            }
+            self.log(
+                LogLevel::Info,
+                format!(
+                    "Breakpoint removido de {}:{}",
+                    short_file(&path.to_string_lossy()),
+                    line
+                ),
+            );
+        }
+    }
+
+    fn debug_line_for_path(&self, path: &Path) -> Option<usize> {
+        let debug = self.debug.as_ref()?;
+        if debug.status != DebugUiStatus::Paused {
+            return None;
+        }
+        let location = debug.location.as_ref()?;
+        let mapped = path_for_location(self.index.as_ref(), &self.source_signatures, location)?;
+        if mapped == path {
+            Some(location.line.saturating_sub(1))
+        } else {
+            None
+        }
+    }
+
+    fn poll_debug(&mut self) {
+        let mut events = Vec::new();
+        if let Some(debug) = self.debug.as_ref() {
+            while let Some(event) = debug.session.poll() {
+                events.push(event);
+            }
+        }
+        if events.is_empty() {
+            return;
+        }
+        let mut logs: Vec<(LogLevel, String)> = Vec::new();
+        let mut open: Option<(PathBuf, usize)> = None;
+        let mut clear_classes = false;
+        let mut toast: Option<String> = None;
+        {
+            let signatures = &self.source_signatures;
+            let index = self.index.as_ref();
+            let Some(debug) = self.debug.as_mut() else {
+                return;
+            };
+            for event in events {
+                match event {
+                    DebugEvent::Started { description } => {
+                        debug.status = DebugUiStatus::Running;
+                        debug.detail = description.clone();
+                        logs.push((LogLevel::Success, format!("Debug: {description}")));
+                    }
+                    DebugEvent::Stopped(info) => {
+                        debug.status = DebugUiStatus::Paused;
+                        debug.threads = info.threads.clone();
+                        debug.frames = info.frames.clone();
+                        debug.variables = info.variables.clone();
+                        debug.selected_frame = 0;
+                        debug.location = info.location.clone();
+                        debug.paused_thread = Some(info.thread.id);
+                        let place = info
+                            .location
+                            .as_ref()
+                            .map(|location| {
+                                format!(
+                                    "{}:{}",
+                                    location
+                                        .source_file
+                                        .as_deref()
+                                        .unwrap_or(&location.signature),
+                                    location.line
+                                )
+                            })
+                            .unwrap_or_else(|| "local desconhecido".to_owned());
+                        debug.detail = format!("{} · {place}", info.reason.label());
+                        logs.push((
+                            LogLevel::Warning,
+                            format!(
+                                "Debug: {} em {} ({})",
+                                info.reason.label(),
+                                place,
+                                info.thread.name
+                            ),
+                        ));
+                        if let Some(location) = &info.location {
+                            if location.line > 0 {
+                                if let Some(path) = path_for_location(index, signatures, location) {
+                                    open = Some((path, location.line));
+                                }
+                            }
+                        }
+                    }
+                    DebugEvent::Variables {
+                        frame_index,
+                        variables,
+                    } => {
+                        debug.selected_frame = frame_index;
+                        debug.variables = variables;
+                    }
+                    DebugEvent::Resumed => {
+                        debug.status = DebugUiStatus::Running;
+                        debug.detail = "executando…".to_owned();
+                        debug.frames.clear();
+                        debug.variables.clear();
+                        debug.location = None;
+                        debug.paused_thread = None;
+                    }
+                    DebugEvent::Output(text) => {
+                        let lower = text.to_lowercase();
+                        let level = if lower.contains("exception") || lower.contains("error") {
+                            LogLevel::Warning
+                        } else {
+                            LogLevel::Info
+                        };
+                        logs.push((level, text));
+                    }
+                    DebugEvent::BreakpointResolved { path, line } => {
+                        logs.push((
+                            LogLevel::Success,
+                            format!(
+                                "Debug: breakpoint ativo em {}:{}",
+                                short_file(&path.to_string_lossy()),
+                                line
+                            ),
+                        ));
+                    }
+                    DebugEvent::BreakpointError {
+                        path,
+                        line,
+                        message,
+                    } => {
+                        logs.push((
+                            LogLevel::Warning,
+                            format!(
+                                "Debug: breakpoint {}:{} não resolvido: {message}",
+                                short_file(&path.to_string_lossy()),
+                                line
+                            ),
+                        ));
+                        debug.breakpoint_errors.push(format!(
+                            "{}:{}: {message}",
+                            path.display(),
+                            line
+                        ));
+                        if debug.breakpoint_errors.len() > 20 {
+                            debug.breakpoint_errors.remove(0);
+                        }
+                    }
+                    DebugEvent::EvaluateResult {
+                        expression,
+                        value,
+                        error,
+                    } => {
+                        debug.eval_result = Some(match (value, error) {
+                            (Some(value), _) => format!("{expression} = {value}"),
+                            (None, Some(error)) => format!("{expression}: {error}"),
+                            (None, None) => format!("{expression}: sem valor"),
+                        });
+                    }
+                    DebugEvent::Exited { message } => {
+                        debug.status = DebugUiStatus::Exited;
+                        debug.detail = message.clone();
+                        debug.frames.clear();
+                        debug.variables.clear();
+                        debug.location = None;
+                        clear_classes = true;
+                        logs.push((LogLevel::Info, format!("Debug: {message}")));
+                        toast = Some(message);
+                    }
+                    DebugEvent::Error(error) => {
+                        debug.status = DebugUiStatus::Failed;
+                        debug.detail = error.clone();
+                        clear_classes = true;
+                        logs.push((LogLevel::Error, format!("Debug: {error}")));
+                        toast = Some(error);
+                    }
+                    DebugEvent::Status(text) => {
+                        debug.detail = text.clone();
+                        logs.push((LogLevel::Info, format!("Debug: {text}")));
+                    }
+                }
+            }
+        }
+        for (level, text) in logs {
+            self.log(level, text);
+        }
+        if clear_classes {
+            self.debug_classes = None;
+        }
+        if let Some((path, line)) = open {
+            self.open_at(path, line, 1);
+        }
+        if let Some(toast) = toast {
+            self.toast(toast);
+        }
+    }
+
     fn schedule_javac_diagnostics(&mut self) {
         if self.project.is_none() {
             return;
@@ -1524,6 +2069,36 @@ impl ReclipseApp {
                 BuildMessage::Compiled(compiled) => {
                     self.flush_build_output();
                     self.apply_compile_result(&compiled);
+                }
+                BuildMessage::DebugStarted {
+                    session,
+                    classes,
+                    main,
+                } => {
+                    self.flush_build_output();
+                    self.build_running = false;
+                    self.build_cancel = None;
+                    self.debug_classes = Some(*classes);
+                    self.debug = Some(DebugUi {
+                        session: *session,
+                        status: DebugUiStatus::Starting,
+                        detail: format!("iniciando {main}"),
+                        threads: Vec::new(),
+                        frames: Vec::new(),
+                        variables: Vec::new(),
+                        selected_frame: 0,
+                        location: None,
+                        paused_thread: None,
+                        eval_input: String::new(),
+                        eval_result: None,
+                        exceptions: self.debug_pause_exceptions,
+                        breakpoint_errors: Vec::new(),
+                    });
+                    self.show_console = true;
+                    self.log(
+                        LogLevel::Info,
+                        format!("Debug {main}: aguardando eventos da JVM…"),
+                    );
                 }
                 BuildMessage::RunFinished { compile, run, main } => {
                     self.flush_build_output();
@@ -2836,6 +3411,16 @@ impl ReclipseApp {
                 .into_iter()
                 .rev()
                 .collect(),
+            breakpoints: self
+                .breakpoints
+                .iter()
+                .flat_map(|(path, lines)| {
+                    lines.iter().map(|line| crate::session::BreakpointSession {
+                        path: path.clone(),
+                        line: *line,
+                    })
+                })
+                .collect(),
             font_size: self.font_size,
             theme: self.theme.config_name().to_owned(),
             launch: self.launch.clone(),
@@ -3901,7 +4486,7 @@ impl ReclipseApp {
                         Action::BuildPackage,
                     ),
                     PaletteEntry::new("Projeto: build clean (mvn/gradle)", "", Action::BuildClean),
-                    PaletteEntry::new("Projeto: executar", "F6", Action::Run),
+                    PaletteEntry::new("Projeto: executar", "Ctrl+F11", Action::Run),
                     PaletteEntry::new("Projeto: testar (mvn/gradle)", "", Action::Test),
                     PaletteEntry::new(
                         "Projeto: baixar dependências (mvn/gradle)",
@@ -3915,7 +4500,13 @@ impl ReclipseApp {
                         "",
                         Action::LaunchConfig,
                     ),
-                    PaletteEntry::new("Projeto: debug (M4)", "", Action::Debug),
+                    PaletteEntry::new("Projeto: depurar (JDWP)", "F11", Action::Debug),
+                    PaletteEntry::new("Debug: continuar", "F8", Action::DebugContinue),
+                    PaletteEntry::new("Debug: pausar", "F12", Action::DebugPause),
+                    PaletteEntry::new("Debug: passo a passo", "F6", Action::DebugStepOver),
+                    PaletteEntry::new("Debug: entrar", "F5", Action::DebugStepInto),
+                    PaletteEntry::new("Debug: sair", "F7", Action::DebugStepOut),
+                    PaletteEntry::new("Debug: encerrar", "Ctrl+F2", Action::DebugStop),
                     PaletteEntry::new(
                         "Ir para definição",
                         self.keymap.label(KeyAction::GoToDefinition),
@@ -4137,7 +4728,37 @@ impl ReclipseApp {
             return;
         }
         if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::F11)) {
-            self.toast("Debugger JDWP/JDI planejado para o M4");
+            self.start_debug();
+            return;
+        }
+        if self
+            .debug
+            .as_ref()
+            .is_some_and(|debug| debug.status == DebugUiStatus::Paused)
+        {
+            if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::F8)) {
+                self.debug_continue();
+                return;
+            }
+            if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::F6)) {
+                self.debug_step(StepKind::Over);
+                return;
+            }
+            if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::F7)) {
+                self.debug_step(StepKind::Out);
+                return;
+            }
+            if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::F5)) {
+                self.debug_step(StepKind::Into);
+                return;
+            }
+        }
+        if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::F12)) {
+            self.debug_pause();
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::F2)) {
+            self.stop_debug();
             return;
         }
         if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::I)) {
@@ -5180,11 +5801,39 @@ impl ReclipseApp {
                         if toolbar_button(ui, "Launch…", "main, args, JVM, env") {
                             actions.push(Action::LaunchConfig);
                         }
-                        let debug = ui.add_enabled(
-                            false,
-                            egui::Button::new(RichText::new("Debug").size(12.0)),
-                        );
-                        debug.on_hover_text("Debugger JDWP/JDI planejado para o M4");
+                        if let Some(debug) = &self.debug {
+                            let status = debug.status;
+                            if status == DebugUiStatus::Paused
+                                && toolbar_button(ui, "Continuar", "F8 · resume")
+                            {
+                                actions.push(Action::DebugContinue);
+                            }
+                            if status == DebugUiStatus::Paused
+                                && toolbar_button(ui, "Passo", "F6 · step over")
+                            {
+                                actions.push(Action::DebugStepOver);
+                            }
+                            if status == DebugUiStatus::Paused
+                                && toolbar_button(ui, "Entrar", "F5 · step into")
+                            {
+                                actions.push(Action::DebugStepInto);
+                            }
+                            if status == DebugUiStatus::Paused
+                                && toolbar_button(ui, "Sair", "F7 · step out")
+                            {
+                                actions.push(Action::DebugStepOut);
+                            }
+                            if status == DebugUiStatus::Running
+                                && toolbar_button(ui, "Pausar", "Suspender a JVM (F12)")
+                            {
+                                actions.push(Action::DebugPause);
+                            }
+                            if toolbar_button(ui, "Parar", "Encerrar a sessão de debug") {
+                                actions.push(Action::DebugStop);
+                            }
+                        } else if toolbar_button(ui, "Debug", "Iniciar debugger JDWP (F11)") {
+                            actions.push(Action::Debug);
+                        }
                     }
                     ui.separator();
                     if toolbar_button(ui, "Salvar", "Salvar arquivo ativo (Ctrl+S)") {
@@ -5602,6 +6251,8 @@ impl ReclipseApp {
                 ui.text_edit_singleline(&mut self.launch.program_args);
                 ui.label("Argumentos da JVM (ex: -Xmx1g -Dkey=val):");
                 ui.text_edit_singleline(&mut self.launch.jvm_args);
+                ui.label("Attach de debug (host:porta; vazio = lançar JVM):");
+                ui.text_edit_singleline(&mut self.launch.debug_attach);
                 ui.label("Ambiente (KEY=VAL por linha):");
                 ui.text_edit_multiline(&mut self.launch.env_vars);
                 ui.separator();
@@ -5609,6 +6260,10 @@ impl ReclipseApp {
                     if ui.button("Executar").clicked() {
                         self.launch_open = false;
                         self.run_project();
+                    }
+                    if ui.button("Debug").clicked() {
+                        self.launch_open = false;
+                        self.start_debug();
                     }
                     if ui.button("Fechar").clicked() {
                         self.launch_open = false;
@@ -5844,6 +6499,8 @@ impl ReclipseApp {
                         ui.add_space(10.0);
                         self.tests_section(ui);
                         ui.add_space(10.0);
+                        self.debug_section(ui);
+                        ui.add_space(10.0);
                         self.rust_telemetry_card(ui);
                         self.classpath_warnings_card(ui);
                     });
@@ -5959,6 +6616,282 @@ impl ReclipseApp {
             } else {
                 self.run_test_class(&filter.class_name);
             }
+        }
+    }
+
+    fn debug_section(&mut self, ui: &mut Ui) {
+        section_header(ui, "DEBUG");
+        let mut debug = self.debug.take();
+        let mut start = false;
+        let mut close = false;
+        let mut command: Option<DebugCommand> = None;
+        let mut select_frame: Option<(u64, usize)> = None;
+        let mut open: Option<(PathBuf, usize)> = None;
+        let mut remove_breakpoint: Option<(PathBuf, usize)> = None;
+        let mut pause_exceptions = debug
+            .as_ref()
+            .map_or(self.debug_pause_exceptions, |debug| debug.exceptions);
+
+        if let Some(debug) = &mut debug {
+            let color = match debug.status {
+                DebugUiStatus::Starting | DebugUiStatus::Running => theme::yellow(),
+                DebugUiStatus::Paused => theme::accent(),
+                DebugUiStatus::Exited => theme::muted(),
+                DebugUiStatus::Failed => theme::red(),
+            };
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("debug · {}", debug.status.label()))
+                        .small()
+                        .strong()
+                        .color(color),
+                );
+                if debug.status.is_active() {
+                    if ui.small_button("Parar").clicked() {
+                        close = true;
+                    }
+                } else if ui.small_button("Limpar").clicked() {
+                    close = true;
+                }
+            });
+            ui.label(RichText::new(&debug.detail).small().color(theme::muted()));
+            if debug.status == DebugUiStatus::Paused {
+                let paused = debug
+                    .paused_thread
+                    .and_then(|id| {
+                        debug
+                            .threads
+                            .iter()
+                            .find(|thread| thread.id == id)
+                            .map(|thread| thread.name.as_str())
+                    })
+                    .unwrap_or("—");
+                let names = debug.threads.len();
+                ui.label(
+                    RichText::new(format!("thread: {paused} · {names} thread(s)"))
+                        .size(10.5)
+                        .color(theme::muted()),
+                );
+                ui.horizontal(|ui| {
+                    if ui.small_button("Continuar").on_hover_text("F8").clicked() {
+                        command = Some(DebugCommand::Resume);
+                    }
+                    if ui
+                        .small_button("Passo")
+                        .on_hover_text("F6 · step over")
+                        .clicked()
+                    {
+                        command = Some(DebugCommand::Step(StepKind::Over));
+                    }
+                    if ui
+                        .small_button("Entrar")
+                        .on_hover_text("F5 · step into")
+                        .clicked()
+                    {
+                        command = Some(DebugCommand::Step(StepKind::Into));
+                    }
+                    if ui
+                        .small_button("Sair")
+                        .on_hover_text("F7 · step out")
+                        .clicked()
+                    {
+                        command = Some(DebugCommand::Step(StepKind::Out));
+                    }
+                });
+            } else if debug.status == DebugUiStatus::Running && ui.small_button("Pausar").clicked()
+            {
+                command = Some(DebugCommand::Pause);
+            }
+
+            if !debug.frames.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new("Call stack").small().color(theme::muted()));
+                let frames: Vec<FrameInfo> = debug.frames.iter().take(20).cloned().collect();
+                for frame in frames {
+                    let source = frame
+                        .location
+                        .source_file
+                        .as_deref()
+                        .map(short_file)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| simple_signature(&frame.location.signature));
+                    let label = format!(
+                        "#{} {}  {}:{}",
+                        frame.index, frame.location.method, source, frame.location.line
+                    );
+                    if ui
+                        .selectable_label(
+                            debug.selected_frame == frame.index,
+                            RichText::new(label).size(11.5).monospace(),
+                        )
+                        .clicked()
+                    {
+                        select_frame = Some((frame.thread_id, frame.index));
+                        if frame.location.line > 0 {
+                            if let Some(path) = path_for_location(
+                                self.index.as_ref(),
+                                &self.source_signatures,
+                                &frame.location,
+                            ) {
+                                open = Some((path, frame.location.line));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !debug.variables.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new("Variáveis").small().color(theme::muted()));
+                for variable in debug.variables.iter().take(80) {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} = {}  ({})",
+                            variable.name, variable.value, variable.type_name
+                        ))
+                        .size(11.5)
+                        .monospace()
+                        .color(theme::text()),
+                    );
+                }
+            }
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut debug.eval_input)
+                        .hint_text("variável ou literal")
+                        .desired_width(120.0),
+                );
+                if ui.small_button("Avaliar").clicked() && !debug.eval_input.trim().is_empty() {
+                    command = Some(DebugCommand::Evaluate {
+                        expression: debug.eval_input.clone(),
+                    });
+                }
+            });
+            if let Some(result) = &debug.eval_result {
+                ui.label(
+                    RichText::new(result)
+                        .size(11.0)
+                        .monospace()
+                        .color(theme::accent()),
+                );
+            }
+            if !debug.breakpoint_errors.is_empty() {
+                for error in debug.breakpoint_errors.iter().rev().take(3) {
+                    ui.label(RichText::new(error).size(10.5).color(theme::red()));
+                }
+            }
+            if ui
+                .checkbox(&mut pause_exceptions, "Pausar em exceções")
+                .changed()
+            {
+                command = Some(DebugCommand::SetPauseOnExceptions(pause_exceptions));
+            }
+        } else {
+            let count: usize = self.breakpoints.values().map(BTreeSet::len).sum();
+            ui.label(
+                RichText::new(if count == 0 {
+                    "Clique na gutter para criar breakpoints. F11 inicia o debug.".to_owned()
+                } else {
+                    format!("{count} breakpoint(s) configurado(s).")
+                })
+                .small()
+                .color(theme::muted()),
+            );
+            ui.horizontal(|ui| {
+                if ui.small_button("Debug (F11)").clicked() {
+                    start = true;
+                }
+                if !self.launch.debug_attach.trim().is_empty() {
+                    ui.label(
+                        RichText::new(format!("attach {}", self.launch.debug_attach.trim()))
+                            .small()
+                            .color(theme::muted()),
+                    );
+                }
+            });
+            if ui
+                .checkbox(&mut pause_exceptions, "Pausar em exceções")
+                .changed()
+            {
+                self.debug_pause_exceptions = pause_exceptions;
+            }
+        }
+
+        if !self.breakpoints.is_empty() {
+            ui.add_space(4.0);
+            ui.label(RichText::new("Breakpoints").small().color(theme::muted()));
+            let entries: Vec<(PathBuf, Vec<usize>)> = self
+                .breakpoints
+                .iter()
+                .take(12)
+                .map(|(path, lines)| (path.clone(), lines.iter().copied().collect()))
+                .collect();
+            for (path, lines) in entries {
+                for line in lines {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("×").on_hover_text("Remover").clicked() {
+                            remove_breakpoint = Some((path.clone(), line));
+                        }
+                        ui.label(
+                            RichText::new(format!(
+                                "{}:{}",
+                                short_file(&path.to_string_lossy()),
+                                line
+                            ))
+                            .size(11.0)
+                            .monospace()
+                            .color(theme::muted()),
+                        );
+                    });
+                }
+            }
+        }
+
+        if let Some(debug) = &mut debug {
+            debug.exceptions = pause_exceptions;
+            if let Some((_, frame_index)) = select_frame {
+                debug.selected_frame = frame_index;
+            }
+            match &command {
+                Some(DebugCommand::Resume) | Some(DebugCommand::Step(_)) => {
+                    debug.status = DebugUiStatus::Running;
+                    debug.detail = "executando…".to_owned();
+                }
+                Some(DebugCommand::Pause) => {
+                    debug.detail = "pausando…".to_owned();
+                }
+                _ => {}
+            }
+        }
+        if let Some(debug) = &debug {
+            if let Some(command) = command {
+                debug.session.send(command);
+            }
+            if close {
+                debug.session.send(DebugCommand::Disconnect);
+            }
+            if let Some((thread_id, frame_index)) = select_frame {
+                debug.session.send(DebugCommand::SelectFrame {
+                    thread_id,
+                    frame_index,
+                });
+            }
+        }
+        if close {
+            debug = None;
+        }
+        self.debug_pause_exceptions = pause_exceptions;
+        self.debug = debug;
+        if let Some((path, line)) = open {
+            self.open_at(path, line, 1);
+        }
+        if let Some((path, line)) = remove_breakpoint {
+            self.toggle_breakpoint(path, line);
+        }
+        if start {
+            self.start_debug();
         }
     }
 
@@ -6500,6 +7433,7 @@ impl ReclipseApp {
         };
         let title = tab.title();
         let path = tab.doc.path.display().to_string();
+        let doc_path = tab.doc.path.clone();
         egui::Frame::NONE
             .fill(theme::panel())
             .inner_margin(egui::Margin::symmetric(8, 2))
@@ -6525,8 +7459,18 @@ impl ReclipseApp {
             })
             .response
             .on_hover_text(path);
+        let breakpoint_lines: Vec<usize> = self
+            .breakpoints
+            .get(&doc_path)
+            .map(|lines| lines.iter().map(|line| line.saturating_sub(1)).collect())
+            .unwrap_or_default();
+        let debug_line = self.debug_line_for_path(&doc_path);
+        let mut toggled = None;
         if let Some(tab) = self.tabs.get_mut(index) {
-            tab.show(ui, font_size);
+            toggled = tab.show(ui, font_size, &breakpoint_lines, debug_line);
+        }
+        if let Some(line) = toggled {
+            self.toggle_breakpoint(doc_path, line + 1);
         }
     }
 
@@ -7078,6 +8022,14 @@ impl ReclipseApp {
                 ui.separator();
                 ui.label(
                     RichText::new(
+                        "Debug: F11 iniciar · F8 continuar · F6 passo · F5 entrar · F7 sair · \
+                         F12 pausar · Ctrl+F2 encerrar",
+                    )
+                    .small()
+                    .color(theme::muted()),
+                );
+                ui.label(
+                    RichText::new(
                         "Editor: Ctrl+Z desfazer · Ctrl+Y refazer · Ctrl+A selecionar tudo · \
                          Ctrl+Alt+↓ adicionar cursor · Alt+arrastar seleção por coluna · Esc reduzir cursores",
                     )
@@ -7246,7 +8198,13 @@ impl ReclipseApp {
             Action::LaunchConfig => {
                 self.launch_open = true;
             }
-            Action::Debug => self.toast("Debugger JDWP/JDI planejado para o M4"),
+            Action::Debug => self.start_debug(),
+            Action::DebugContinue => self.debug_continue(),
+            Action::DebugPause => self.debug_pause(),
+            Action::DebugStepOver => self.debug_step(StepKind::Over),
+            Action::DebugStepInto => self.debug_step(StepKind::Into),
+            Action::DebugStepOut => self.debug_step(StepKind::Out),
+            Action::DebugStop => self.stop_debug(),
             Action::ToggleSplit => self.toggle_split(),
             Action::ToggleProject => self.show_project = !self.show_project,
             Action::ToggleOutline => self.show_outline = !self.show_outline,
@@ -7396,6 +8354,65 @@ impl ReclipseApp {
         ctx.request_repaint_after(Duration::from_millis(1));
     }
 
+    #[cfg_attr(not(feature = "screenshot"), allow(dead_code))]
+    fn setup_screenshot_debug(&mut self) {
+        if self.screenshot.debug_done {
+            return;
+        }
+        self.screenshot.debug_done = true;
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let path = self
+            .index
+            .as_ref()
+            .and_then(|index| {
+                index
+                    .files
+                    .iter()
+                    .find(|(path, file)| {
+                        is_java_path(path)
+                            && file.symbols.iter().any(|symbol| {
+                                symbol.name == "main"
+                                    && symbol
+                                        .detail
+                                        .as_deref()
+                                        .is_some_and(|detail| detail.contains("static"))
+                            })
+                    })
+                    .map(|(path, _)| path.clone())
+            })
+            .or_else(|| project.java_files.first().cloned());
+        let Some(path) = path else {
+            return;
+        };
+        let Ok(source) = fs::read_to_string(&path) else {
+            return;
+        };
+        let line = source
+            .lines()
+            .position(|line| {
+                let trimmed = line.trim();
+                !trimmed.starts_with("//")
+                    && !trimmed.starts_with('*')
+                    && (trimmed.contains("System.out.println")
+                        || trimmed.contains("printModes")
+                        || trimmed.contains("total +="))
+            })
+            .map(|line| line + 1);
+        if let Some(line) = line {
+            self.open_at(path.clone(), line, 1);
+            let already = self
+                .breakpoints
+                .get(&path)
+                .is_some_and(|lines| lines.contains(&line));
+            if !already {
+                self.toggle_breakpoint(path, line);
+            }
+            self.start_debug();
+        }
+    }
+
     fn maybe_capture_screenshot(&mut self, ctx: &Context) {
         let Some(path) = self.screenshot.path.clone() else {
             return;
@@ -7524,6 +8541,27 @@ impl ReclipseApp {
                             self.screenshot.run_done = true;
                         }
                     }
+                    if self.screenshot.debug
+                        && !self.screenshot.debug_done
+                        && self.classpath_index.is_some()
+                    {
+                        self.setup_screenshot_debug();
+                    }
+                    if self.screenshot.debug {
+                        let ready = self.debug.as_ref().is_some_and(|debug| {
+                            matches!(
+                                debug.status,
+                                DebugUiStatus::Paused
+                                    | DebugUiStatus::Failed
+                                    | DebugUiStatus::Exited
+                            )
+                        });
+                        if !ready {
+                            self.screenshot.ready_frames = 0;
+                            ctx.request_repaint_after(Duration::from_millis(60));
+                            return;
+                        }
+                    }
                     if self.screenshot.split && !self.screenshot.split_done {
                         if self.tabs.len() < 2 {
                             if let Some(path) = self.project.as_ref().and_then(|project| {
@@ -7614,6 +8652,10 @@ impl eframe::App for ReclipseApp {
         self.poll_classpath();
         self.poll_build();
         self.poll_javac_diagnostics();
+        self.poll_debug();
+        if self.debug.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
         self.poll_jdtls();
         self.poll_watcher();
         self.maybe_reload_classpath();
@@ -8200,6 +9242,86 @@ fn is_completion_identifier(character: char) -> bool {
     character.is_alphanumeric() || character == '_' || character == '$'
 }
 
+fn build_source_signatures(index: &ProjectIndex) -> HashMap<String, PathBuf> {
+    let mut map = HashMap::new();
+    for (path, file) in &index.files {
+        let package = file.package.as_deref().unwrap_or("");
+        for symbol in &file.symbols {
+            if !symbol.kind.is_type()
+                || symbol.name == "<anonymous>"
+                || symbol.name.starts_with('<')
+            {
+                continue;
+            }
+            let chain = symbol
+                .container
+                .as_deref()
+                .filter(|container| !container.is_empty())
+                .map_or_else(
+                    || symbol.name.clone(),
+                    |container| format!("{container}.{}", symbol.name),
+                );
+            let binary = chain.replace('.', "$");
+            let fq = if package.is_empty() {
+                binary
+            } else {
+                format!("{package}.{binary}")
+            };
+            map.insert(format!("L{};", fq.replace('.', "/")), path.clone());
+        }
+        if let Some(stem) = path.file_stem() {
+            let name = stem.to_string_lossy();
+            if !name.is_empty() {
+                let fq = if package.is_empty() {
+                    name.into_owned()
+                } else {
+                    format!("{package}.{name}")
+                };
+                map.entry(format!("L{};", fq.replace('.', "/")))
+                    .or_insert_with(|| path.clone());
+            }
+        }
+    }
+    map
+}
+
+fn path_for_location(
+    index: Option<&ProjectIndex>,
+    signatures: &HashMap<String, PathBuf>,
+    location: &SourceLocation,
+) -> Option<PathBuf> {
+    let signature = location
+        .signature
+        .split('<')
+        .next()
+        .unwrap_or(&location.signature);
+    if let Some(path) = signatures.get(signature) {
+        return Some(path.clone());
+    }
+    let source = location.source_file.as_deref()?;
+    index.and_then(|index| {
+        index
+            .files
+            .keys()
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy() == source)
+            })
+            .cloned()
+    })
+}
+
+fn simple_signature(signature: &str) -> String {
+    let signature = signature.split('<').next().unwrap_or(signature);
+    if let Some(value) = signature
+        .strip_prefix('L')
+        .and_then(|value| value.strip_suffix(';'))
+    {
+        return value.rsplit('/').next().unwrap_or(value).replace('$', ".");
+    }
+    signature.to_owned()
+}
+
 fn is_classpath_config(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -8610,6 +9732,27 @@ mod tests {
             "project/gradle/libs.versions.toml"
         )));
         assert!(!is_classpath_config(Path::new("project/App.java")));
+    }
+
+    #[test]
+    fn maps_debug_signatures_to_source_paths() {
+        let mut signatures = HashMap::new();
+        signatures.insert(
+            "Lcom/acme/App$Inner;".to_owned(),
+            PathBuf::from("src/com/acme/App.java"),
+        );
+        let location = SourceLocation {
+            signature: "Lcom/acme/App$Inner;".to_owned(),
+            source_file: Some("App.java".to_owned()),
+            line: 42,
+            method: "run".to_owned(),
+            code_index: 7,
+        };
+        assert_eq!(
+            path_for_location(None, &signatures, &location),
+            Some(PathBuf::from("src/com/acme/App.java"))
+        );
+        assert_eq!(simple_signature("Lcom/acme/App$Inner;"), "App.Inner");
     }
 
     #[test]

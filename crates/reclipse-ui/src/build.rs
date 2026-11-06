@@ -42,6 +42,8 @@ pub struct LaunchConfig {
     pub program_args: String,
     pub jvm_args: String,
     pub env_vars: String,
+    /// `host:port` for attaching instead of launching a JVM. Empty launches.
+    pub debug_attach: String,
 }
 
 impl LaunchConfig {
@@ -176,6 +178,7 @@ fn compile_inner(
         "-encoding".to_owned(),
         "UTF-8".to_owned(),
         "-proc:none".to_owned(),
+        "-g".to_owned(),
         "-d".to_owned(),
         quote_path(classes_dir.path()),
     ];
@@ -307,17 +310,8 @@ pub fn run_main(
 ) -> Result<RunResult, String> {
     let started = Instant::now();
     let java = jdk_binary(env.jdk_home.as_deref(), "java")?;
-    let mut entries = Vec::with_capacity(env.jars.len() + 2);
-    entries.push(compiled.classes_dir.path().to_path_buf());
-    let target_classes = project_root.join("target/classes");
-    if target_classes.is_dir() {
-        entries.push(target_classes);
-    }
-    entries.extend(env.jars.iter().cloned());
-    let mut args = vec![
-        "-cp".to_owned(),
-        join_classpath(&entries).display().to_string(),
-    ];
+    let classpath = runtime_classpath(compiled, env, project_root);
+    let mut args = vec!["-cp".to_owned(), classpath.display().to_string()];
     args.extend(launch.jvm_args_list());
     args.push(main_class.to_owned());
     args.extend(launch.program_args_list());
@@ -328,6 +322,38 @@ pub fn run_main(
         output: output.combined,
         elapsed_ms: started.elapsed().as_millis(),
     })
+}
+
+/// Runtime classpath used by `java` (compiled classes, project classes and jars).
+pub(crate) fn runtime_classpath(
+    compiled: &CompileResult,
+    env: &BuildEnv,
+    project_root: &Path,
+) -> std::path::PathBuf {
+    let mut entries = Vec::with_capacity(env.jars.len() + 2);
+    entries.push(compiled.classes_dir.path().to_path_buf());
+    let target_classes = project_root.join("target/classes");
+    if target_classes.is_dir() {
+        entries.push(target_classes);
+    }
+    entries.extend(env.jars.iter().cloned());
+    join_classpath(&entries)
+}
+
+/// `java` binary for the configured JDK.
+pub(crate) fn java_binary(env: &BuildEnv) -> Result<PathBuf, String> {
+    jdk_binary(env.jdk_home.as_deref(), "java")
+}
+
+/// Classpath string for launching a JVM.
+pub(crate) fn runtime_classpath_string(
+    compiled: &CompileResult,
+    env: &BuildEnv,
+    project_root: &Path,
+) -> String {
+    runtime_classpath(compiled, env, project_root)
+        .display()
+        .to_string()
 }
 
 pub(crate) struct PipedOutput {

@@ -177,24 +177,37 @@ impl Tab {
         Ok(())
     }
 
-    pub fn show(&mut self, ui: &mut Ui, font_size: f32) {
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        font_size: f32,
+        breakpoints: &[usize],
+        debug_line: Option<usize>,
+    ) -> Option<usize> {
         self.ensure_highlight_states();
         egui::ScrollArea::both()
             .id_salt(("reclipse_editor", &self.doc.path))
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                self.paint_body(ui, font_size);
-            });
+                self.paint_body(ui, font_size, breakpoints, debug_line)
+            })
+            .inner
     }
 
-    fn paint_body(&mut self, ui: &mut Ui, font_size: f32) {
+    fn paint_body(
+        &mut self,
+        ui: &mut Ui,
+        font_size: f32,
+        breakpoints: &[usize],
+        debug_line: Option<usize>,
+    ) -> Option<usize> {
         let font = FontId::monospace(font_size);
         let char_width = ui.fonts(|fonts| fonts.glyph_width(&font, 'M')).max(1.0);
         let row_height = ui.fonts(|fonts| fonts.row_height(&font)).max(1.0);
         let line_count = self.doc.line_count();
         let visible_count = self.visible_line_count().max(1);
         let digits = line_count.to_string().len().max(3);
-        let gutter_width = digits as f32 * char_width + GUTTER_PAD * 2.0;
+        let gutter_width = digits as f32 * char_width + GUTTER_PAD * 2.0 + 14.0;
 
         let available = ui.available_width().max(320.0);
         let content_width = self
@@ -211,7 +224,7 @@ impl Tab {
         let response = ui.interact(rect, editor_id, Sense::click_and_drag());
         let clip = ui.clip_rect().intersect(rect);
         if !clip.is_positive() {
-            return;
+            return None;
         }
         self.cursor_screen_rect = None;
 
@@ -229,6 +242,7 @@ impl Tab {
         let text_left = rect.left() + gutter_width + GUTTER_PAD;
         let pointer = response.interact_pointer_pos();
         let mut handled_gutter = false;
+        let mut toggled_breakpoint = None;
         if (response.clicked() || response.drag_started())
             && pointer.is_some_and(|pos| pos.x < clip.left() + gutter_width)
         {
@@ -236,8 +250,14 @@ impl Tab {
                 let visual =
                     (((pos.y - rect.top() - TOP_PAD) / row_height).floor()).max(0.0) as usize;
                 let line = self.visual_to_doc(visual);
-                if self.is_fold_marker(line) {
+                let gutter_x = pos.x - clip.left();
+                if (13.0..28.0).contains(&gutter_x) && self.is_fold_marker(line) {
                     self.toggle_fold(line);
+                    handled_gutter = true;
+                } else if response.clicked() {
+                    toggled_breakpoint = Some(line);
+                    handled_gutter = true;
+                } else {
                     handled_gutter = true;
                 }
             }
@@ -382,6 +402,16 @@ impl Tab {
                     with_alpha(theme::accent_dim(), 90),
                 );
             }
+            if debug_line == Some(line) {
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(text_clip.left(), y),
+                        Pos2::new(text_clip.right(), y + row_height),
+                    ),
+                    0.0,
+                    with_alpha(theme::yellow(), 55),
+                );
+            }
 
             for cursor in &cursors {
                 let (selection_start, selection_end) = cursor.range();
@@ -464,9 +494,29 @@ impl Tab {
                 gutter_text.clone(),
                 gutter_color,
             );
+            if breakpoints.contains(&line) {
+                painter.circle_filled(
+                    Pos2::new(gutter_rect.left() + 7.0, y + row_height * 0.5),
+                    3.5,
+                    theme::red(),
+                );
+            }
+            if debug_line == Some(line) {
+                let cx = gutter_rect.left() + 6.0;
+                let cy = y + row_height * 0.5;
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        Pos2::new(cx - 3.0, cy - 4.0),
+                        Pos2::new(cx + 4.0, cy),
+                        Pos2::new(cx - 3.0, cy + 4.0),
+                    ],
+                    theme::yellow(),
+                    Stroke::NONE,
+                ));
+            }
             if self.is_fold_marker(line) {
                 let folded = self.folded.contains_key(&line);
-                let cx = gutter_rect.left() + 6.0;
+                let cx = gutter_rect.left() + 18.0;
                 let cy = y + row_height * 0.5;
                 let points = if folded {
                     vec![
@@ -558,6 +608,7 @@ impl Tab {
                 })
         };
         self.hovered_identifier = hovered;
+        toggled_breakpoint
     }
 
     #[allow(clippy::too_many_lines)]

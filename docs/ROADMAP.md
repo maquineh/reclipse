@@ -111,7 +111,7 @@ Entregue:
 
 Pendente:
 
-- Debugger JDWP/JDI (M4).
+- Debugger JDWP/JDI entregue no M4 (DAP, breakpoints condicionais, watches e hot swap pendentes).
 - JUnit independente do runner Maven/Gradle (execução direta via launcher/JUnit Platform).
 - Configurações de execução múltiplas e variáveis por plataforma.
 - Formatter embutido (sem dependência externa).
@@ -122,12 +122,26 @@ Aceite:
 - rodar `mvn test`/`gradle test` e navegar dos resultados ao código;
 - reexecutar um teste individual em < 2 s de overhead da IDE.
 
-## M4 — Debugger (4–6 semanas)
+## M4 — Debugger (em andamento; núcleo JDWP entregue)
 
-- Adaptador DAP em Rust e backend JDWP/JDI em processo separado.
-- Breakpoints (linha, condicional, exceção), stepping, call stack, variáveis, watches.
-- Evaluate expression e hot swap básico quando suportado.
-- Launch/attach em JVM local e remota.
+Entregue:
+
+- cliente JDWP nativo em Rust (`reclipse-debug`) rodando em thread separada, sem congelar a UI;
+- launch de JVM com `-agentlib:jdwp` e `javac -g`, além de attach em `host:porta`;
+- breakpoints de linha pela gutter, persistidos na sessão e resolvidos via `ClassPrepare`;
+- stepping (`F5`/`F6`/`F7`/`F8`), pausa (`F12`) e encerramento (`Ctrl+F2`);
+- call stack, threads, variáveis locais, campos de `this`, strings/arrays e objetos formatados;
+- avaliação simples de variável local ou literal;
+- pausa em exceções não capturadas;
+- abertura automática do arquivo/linha ao parar e destaque da linha atual no editor.
+
+Pendente:
+
+- adaptador DAP para clientes externos;
+- breakpoints condicionais, watches e hot swap;
+- expressões compostas (`obj.field`, chamadas) no evaluate;
+- mapeamento preciso de classes anônimas/lambdas e de linhas após tipos aninhados;
+- attach remoto com TLS/autenticação e reconexão.
 
 Aceite:
 

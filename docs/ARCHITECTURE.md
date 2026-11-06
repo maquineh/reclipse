@@ -42,6 +42,7 @@ reclipse-ui  ──────────────► reclipse-java ──�
      │                            │                    │
      │                            └──────────► tree-sitter-java
      ├──────────────► reclipse-editor
+     ├──────────────► reclipse-debug ──► JDWP/JVM
      ├──────────────► reclipse-plugin-host ──► reclipse-plugin-api
      └──────────────► egui / eframe / rfd
 ```
@@ -52,6 +53,7 @@ reclipse-ui  ──────────────► reclipse-java ──�
 | `reclipse-classpath` | classpath Eclipse/Maven/Gradle/JDK, parser de `.class`, índice de JARs/JMODs | zip, core |
 | `reclipse-java` | parse Java, extração de símbolos, índice paralelo, semântica de imports/tipos | tree-sitter, Rayon, core, classpath |
 | `reclipse-editor` | documento, cursor, lexer de highlighting | std |
+| `reclipse-debug` | cliente JDWP, launch/attach, breakpoints, stepping, frames e variáveis | std |
 | `reclipse-plugin-api` | structs `#[repr(C)]`, protocolo JSON | serde |
 | `reclipse-plugin-host` | dlopen/dlclose, validação de ABI, despacho | libloading, api |
 | `reclipse-ui` | estado da aplicação, painéis, comandos | todos |
@@ -277,7 +279,7 @@ Nada disso substitui aconselhamento jurídico.
 
 - **Build**: invocar wrappers Maven/Gradle com output estruturado; futuramente Tooling API via sidecar.
 - **Testes**: descoberta JUnit 4/5, execução por arquivo/classe, console de resultados.
-- **Debug**: JDWP/JDI atrás de um adaptador DAP; a UI fala DAP com o adaptador, mantendo o núcleo Rust limpo.
+- **Debug**: cliente JDWP nativo em `reclipse-debug`, executado em thread separada e conversando com a UI por canais; launch/attach local, breakpoints, stepping, frames, variáveis e exceções. Um adaptador DAP para clientes externos permanece no roadmap.
 - **Formatting**: google-java-format/Eclipse formatter via sidecar ou implementação nativa futura.
 
 ## 11. Segurança

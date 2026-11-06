@@ -40,7 +40,8 @@ Este repositório contém o **MVP 0.1.0**, o **M1** do editor e a **fundação d
   - renomeia o `.java` de tipos top-level e atualiza o índice sem recarregar o classpath;
   - recusa classpath/JDK, colisões, sombreamento de locais e métodos sobrescritos/implementados;
   - aplica edits em lote e um único passo de undo para rename local.
-- **Compilação e execução**: **Compilar** com `javac` (classpath do projeto + `--release` do target), **Build compile/package/clean** do Maven/Gradle com saída incremental, diagnósticos no painel Problemas e **Executar** a classe `main` com `java` (`Ctrl+F11`). Debug JDWP/JDI fica para o M4.
+- **Compilação e execução**: **Compilar** com `javac` (classpath do projeto + `--release` do target), **Build compile/package/clean** do Maven/Gradle com saída incremental, diagnósticos no painel Problemas e **Executar** a classe `main` com `java` (`Ctrl+F11`).
+- **Debugger JDWP nativo**: breakpoints clicáveis na gutter, launch ou attach, stepping (`F5`/`F6`/`F7`/`F8`), call stack, threads, variáveis locais e campos de `this`, avaliação simples e pausa em exceções não capturadas (`F11`).
 - **JUnit inline**: descoberta de testes JUnit 4/5, árvore classe → método no right dock, execução por classe ou método e falhas clicáveis com stack frame.
 - **Editor dividido** com dois painéis e **abas arrastáveis** (drag-and-drop) entre eles.
 - **Organizar imports** (`Ctrl+Shift+I`) e **formatar arquivo** via formatter externo opt-in (`Ctrl+Alt+F`).
@@ -50,7 +51,7 @@ Este repositório contém o **MVP 0.1.0**, o **M1** do editor e a **fundação d
 - Diagnóstico de **imports não resolvidos** no painel de problemas.
 - **File watcher**: recarga automática de arquivos limpos alterados no disco e banner de conflito para buffers sujos.
 - **Recuperação de buffers sujos** após fechar/crash, com diálogo de recuperação.
-- **Sessão persistente**: projeto, abas, cursor, folds, painéis, fonte e keybindings.
+- **Sessão persistente**: projeto, abas, cursor, folds, painéis, breakpoints, fonte e keybindings.
 - **Keybindings no padrão Eclipse** (Open Resource, Open Type, Quick Access, Quick Outline, F3), configuráveis via `session.json`.
 - Indexação paralela de arquivos Java com **tree-sitter-java + Rayon**:
   - pacote, imports, classes, interfaces, enums, records, anotações
@@ -113,11 +114,16 @@ Descoberta de testes JUnit no right dock:
 
 ![Testes JUnit](docs/screenshot-tests.png)
 
+Debugger JDWP pausado em um breakpoint, com call stack e variáveis:
+
+![Debugger](docs/screenshot-debug.png)
+
 ## O que ainda não existe
 
 Este MVP é deliberadamente honesto sobre o escopo:
 
-- Compila e executa `main` via `javac`/`java` com launch config, roda `mvn test`/`gradle test` com parser e JUnit inline por classe/método, mas ainda não depura (JDWP/JDI) e não executa ciclos de build Maven/Gradle completos.
+- O debugger usa JDWP nativo e entrega launch/attach, breakpoints de linha, stepping, call stack, variáveis, campos de `this` e exceções não capturadas; ainda faltam breakpoints condicionais, watches, hot swap, DAP externo e depuração de classes anônimas/lambdas de forma precisa.
+- Compila e executa `main` via `javac`/`java` com launch config, roda `mvn test`/`gradle test` com parser e JUnit inline por classe/método, e depura via JDWP; ainda não executa ciclos de build Maven/Gradle completos.
 - O formatter é externo e opt-in (`RECLIPSE_FORMATTER`/`RECLIPSE_FORMATTER_JAR`); organize imports é nativo e conservador.
 - A semântica Java cobre imports/tipos, completion de membros, hover, referências semânticas de tipos/membros, rename conservador, overloads por tipo, type variables com substituição e diagnósticos nativos (tipos/membros não resolvidos, `@Override`, static ambíguo) além do `javac` em fundo; faltam apenas refinamentos (overloads finos por subtipo, Javadoc, modo JDT opt-in). Tipos locais são detectados; tipos anônimos ainda não são modelados.
 - Rename não reescreve Javadoc, strings, configuração por reflexão ou nomes em arquivos de recursos; overrides/implementações e locais sombreados são recusados por segurança, e o rename de workspace exige buffers Java salvos.
@@ -127,7 +133,7 @@ Este MVP é deliberadamente honesto sobre o escopo:
 - Plugins Eclipse/OSGi/SWT **não** são carregados ainda. A compatibilidade headless está no roadmap.
 - Há **JDT LS opt-in** via `RECLIPSE_JDTLS` (diagnósticos extras), desabilitado por padrão; não é um LSP embutido completo.
 
-Veja [docs/M1.md](docs/M1.md) para o detalhamento do editor, [docs/M2.md](docs/M2.md) para o classpath/semântica e [docs/ROADMAP.md](docs/ROADMAP.md) para os próximos marcos.
+Veja [docs/M1.md](docs/M1.md) para o detalhamento do editor, [docs/M2.md](docs/M2.md) para o classpath/semântica, [docs/M3.md](docs/M3.md) para build/testes e [docs/M4.md](docs/M4.md) para o debugger. O [docs/ROADMAP.md](docs/ROADMAP.md) lista os próximos marcos.
 
 ---
 
@@ -169,12 +175,18 @@ Também é possível abrir a IDE sem argumentos e escolher **Arquivo → Abrir p
 | `Ctrl+Shift+G` | Referências (semânticas para tipos/membros; locais no buffer) |
 | `Alt+Shift+R` | Renomear tipo/método/campo/variável local |
 | `Ctrl+F11` | Compilar e executar a classe `main` |
+| `F11` | Iniciar o debugger JDWP |
+| `F8` | Continuar (pausado) |
+| `F6` | Passo a passo / step over (pausado) |
+| `F5` | Entrar / step into (pausado; senão reindexa) |
+| `F7` | Sair / step out (pausado) |
+| `F12` | Pausar a JVM |
+| `Ctrl+F2` | Encerrar a sessão de debug |
 | `Ctrl+Shift+I` | Organizar imports |
 | `Ctrl+Alt+F` | Formatar arquivo (formatter externo) |
-| `F11` | Debug (planejado para o M4) |
 | `Ctrl+Shift+L` | Ajuda de atalhos |
 | `F3` | Ir para definição |
-| `F5` | Reindexar |
+| `F5` | Reindexar (fora do debug) |
 | `Ctrl+S` | Salvar |
 | `Ctrl+W` | Fechar aba |
 | `Ctrl+Alt+O` | Abrir arquivo |
@@ -188,9 +200,11 @@ Os atalhos de arquivo, navegação, busca e projeto podem ser redefinidos em `%A
 
 ## Sessão e configuração
 
-A IDE salva projeto, abas, cursor, visibilidade dos painéis (incluindo o console), tema, tamanho da fonte e keybindings ao sair. Abra **Ajuda → Abrir configuração (session.json)** para editar. Alterações de keybinding exigem reinício; edições externas de keybindings são preservadas ao fechar a IDE.
+A IDE salva projeto, abas, cursor, visibilidade dos painéis (incluindo o console), breakpoints, tema, tamanho da fonte e keybindings ao sair. Abra **Ajuda → Abrir configuração (session.json)** para editar. Alterações de keybinding exigem reinício; edições externas de keybindings são preservadas ao fechar a IDE.
 
 O campo `theme` aceita `rust-oxide` (padrão), `eclipse-cosmic` ou `cyber-solar`. Também é possível iniciar com `RECLIPSE_THEME=cyber-solar`.
+
+Para depurar, clique na gutter para criar breakpoints e pressione `F11`; a IDE compila com `-g`, inicia a JVM com JDWP e abre a sessão. Em **Launch…**, o campo **Attach de debug** aceita `host:porta` para conectar a uma JVM já em execução (vazio = lançar uma nova JVM).
 
 O formatter é externo e opt-in: defina `RECLIPSE_FORMATTER` (executável que lê o código pela stdin) ou `RECLIPSE_FORMATTER_JAR` (jar do google-java-format). `Ctrl+Shift+I` organiza imports nativamente.
 
