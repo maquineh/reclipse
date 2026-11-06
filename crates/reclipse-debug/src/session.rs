@@ -12,9 +12,10 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::expr::{self, BinaryOp, Expr, Literal, UnaryOp};
 use crate::model::{
     BreakpointSpec, DebugCommand, DebugEvent, FrameInfo, LaunchSpec, SourceLocation, StepKind,
-    StopInfo, StopReason, ThreadInfo, VariableInfo,
+    StopInfo, StopReason, ThreadInfo, VariableInfo, WatchValue,
 };
 use crate::protocol::{Incoming, JdwpClient, Location, Reader, Value, Writer};
 
@@ -124,6 +125,7 @@ pub(crate) fn run_launch(
         resume_after_start: true,
         pending: Vec::new(),
         requests: HashMap::new(),
+        request_conditions: HashMap::new(),
         class_prepare: HashMap::new(),
         exception_request: None,
         pause_on_exceptions,
@@ -180,6 +182,7 @@ pub(crate) fn run_attach(
         resume_after_start: false,
         pending: Vec::new(),
         requests: HashMap::new(),
+        request_conditions: HashMap::new(),
         class_prepare: HashMap::new(),
         exception_request: None,
         pause_on_exceptions,
@@ -224,7 +227,24 @@ struct StopContext {
     thread_id: u64,
     frames: Vec<FrameInfo>,
     variables: Vec<VariableInfo>,
+    locals: HashMap<String, (String, EvalValue)>,
+    this_object_id: Option<u64>,
 }
+
+#[derive(Debug, Clone)]
+enum EvalValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Char(char),
+    String(String),
+    Object { id: u64 },
+}
+
+type LocalValues = HashMap<String, (String, EvalValue)>;
+type FrameLocals = (Vec<VariableInfo>, LocalValues, Option<u64>);
+type LocalVariables = (Vec<VariableInfo>, LocalValues);
 
 struct Worker {
     client: JdwpClient,
@@ -236,6 +256,8 @@ struct Worker {
     pending: Vec<BreakpointSpec>,
     /// Breakpoint request IDs keyed by `(path, line)`.
     requests: HashMap<(PathBuf, usize), Vec<u32>>,
+    /// Optional condition keyed by the JDWP breakpoint request ID.
+    request_conditions: HashMap<u32, Option<String>>,
     /// ClassPrepare request IDs keyed by binary class name.
     class_prepare: HashMap<String, u32>,
     exception_request: Option<u32>,
@@ -272,6 +294,7 @@ struct StopRequest {
     thread_id: u64,
     location: Location,
     exception: Option<String>,
+    condition: Option<String>,
 }
 
 impl Worker {
@@ -376,6 +399,19 @@ impl Worker {
                 frame_index,
             } => self.select_frame(thread_id, frame_index)?,
             DebugCommand::Evaluate { expression } => self.evaluate(&expression),
+            DebugCommand::EvaluateWatches { expressions } => self.evaluate_watches(&expressions),
+            DebugCommand::RedefineClasses { classes } => match self.redefine_classes(classes) {
+                Ok(count) => {
+                    let _ = self.events.send(DebugEvent::Status(format!(
+                        "hot swap: {count} classe(s) redefinida(s)"
+                    )));
+                }
+                Err(error) => {
+                    let _ = self
+                        .events
+                        .send(DebugEvent::Error(format!("hot swap: {error}")));
+                }
+            },
             DebugCommand::SetPauseOnExceptions(enable) => {
                 self.set_exception_request(enable)?;
                 let _ = self.events.send(DebugEvent::Status(if enable {
@@ -479,6 +515,7 @@ impl Worker {
                 variables: Vec::new(),
                 location: None,
                 exception: None,
+                condition_error: None,
             })));
             return Ok(());
         };
@@ -492,14 +529,16 @@ impl Worker {
                 id: thread_id,
                 name: format!("thread {thread_id}"),
             });
-        let variables = frames
+        let (variables, locals, this_object_id) = frames
             .first()
-            .map(|frame| self.variables(thread_id, frame).unwrap_or_default())
+            .map(|frame| self.frame_variables(thread_id, frame).unwrap_or_default())
             .unwrap_or_default();
         self.stop = Some(StopContext {
             thread_id,
             frames: frames.clone(),
             variables: variables.clone(),
+            locals,
+            this_object_id,
         });
         let _ = self.events.send(DebugEvent::Stopped(Box::new(StopInfo {
             reason: StopReason::Pause,
@@ -509,6 +548,7 @@ impl Worker {
             variables,
             location,
             exception: None,
+            condition_error: None,
         })));
         Ok(())
     }
@@ -621,8 +661,7 @@ impl Worker {
         self.ensure_class_prepare(&spec.class_name)?;
         let signature = signature_for_class(&spec.class_name);
         let classes = self.classes_by_signature(&signature)?;
-        for type_id in classes {
-            let tag = self.reference_type_tag(type_id).unwrap_or(1);
+        for (tag, type_id) in classes {
             self.resolve_breakpoints_for_type(type_id, tag, &spec.class_name)?;
         }
         if !self
@@ -640,6 +679,7 @@ impl Worker {
             .retain(|pending| pending.path != *path || pending.line != line);
         if let Some(request_ids) = self.requests.remove(&(path.clone(), line)) {
             for request_id in request_ids {
+                self.request_conditions.remove(&request_id);
                 let mut writer = Writer::default();
                 writer.u8(EVENT_BREAKPOINT);
                 writer.u32(request_id);
@@ -663,7 +703,7 @@ impl Worker {
         Ok(())
     }
 
-    fn classes_by_signature(&mut self, signature: &str) -> Result<Vec<u64>, String> {
+    fn classes_by_signature(&mut self, signature: &str) -> Result<Vec<(u8, u64)>, String> {
         let mut writer = Writer::default();
         writer.string(signature);
         let data = self.client.request(1, 2, &writer.data)?;
@@ -671,19 +711,11 @@ impl Worker {
         let count = reader.u32()? as usize;
         let mut classes = Vec::with_capacity(count);
         for _ in 0..count {
-            classes.push(reader.reference_type()?);
+            let tag = reader.u8()?;
+            classes.push((tag, reader.reference_type()?));
             let _status = reader.u32()?;
         }
         Ok(classes)
-    }
-
-    fn reference_type_tag(&mut self, type_id: u64) -> Result<u8, String> {
-        let mut writer = Writer::default();
-        writer.id(type_id, self.client.sizes.reference_type);
-        let data = self.client.request(2, 3, &writer.data)?;
-        let mut reader = Reader::new(&data, self.client.sizes);
-        let modifiers = reader.u32()?;
-        Ok(if modifiers & 0x0200 != 0 { 2 } else { 1 })
     }
 
     fn resolve_breakpoints_for_type(
@@ -791,7 +823,7 @@ impl Worker {
         type_tag: u8,
         method_id: u64,
         index: u64,
-        _target: &BreakpointSpec,
+        target: &BreakpointSpec,
     ) -> Result<u32, String> {
         let mut writer = Writer::default();
         writer.u8(EVENT_BREAKPOINT);
@@ -804,7 +836,10 @@ impl Worker {
         writer.u64(index);
         let data = self.client.request(15, 1, &writer.data)?;
         let mut reader = Reader::new(&data, self.client.sizes);
-        reader.u32()
+        let request_id = reader.u32()?;
+        self.request_conditions
+            .insert(request_id, target.condition.clone());
+        Ok(request_id)
     }
 
     fn handle_composite(&mut self, data: &[u8]) -> Result<bool, String> {
@@ -815,7 +850,7 @@ impl Worker {
         let mut class_prepared = false;
         for _ in 0..count {
             let kind = reader.u8()?;
-            let _request_id = reader.u32()?;
+            let request_id = reader.u32()?;
             match kind {
                 EVENT_CLASS_PREPARE => {
                     let _thread = reader.object()?;
@@ -844,6 +879,7 @@ impl Worker {
                             thread_id,
                             location,
                             exception: None,
+                            condition: self.request_conditions.get(&request_id).cloned().flatten(),
                         });
                     }
                 }
@@ -857,6 +893,7 @@ impl Worker {
                             thread_id,
                             location,
                             exception: None,
+                            condition: None,
                         });
                     }
                 }
@@ -871,6 +908,7 @@ impl Worker {
                             thread_id,
                             location,
                             exception: exception.map(|value| self.format_value(value)),
+                            condition: None,
                         });
                     }
                 }
@@ -896,6 +934,40 @@ impl Worker {
     }
 
     fn gather_stop(&mut self, request: StopRequest) -> Result<(), String> {
+        let mut info = self.build_stop_info(&request)?;
+        if let Some(condition) = request.condition.as_deref() {
+            let locals = self
+                .stop
+                .as_ref()
+                .map(|stop| stop.locals.clone())
+                .unwrap_or_default();
+            let this_object_id = self.stop.as_ref().and_then(|stop| stop.this_object_id);
+            match expr::parse(condition)
+                .and_then(|parsed| self.eval_expr(&parsed, &locals, this_object_id))
+            {
+                Ok(EvalValue::Bool(true)) => {}
+                Ok(EvalValue::Bool(false)) => {
+                    self.stop = None;
+                    self.vm_resume()?;
+                    let _ = self.events.send(DebugEvent::Resumed);
+                    return Ok(());
+                }
+                Ok(other) => {
+                    info.condition_error = Some(format!(
+                        "condição retornou {} (esperado boolean)",
+                        self.display_eval_value(&other)
+                    ));
+                }
+                Err(error) => {
+                    info.condition_error = Some(format!("condição inválida: {error}"));
+                }
+            }
+        }
+        let _ = self.events.send(DebugEvent::Stopped(Box::new(info)));
+        Ok(())
+    }
+
+    fn build_stop_info(&mut self, request: &StopRequest) -> Result<StopInfo, String> {
         let threads = self.all_threads().unwrap_or_default();
         let thread = threads
             .iter()
@@ -917,27 +989,32 @@ impl Worker {
                 method_id: request.location.method_id,
             });
         }
-        let variables = frames
+        let (variables, locals, this_object_id) = frames
             .first()
             .filter(|frame| frame.frame_id != 0)
-            .map(|frame| self.variables(request.thread_id, frame).unwrap_or_default())
+            .map(|frame| {
+                self.frame_variables(request.thread_id, frame)
+                    .unwrap_or_default()
+            })
             .unwrap_or_default();
         let location = frames.first().map(|frame| frame.location.clone());
         self.stop = Some(StopContext {
             thread_id: request.thread_id,
             frames: frames.clone(),
             variables: variables.clone(),
+            locals,
+            this_object_id,
         });
-        let _ = self.events.send(DebugEvent::Stopped(Box::new(StopInfo {
+        Ok(StopInfo {
             reason: request.reason,
             thread,
             threads,
             frames,
             variables,
             location,
-            exception: request.exception,
-        })));
-        Ok(())
+            exception: request.exception.clone(),
+            condition_error: None,
+        })
     }
 
     fn select_frame(&mut self, thread_id: u64, frame_index: usize) -> Result<(), String> {
@@ -947,7 +1024,14 @@ impl Worker {
         let Some(frame) = stop.frames.get(frame_index).cloned() else {
             return Err("frame inválido".to_owned());
         };
-        let variables = self.variables(thread_id, &frame).unwrap_or_default();
+        let (variables, locals, this_object_id) =
+            self.frame_variables(thread_id, &frame).unwrap_or_default();
+        if let Some(stop) = &mut self.stop {
+            stop.thread_id = thread_id;
+            stop.variables = variables.clone();
+            stop.locals = locals;
+            stop.this_object_id = this_object_id;
+        }
         let _ = self.events.send(DebugEvent::Variables {
             frame_index,
             variables,
@@ -1091,25 +1175,27 @@ impl Worker {
             .unwrap_or(0))
     }
 
-    fn variables(
+    fn frame_variables(
         &mut self,
         thread_id: u64,
         frame: &FrameInfo,
-    ) -> Result<Vec<VariableInfo>, String> {
-        let mut variables = self.local_variables(thread_id, frame).unwrap_or_default();
+    ) -> Result<FrameLocals, String> {
+        let (mut variables, locals) = self.local_variables(thread_id, frame)?;
+        let mut this_object_id = None;
         if let Ok(Value::Object { id, .. }) = self.this_object(thread_id, frame) {
             if id != 0 {
+                this_object_id = Some(id);
                 variables.extend(self.object_fields(id).unwrap_or_default());
             }
         }
-        Ok(variables)
+        Ok((variables, locals, this_object_id))
     }
 
     fn local_variables(
         &mut self,
         thread_id: u64,
         frame: &FrameInfo,
-    ) -> Result<Vec<VariableInfo>, String> {
+    ) -> Result<LocalVariables, String> {
         let mut writer = Writer::default();
         writer.id(frame.type_id, self.client.sizes.reference_type);
         writer.id(frame.method_id, self.client.sizes.method);
@@ -1159,7 +1245,7 @@ impl Worker {
             slots.push((name, signature, slot));
         }
         if slots.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), HashMap::new()));
         }
         let mut values = Writer::default();
         values.id(thread_id, self.client.sizes.object);
@@ -1184,18 +1270,21 @@ impl Worker {
             eprintln!("[reclipse-debug]   get values returned {count} value(s)");
         }
         let mut variables = Vec::new();
+        let mut locals = HashMap::new();
         for (name, signature, _) in slots.iter().take(count) {
             let value = reader.value()?;
+            let evaluated = self.eval_value(value.clone());
             variables.push(VariableInfo {
                 name: name.clone(),
                 value: self.format_value(value),
                 type_name: type_name_from_signature(signature),
             });
+            locals.insert(name.clone(), (signature.clone(), evaluated));
             if variables.len() >= 200 {
                 break;
             }
         }
-        Ok(variables)
+        Ok((variables, locals))
     }
 
     fn this_object(&mut self, thread_id: u64, frame: &FrameInfo) -> Result<Value, String> {
@@ -1299,6 +1388,44 @@ impl Worker {
         Ok(variables)
     }
 
+    fn eval_value(&mut self, value: Value) -> EvalValue {
+        match value {
+            Value::Byte(value) => EvalValue::Int(value as i64),
+            Value::Boolean(value) => EvalValue::Bool(value),
+            Value::Char(value) => char::from_u32(value as u32)
+                .map(EvalValue::Char)
+                .unwrap_or(EvalValue::Int(value as i64)),
+            Value::Short(value) => EvalValue::Int(value as i64),
+            Value::Int(value) => EvalValue::Int(value as i64),
+            Value::Long(value) => EvalValue::Int(value),
+            Value::Float(value) => EvalValue::Float(value as f64),
+            Value::Double(value) => EvalValue::Float(value),
+            Value::Void => EvalValue::Null,
+            Value::Object { tag, id } => {
+                if id == 0 {
+                    EvalValue::Null
+                } else if tag == b's' {
+                    EvalValue::String(self.string_value(id).unwrap_or_default())
+                } else {
+                    EvalValue::Object { id }
+                }
+            }
+        }
+    }
+
+    fn string_value(&mut self, id: u64) -> Option<String> {
+        if let Some(text) = self.string_cache.get(&id) {
+            return Some(text.clone());
+        }
+        let mut writer = Writer::default();
+        writer.id(id, self.client.sizes.object);
+        let data = self.client.request(10, 1, &writer.data).ok()?;
+        let mut reader = Reader::new(&data, self.client.sizes);
+        let text = reader.string().ok()?;
+        self.string_cache.insert(id, text.clone());
+        Some(text)
+    }
+
     fn format_value(&mut self, value: Value) -> String {
         let text = match value {
             Value::Byte(value) => value.to_string(),
@@ -1322,17 +1449,8 @@ impl Worker {
             return "null".to_owned();
         }
         if tag == b's' {
-            if let Some(text) = self.string_cache.get(&id) {
-                return format!("\"{}\"", truncate(text, 200));
-            }
-            let mut writer = Writer::default();
-            writer.id(id, self.client.sizes.object);
-            if let Ok(data) = self.client.request(10, 1, &writer.data) {
-                let mut reader = Reader::new(&data, self.client.sizes);
-                if let Ok(text) = reader.string() {
-                    self.string_cache.insert(id, text.clone());
-                    return format!("\"{}\"", truncate(&text, 200));
-                }
+            if let Some(text) = self.string_value(id) {
+                return format!("\"{}\"", truncate(&text, 200));
             }
             return "\"\"".to_owned();
         }
@@ -1354,49 +1472,372 @@ impl Worker {
     }
 
     fn object_signature(&mut self, object_id: u64) -> Option<String> {
-        let type_id = if let Some(type_id) = self.object_type_cache.get(&object_id) {
-            *type_id
-        } else {
-            let mut writer = Writer::default();
-            writer.id(object_id, self.client.sizes.object);
-            let data = self.client.request(9, 1, &writer.data).ok()?;
-            let mut reader = Reader::new(&data, self.client.sizes);
-            let _tag = reader.u8().ok()?;
-            let type_id = reader.reference_type().ok()?;
-            self.object_type_cache.insert(object_id, type_id);
-            type_id
-        };
+        let type_id = self.object_type_id(object_id)?;
         self.type_signature(type_id).ok()
+    }
+
+    fn object_type_id(&mut self, object_id: u64) -> Option<u64> {
+        if let Some(type_id) = self.object_type_cache.get(&object_id) {
+            return Some(*type_id);
+        }
+        let mut writer = Writer::default();
+        writer.id(object_id, self.client.sizes.object);
+        let data = self.client.request(9, 1, &writer.data).ok()?;
+        let mut reader = Reader::new(&data, self.client.sizes);
+        let _tag = reader.u8().ok()?;
+        let type_id = reader.reference_type().ok()?;
+        self.object_type_cache.insert(object_id, type_id);
+        Some(type_id)
     }
 
     fn evaluate(&mut self, expression: &str) {
         let expression = expression.trim();
-        let mut error = None;
-        let mut value = None;
-        if expression.is_empty() {
-            error = Some("expressão vazia".to_owned());
-        } else if let Some(literal) = parse_literal(expression) {
-            value = Some(literal);
-        } else if let Some(stop) = &self.stop {
-            if let Some(variable) = stop
-                .variables
-                .iter()
-                .find(|variable| variable.name == expression)
-            {
-                value = Some(variable.value.clone());
-            } else {
-                error = Some(format!(
-                    "variável `{expression}` não encontrada no frame selecionado"
-                ));
-            }
-        } else {
-            error = Some("a JVM não está pausada".to_owned());
-        }
+        let (value, error) = match self.eval_expression(expression) {
+            Ok(value) => (Some(self.display_eval_value(&value)), None),
+            Err(error) => (None, Some(error)),
+        };
         let _ = self.events.send(DebugEvent::EvaluateResult {
             expression: expression.to_owned(),
             value,
             error,
         });
+    }
+
+    fn evaluate_watches(&mut self, expressions: &[String]) {
+        let mut values = Vec::with_capacity(expressions.len());
+        for expression in expressions {
+            match self.eval_expression(expression) {
+                Ok(value) => values.push(WatchValue {
+                    expression: expression.clone(),
+                    value: Some(self.display_eval_value(&value)),
+                    error: None,
+                }),
+                Err(error) => values.push(WatchValue {
+                    expression: expression.clone(),
+                    value: None,
+                    error: Some(error),
+                }),
+            }
+        }
+        let _ = self.events.send(DebugEvent::WatchValues(values));
+    }
+
+    fn eval_expression(&mut self, expression: &str) -> Result<EvalValue, String> {
+        let parsed = expr::parse(expression)?;
+        let Some(stop) = &self.stop else {
+            return Err("a JVM não está pausada".to_owned());
+        };
+        let locals = stop.locals.clone();
+        let this_object_id = stop.this_object_id;
+        self.eval_expr(&parsed, &locals, this_object_id)
+    }
+
+    fn eval_expr(
+        &mut self,
+        expression: &Expr,
+        locals: &HashMap<String, (String, EvalValue)>,
+        this_object_id: Option<u64>,
+    ) -> Result<EvalValue, String> {
+        match expression {
+            Expr::Literal(literal) => Ok(match literal {
+                Literal::Null => EvalValue::Null,
+                Literal::Bool(value) => EvalValue::Bool(*value),
+                Literal::Int(value) => EvalValue::Int(*value),
+                Literal::Float(value) => EvalValue::Float(*value),
+                Literal::String(value) => EvalValue::String(value.clone()),
+                Literal::Char(value) => EvalValue::Char(*value),
+            }),
+            Expr::Name(name) => {
+                if name == "this" {
+                    return Ok(this_object_id
+                        .map(|id| EvalValue::Object { id })
+                        .unwrap_or(EvalValue::Null));
+                }
+                locals
+                    .get(name)
+                    .map(|(_, value)| value.clone())
+                    .ok_or_else(|| format!("variável `{name}` não encontrada no frame selecionado"))
+            }
+            Expr::Field(base, field) => {
+                let base = self.eval_expr(base, locals, this_object_id)?;
+                self.eval_field(base, field)
+            }
+            Expr::Unary(operator, value) => {
+                let value = self.eval_expr(value, locals, this_object_id)?;
+                match operator {
+                    UnaryOp::Not => match value {
+                        EvalValue::Bool(value) => Ok(EvalValue::Bool(!value)),
+                        other => Err(format!(
+                            "`!` requer boolean, recebeu {}",
+                            self.display_eval_value(&other)
+                        )),
+                    },
+                    UnaryOp::Negate => match self.numeric_value(&value) {
+                        Some(value) => Ok(EvalValue::Float(-value)),
+                        None => Err(format!(
+                            "`-` requer número, recebeu {}",
+                            self.display_eval_value(&value)
+                        )),
+                    },
+                    UnaryOp::Plus => match self.numeric_value(&value) {
+                        Some(_) => Ok(value),
+                        None => Err(format!(
+                            "`+` requer número, recebeu {}",
+                            self.display_eval_value(&value)
+                        )),
+                    },
+                }
+            }
+            Expr::Binary(BinaryOp::And, left, right) => {
+                let left = self.eval_expr(left, locals, this_object_id)?;
+                match left {
+                    EvalValue::Bool(false) => Ok(EvalValue::Bool(false)),
+                    EvalValue::Bool(true) => match self.eval_expr(right, locals, this_object_id)? {
+                        EvalValue::Bool(value) => Ok(EvalValue::Bool(value)),
+                        other => Err(format!(
+                            "`&&` requer boolean, recebeu {}",
+                            self.display_eval_value(&other)
+                        )),
+                    },
+                    other => Err(format!(
+                        "`&&` requer boolean, recebeu {}",
+                        self.display_eval_value(&other)
+                    )),
+                }
+            }
+            Expr::Binary(BinaryOp::Or, left, right) => {
+                let left = self.eval_expr(left, locals, this_object_id)?;
+                match left {
+                    EvalValue::Bool(true) => Ok(EvalValue::Bool(true)),
+                    EvalValue::Bool(false) => {
+                        match self.eval_expr(right, locals, this_object_id)? {
+                            EvalValue::Bool(value) => Ok(EvalValue::Bool(value)),
+                            other => Err(format!(
+                                "`||` requer boolean, recebeu {}",
+                                self.display_eval_value(&other)
+                            )),
+                        }
+                    }
+                    other => Err(format!(
+                        "`||` requer boolean, recebeu {}",
+                        self.display_eval_value(&other)
+                    )),
+                }
+            }
+            Expr::Binary(operator, left, right) => {
+                let left = self.eval_expr(left, locals, this_object_id)?;
+                let right = self.eval_expr(right, locals, this_object_id)?;
+                self.eval_binary(*operator, left, right)
+            }
+        }
+    }
+
+    fn eval_field(&mut self, base: EvalValue, field: &str) -> Result<EvalValue, String> {
+        match base {
+            EvalValue::Object { id } => self.object_field(id, field),
+            EvalValue::Null => Err(format!("não é possível acessar `.{field}` em null")),
+            other => Err(format!(
+                "não é possível acessar `.{field}` em {}",
+                self.display_eval_value(&other)
+            )),
+        }
+    }
+
+    fn eval_binary(
+        &mut self,
+        operator: BinaryOp,
+        left: EvalValue,
+        right: EvalValue,
+    ) -> Result<EvalValue, String> {
+        match operator {
+            BinaryOp::Add => {
+                if matches!(left, EvalValue::String(_)) || matches!(right, EvalValue::String(_)) {
+                    let left = self.display_eval_value(&left);
+                    let right = self.display_eval_value(&right);
+                    return Ok(EvalValue::String(format!("{left}{right}")));
+                }
+                self.numeric_binary(operator, left, right)
+            }
+            BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Remainder => {
+                self.numeric_binary(operator, left, right)
+            }
+            BinaryOp::Equal => Ok(EvalValue::Bool(self.values_equal(&left, &right))),
+            BinaryOp::NotEqual => Ok(EvalValue::Bool(!self.values_equal(&left, &right))),
+            BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
+                let (Some(left), Some(right)) =
+                    (self.numeric_value(&left), self.numeric_value(&right))
+                else {
+                    return Err(format!(
+                        "comparação requer números, recebeu {} e {}",
+                        self.display_eval_value(&left),
+                        self.display_eval_value(&right)
+                    ));
+                };
+                Ok(EvalValue::Bool(match operator {
+                    BinaryOp::Less => left < right,
+                    BinaryOp::LessEqual => left <= right,
+                    BinaryOp::Greater => left > right,
+                    BinaryOp::GreaterEqual => left >= right,
+                    _ => unreachable!(),
+                }))
+            }
+            BinaryOp::And | BinaryOp::Or => unreachable!("short-circuit handled earlier"),
+        }
+    }
+
+    fn numeric_binary(
+        &mut self,
+        operator: BinaryOp,
+        left: EvalValue,
+        right: EvalValue,
+    ) -> Result<EvalValue, String> {
+        let (Some(left_number), Some(right_number)) =
+            (self.numeric_value(&left), self.numeric_value(&right))
+        else {
+            return Err(format!(
+                "operação requer números, recebeu {} e {}",
+                self.display_eval_value(&left),
+                self.display_eval_value(&right)
+            ));
+        };
+        let integral = matches!(left, EvalValue::Int(_) | EvalValue::Char(_))
+            && matches!(right, EvalValue::Int(_) | EvalValue::Char(_));
+        let value = match operator {
+            BinaryOp::Add => left_number + right_number,
+            BinaryOp::Subtract => left_number - right_number,
+            BinaryOp::Multiply => left_number * right_number,
+            BinaryOp::Divide => {
+                if right_number == 0.0 {
+                    return Err("divisão por zero".to_owned());
+                }
+                left_number / right_number
+            }
+            BinaryOp::Remainder => {
+                if right_number == 0.0 {
+                    return Err("resto por zero".to_owned());
+                }
+                left_number % right_number
+            }
+            _ => return Err("operador numérico inválido".to_owned()),
+        };
+        Ok(if integral && value.fract() == 0.0 {
+            EvalValue::Int(value as i64)
+        } else {
+            EvalValue::Float(value)
+        })
+    }
+
+    fn numeric_value(&self, value: &EvalValue) -> Option<f64> {
+        match value {
+            EvalValue::Int(value) => Some(*value as f64),
+            EvalValue::Float(value) => Some(*value),
+            EvalValue::Char(value) => Some(*value as u32 as f64),
+            _ => None,
+        }
+    }
+
+    fn values_equal(&self, left: &EvalValue, right: &EvalValue) -> bool {
+        match (left, right) {
+            (EvalValue::Null, EvalValue::Null) => true,
+            (EvalValue::Null, _) | (_, EvalValue::Null) => false,
+            (EvalValue::Bool(left), EvalValue::Bool(right)) => left == right,
+            (EvalValue::Char(left), EvalValue::Char(right)) => left == right,
+            (EvalValue::String(left), EvalValue::String(right)) => left == right,
+            (EvalValue::Object { id: left }, EvalValue::Object { id: right }) => left == right,
+            _ => match (self.numeric_value(left), self.numeric_value(right)) {
+                (Some(left), Some(right)) => left == right,
+                _ => false,
+            },
+        }
+    }
+
+    fn display_eval_value(&mut self, value: &EvalValue) -> String {
+        match value {
+            EvalValue::Null => "null".to_owned(),
+            EvalValue::Bool(value) => value.to_string(),
+            EvalValue::Int(value) => value.to_string(),
+            EvalValue::Float(value) => value.to_string(),
+            EvalValue::Char(value) => format!("'{value}'"),
+            EvalValue::String(value) => format!("\"{}\"", truncate(value, 200)),
+            EvalValue::Object { id } => self.format_object(b'L', *id),
+        }
+    }
+
+    fn object_field(&mut self, object_id: u64, field: &str) -> Result<EvalValue, String> {
+        let Some(type_id) = self.object_type_id(object_id) else {
+            return Err(format!("objeto {object_id} sem tipo"));
+        };
+        let signature = self.type_signature(type_id).unwrap_or_default();
+        if signature.starts_with('[') && field == "length" {
+            let mut writer = Writer::default();
+            writer.id(object_id, self.client.sizes.object);
+            let data = self.client.request(13, 1, &writer.data)?;
+            let mut reader = Reader::new(&data, self.client.sizes);
+            return Ok(EvalValue::Int(reader.u32()? as i64));
+        }
+        let mut current = type_id;
+        let mut visited = HashSet::new();
+        let mut depth = 0;
+        while current != 0 && depth < 8 && visited.insert(current) {
+            let fields = self.fields(current)?;
+            if let Some(field_info) = fields.iter().find(|field_info| field_info.name == field) {
+                if field_info.is_static {
+                    return Err(format!("campo `{field}` é estático; acesso não suportado"));
+                }
+                let mut writer = Writer::default();
+                writer.id(object_id, self.client.sizes.object);
+                writer.u32(1);
+                writer.id(field_info.id, self.client.sizes.field);
+                let data = self.client.request(9, 2, &writer.data)?;
+                let mut reader = Reader::new(&data, self.client.sizes);
+                let count = reader.u32()? as usize;
+                if count == 0 {
+                    return Err(format!("campo `{field}` sem valor"));
+                }
+                let value = reader.value()?;
+                return Ok(self.eval_value(value));
+            }
+            let mut superclass = Writer::default();
+            superclass.id(current, self.client.sizes.reference_type);
+            match self.client.request(3, 1, &superclass.data) {
+                Ok(data) => {
+                    let mut reader = Reader::new(&data, self.client.sizes);
+                    current = reader.reference_type().unwrap_or(0);
+                }
+                Err(_) => break,
+            }
+            depth += 1;
+        }
+        Err(format!("campo `{field}` não encontrado"))
+    }
+
+    fn redefine_classes(&mut self, classes: Vec<(String, Vec<u8>)>) -> Result<usize, String> {
+        let mut entries: Vec<(u64, Vec<u8>)> = Vec::new();
+        for (name, bytes) in classes {
+            let signature = signature_for_class(&name);
+            let types = self.classes_by_signature(&signature).unwrap_or_default();
+            if std::env::var_os("RECLIPSE_DEBUG_TRACE").is_some() {
+                eprintln!(
+                    "[reclipse-debug] hot swap {name} ({signature}) -> types {types:?}, {} bytes",
+                    bytes.len()
+                );
+            }
+            for (_tag, type_id) in types {
+                entries.push((type_id, bytes.clone()));
+            }
+        }
+        if entries.is_empty() {
+            return Err("nenhuma classe carregada corresponde aos .class compilados".to_owned());
+        }
+        let mut writer = Writer::default();
+        writer.u32(entries.len() as u32);
+        for (type_id, bytes) in &entries {
+            writer.id(*type_id, self.client.sizes.reference_type);
+            writer.u32(bytes.len() as u32);
+            writer.data.extend_from_slice(bytes);
+        }
+        self.client.request(1, 18, &writer.data)?;
+        Ok(entries.len())
     }
 
     fn finish(&mut self) {
@@ -1456,35 +1897,6 @@ fn type_name_from_signature(signature: &str) -> String {
     }
 }
 
-fn parse_literal(expression: &str) -> Option<String> {
-    let trimmed = expression.trim();
-    if trimmed == "null" {
-        return Some("null".to_owned());
-    }
-    if trimmed == "true" || trimmed == "false" {
-        return Some(trimmed.to_owned());
-    }
-    if let Some(inner) = trimmed
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-    {
-        return Some(format!("\"{inner}\""));
-    }
-    if let Some(inner) = trimmed
-        .strip_prefix('\'')
-        .and_then(|value| value.strip_suffix('\''))
-    {
-        return Some(format!("'{inner}'"));
-    }
-    if let Ok(value) = trimmed.parse::<i64>() {
-        return Some(value.to_string());
-    }
-    if let Ok(value) = trimmed.parse::<f64>() {
-        return Some(value.to_string());
-    }
-    None
-}
-
 fn truncate(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_owned();
@@ -1527,14 +1939,6 @@ mod tests {
             type_name_from_signature("Lcom/acme/Outer$Inner;"),
             "com.acme.Outer.Inner"
         );
-    }
-
-    #[test]
-    fn parses_literals() {
-        assert_eq!(parse_literal("42").as_deref(), Some("42"));
-        assert_eq!(parse_literal("true").as_deref(), Some("true"));
-        assert_eq!(parse_literal("\"hi\"").as_deref(), Some("\"hi\""));
-        assert!(parse_literal("user.name").is_none());
     }
 
     #[test]

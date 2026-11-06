@@ -279,7 +279,7 @@ Nada disso substitui aconselhamento jurídico.
 
 - **Build**: invocar wrappers Maven/Gradle com output estruturado; futuramente Tooling API via sidecar.
 - **Testes**: descoberta JUnit 4/5, execução por arquivo/classe, console de resultados.
-- **Debug**: cliente JDWP nativo em `reclipse-debug`, executado em thread separada e conversando com a UI por canais; launch/attach local, breakpoints, stepping, frames, variáveis e exceções. Um adaptador DAP para clientes externos permanece no roadmap.
+- **Debug**: cliente JDWP nativo em `reclipse-debug`, executado em thread separada e conversando com a UI por canais; launch/attach local, breakpoints de linha e condicionais, stepping, frames, variáveis, watches, evaluator de expressões, hot swap e exceções. Um adaptador DAP para clientes externos permanece no roadmap.
 - **Formatting**: google-java-format/Eclipse formatter via sidecar ou implementação nativa futura.
 
 ## 11. Segurança

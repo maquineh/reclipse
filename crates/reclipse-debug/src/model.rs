@@ -14,6 +14,8 @@ pub struct BreakpointSpec {
     pub line: usize,
     /// Binary class name, e.g. `com.acme.App` or `com.acme.App$Inner`.
     pub class_name: String,
+    /// Optional boolean expression evaluated client-side when the breakpoint hits.
+    pub condition: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +46,8 @@ pub enum DebugCommand {
     Disconnect,
     SelectFrame { thread_id: u64, frame_index: usize },
     Evaluate { expression: String },
+    EvaluateWatches { expressions: Vec<String> },
+    RedefineClasses { classes: Vec<(String, Vec<u8>)> },
     SetPauseOnExceptions(bool),
 }
 
@@ -112,6 +116,15 @@ pub struct StopInfo {
     pub variables: Vec<VariableInfo>,
     pub location: Option<SourceLocation>,
     pub exception: Option<String>,
+    /// Present when a conditional breakpoint's expression could not be evaluated.
+    pub condition_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WatchValue {
+    pub expression: String,
+    pub value: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +154,7 @@ pub enum DebugEvent {
         value: Option<String>,
         error: Option<String>,
     },
+    WatchValues(Vec<WatchValue>),
     Exited {
         message: String,
     },
@@ -215,6 +229,12 @@ impl DebugSession {
 
     pub fn send(&self, command: DebugCommand) -> bool {
         self.tx.send(command).is_ok()
+    }
+
+    /// Clone the command sender so background work (e.g. hot swap compilation)
+    /// can talk to the same debug session.
+    pub fn sender(&self) -> Sender<DebugCommand> {
+        self.tx.clone()
     }
 
     pub fn poll(&self) -> Option<DebugEvent> {

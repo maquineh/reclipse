@@ -441,6 +441,32 @@ pub(crate) fn run_piped_stream(
     }
 }
 
+/// Read compiled `.class` files for basic hot swap.
+pub(crate) fn compiled_classes(compiled: &CompileResult) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let root = compiled.classes_dir.path();
+    let mut classes = Vec::new();
+    for file in walkdir_files(root) {
+        if file.extension().and_then(|extension| extension.to_str()) != Some("class") {
+            continue;
+        }
+        let relative = match file.strip_prefix(root) {
+            Ok(relative) => relative,
+            Err(_) => continue,
+        };
+        let mut name = relative.to_string_lossy().replace(['\\', '/'], ".");
+        if let Some(stripped) = name.strip_suffix(".class") {
+            name = stripped.to_owned();
+        }
+        if name.is_empty() || name == "module-info" || name == "package-info" {
+            continue;
+        }
+        let bytes =
+            fs::read(&file).map_err(|error| format!("falha ao ler {}: {error}", file.display()))?;
+        classes.push((name, bytes));
+    }
+    Ok(classes)
+}
+
 /// Discover fully-qualified `main` classes from the syntax index.
 pub fn main_classes(index: &ProjectIndex) -> Vec<String> {
     let mut classes = Vec::new();

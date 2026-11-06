@@ -27,6 +27,7 @@ pub enum Action {
     DebugStepInto,
     DebugStepOut,
     DebugStop,
+    DebugHotSwap,
     ToggleSplit,
     ToggleProject,
     ToggleOutline,

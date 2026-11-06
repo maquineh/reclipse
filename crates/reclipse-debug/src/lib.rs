@@ -4,11 +4,12 @@
 //! polls [`DebugEvent`]s while a background thread owns the JDWP socket and the
 //! target JVM process.
 
+mod expr;
 mod model;
 mod protocol;
 mod session;
 
 pub use model::{
     BreakpointSpec, DebugCommand, DebugEvent, DebugSession, FrameInfo, LaunchSpec, SourceLocation,
-    StepKind, StopInfo, StopReason, ThreadInfo, VariableInfo,
+    StepKind, StopInfo, StopReason, ThreadInfo, VariableInfo, WatchValue,
 };

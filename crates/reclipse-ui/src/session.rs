@@ -63,6 +63,7 @@ pub struct Session {
     pub show_console: bool,
     pub console_history: Vec<String>,
     pub breakpoints: Vec<BreakpointSession>,
+    pub watches: Vec<String>,
     pub font_size: f32,
     pub theme: String,
     pub launch: crate::build::LaunchConfig,
@@ -81,6 +82,7 @@ impl Default for Session {
             show_console: true,
             console_history: Vec::new(),
             breakpoints: Vec::new(),
+            watches: Vec::new(),
             font_size: 14.5,
             theme: "rust-oxide".to_owned(),
             launch: crate::build::LaunchConfig::default(),
@@ -104,6 +106,8 @@ pub struct TabSession {
 pub struct BreakpointSession {
     pub path: PathBuf,
     pub line: usize,
+    #[serde(default)]
+    pub condition: String,
 }
 
 pub fn load() -> Session {
@@ -173,12 +177,15 @@ mod tests {
     #[test]
     fn parses_breakpoints_and_old_sessions() {
         let bytes =
-            br#"{"show_project":true,"breakpoints":[{"path":"C:/work/App.java","line":12}]}"#;
+            br#"{"show_project":true,"breakpoints":[{"path":"C:/work/App.java","line":12,"condition":"i == 3"}],"watches":["i","total + 1"]}"#;
         let session = parse_session(bytes).unwrap();
         assert_eq!(session.breakpoints.len(), 1);
         assert_eq!(session.breakpoints[0].line, 12);
+        assert_eq!(session.breakpoints[0].condition, "i == 3");
+        assert_eq!(session.watches, vec!["i", "total + 1"]);
         let old = br#"{"show_project":false}"#;
         assert!(parse_session(old).unwrap().breakpoints.is_empty());
+        assert!(parse_session(old).unwrap().watches.is_empty());
     }
 
     #[test]

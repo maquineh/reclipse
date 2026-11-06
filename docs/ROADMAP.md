@@ -128,20 +128,22 @@ Entregue:
 
 - cliente JDWP nativo em Rust (`reclipse-debug`) rodando em thread separada, sem congelar a UI;
 - launch de JVM com `-agentlib:jdwp` e `javac -g`, além de attach em `host:porta`;
-- breakpoints de linha pela gutter, persistidos na sessão e resolvidos via `ClassPrepare`;
+- breakpoints de linha e condicionais pela gutter, persistidos na sessão e resolvidos via `ClassPrepare`;
 - stepping (`F5`/`F6`/`F7`/`F8`), pausa (`F12`) e encerramento (`Ctrl+F2`);
 - call stack, threads, variáveis locais, campos de `this`, strings/arrays e objetos formatados;
-- avaliação simples de variável local ou literal;
+- evaluator de expressões (`this.campo`, `obj.campo`, aritmética, comparações e booleanos);
+- watches persistidos e reavaliados a cada parada;
+- hot swap básico via `VirtualMachine.RedefineClasses`;
 - pausa em exceções não capturadas;
 - abertura automática do arquivo/linha ao parar e destaque da linha atual no editor.
 
 Pendente:
 
 - adaptador DAP para clientes externos;
-- breakpoints condicionais, watches e hot swap;
-- expressões compostas (`obj.field`, chamadas) no evaluate;
+- evaluator com chamadas de método, índices de array e campos estáticos;
 - mapeamento preciso de classes anônimas/lambdas e de linhas após tipos aninhados;
-- attach remoto com TLS/autenticação e reconexão.
+- attach remoto com TLS/autenticação e reconexão;
+- validação com Spring Boot real.
 
 Aceite:
 

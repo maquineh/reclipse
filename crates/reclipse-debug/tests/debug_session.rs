@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reclipse_debug::{
     BreakpointSpec, DebugCommand, DebugEvent, DebugSession, LaunchSpec, StepKind, StopReason,
+    WatchValue,
 };
 
 #[test]
@@ -66,6 +67,7 @@ public class DebugTarget {
         path: source_file,
         line: breakpoint_line,
         class_name: "DebugTarget".to_owned(),
+        condition: None,
     }];
     let session = DebugSession::launch(spec, breakpoints, false).expect("session");
     let deadline = Instant::now() + Duration::from_secs(25);
@@ -183,6 +185,7 @@ public class InstanceTarget {
             path: source_file,
             line: breakpoint_line,
             class_name: "InstanceTarget".to_owned(),
+            condition: None,
         }],
         false,
     )
@@ -295,6 +298,7 @@ public class AttachTarget {
             path: source_file,
             line: breakpoint_line,
             class_name: "AttachTarget".to_owned(),
+            condition: None,
         }],
         false,
     )
@@ -349,6 +353,7 @@ public class StepTarget {
             path: source_file.clone(),
             line: breakpoint_line,
             class_name: "StepTarget".to_owned(),
+            condition: None,
         }],
         false,
     )
@@ -393,6 +398,256 @@ public class StepTarget {
     drop(session);
     thread::sleep(Duration::from_millis(100));
     let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn conditional_breakpoint_filters_hits() {
+    if Command::new("javac").arg("-version").output().is_err() {
+        eprintln!("javac unavailable; skipping conditional breakpoint test");
+        return;
+    }
+    let source = r#"
+public class ConditionalTarget {
+    public static void main(String[] args) {
+        int total = 0;
+        for (int i = 0; i < 10; i++) {
+            total += i;
+        }
+        System.out.println("total=" + total);
+    }
+}
+"#;
+    let source = source.trim_start();
+    let breakpoint_line = source
+        .lines()
+        .position(|line| line.contains("total += i"))
+        .map(|line| line + 1)
+        .expect("breakpoint line");
+    let (directory, source_file) = compile_target(source, "ConditionalTarget");
+    let session = DebugSession::launch(
+        launch_spec(&directory, "ConditionalTarget"),
+        vec![BreakpointSpec {
+            path: source_file,
+            line: breakpoint_line,
+            class_name: "ConditionalTarget".to_owned(),
+            condition: Some("i == 3".to_owned()),
+        }],
+        false,
+    )
+    .expect("session");
+    let stopped = wait_for_stop(&session, StopReason::Breakpoint);
+    let i = stopped
+        .variables
+        .iter()
+        .find(|variable| variable.name == "i")
+        .map(|variable| variable.value.as_str());
+    assert_eq!(i, Some("3"), "locals: {:?}", stopped.variables);
+    session.send(DebugCommand::Disconnect);
+    drop(session);
+    thread::sleep(Duration::from_millis(100));
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn evaluates_expressions_and_watches() {
+    if Command::new("javac").arg("-version").output().is_err() {
+        eprintln!("javac unavailable; skipping expression test");
+        return;
+    }
+    let source = r#"
+public class ExprTarget {
+    static class User {
+        final String name;
+        User(String name) { this.name = name; }
+    }
+
+    public static void main(String[] args) {
+        User user = new User("Ada");
+        int total = 0;
+        for (int i = 0; i < 5; i++) {
+            total += i;
+        }
+        System.out.println(user.name + total);
+    }
+}
+"#;
+    let source = source.trim_start();
+    let breakpoint_line = source
+        .lines()
+        .position(|line| line.trim() == "total += i;")
+        .map(|line| line + 1)
+        .expect("breakpoint line");
+    let (directory, source_file) = compile_target(source, "ExprTarget");
+    let session = DebugSession::launch(
+        launch_spec(&directory, "ExprTarget"),
+        vec![BreakpointSpec {
+            path: source_file,
+            line: breakpoint_line,
+            class_name: "ExprTarget".to_owned(),
+            condition: None,
+        }],
+        false,
+    )
+    .expect("session");
+    wait_for_stop(&session, StopReason::Breakpoint);
+
+    session.send(DebugCommand::Evaluate {
+        expression: "1 + 2 * 3".to_owned(),
+    });
+    let (value, error) = wait_for_evaluate(&session, "1 + 2 * 3");
+    assert_eq!(error, None);
+    assert_eq!(value.as_deref(), Some("7"));
+
+    session.send(DebugCommand::Evaluate {
+        expression: "user.name".to_owned(),
+    });
+    let (value, error) = wait_for_evaluate(&session, "user.name");
+    assert_eq!(error, None);
+    assert_eq!(value.as_deref(), Some("\"Ada\""));
+
+    session.send(DebugCommand::Evaluate {
+        expression: "i == 0 && user.name == \"Ada\"".to_owned(),
+    });
+    let (value, error) = wait_for_evaluate(&session, "i == 0 && user.name == \"Ada\"");
+    assert_eq!(error, None);
+    assert_eq!(value.as_deref(), Some("true"));
+
+    session.send(DebugCommand::EvaluateWatches {
+        expressions: vec![
+            "i".to_owned(),
+            "total + 10".to_owned(),
+            "user.name".to_owned(),
+        ],
+    });
+    let watches = wait_for_watches(&session, 3);
+    assert_eq!(watches[0].value.as_deref(), Some("0"));
+    assert_eq!(watches[1].value.as_deref(), Some("10"));
+    assert_eq!(watches[2].value.as_deref(), Some("\"Ada\""));
+
+    session.send(DebugCommand::Disconnect);
+    drop(session);
+    thread::sleep(Duration::from_millis(100));
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn hot_swaps_a_loaded_class() {
+    if Command::new("javac").arg("-version").output().is_err() {
+        eprintln!("javac unavailable; skipping hot swap test");
+        return;
+    }
+    let source_v1 = r#"
+public class HotSwapTarget {
+    public static void main(String[] args) {
+        System.out.println(new HotSwapTarget().version());
+    }
+
+    String version() { return "v1"; }
+}
+"#;
+    let source_v2 = source_v1.replace("\"v1\"", "\"v2\"");
+    let source_v1 = source_v1.trim_start();
+    let breakpoint_line = source_v1
+        .lines()
+        .position(|line| line.contains("System.out.println"))
+        .map(|line| line + 1)
+        .expect("breakpoint line");
+    let (directory, source_file) = compile_target(source_v1, "HotSwapTarget");
+    let session = DebugSession::launch(
+        launch_spec(&directory, "HotSwapTarget"),
+        vec![BreakpointSpec {
+            path: source_file,
+            line: breakpoint_line,
+            class_name: "HotSwapTarget".to_owned(),
+            condition: None,
+        }],
+        false,
+    )
+    .expect("session");
+    wait_for_stop(&session, StopReason::Breakpoint);
+    let (v2_directory, _) = compile_target(source_v2.trim_start(), "HotSwapTarget");
+    let bytes = fs::read(v2_directory.join("classes/HotSwapTarget.class")).unwrap();
+    session.send(DebugCommand::RedefineClasses {
+        classes: vec![("HotSwapTarget".to_owned(), bytes)],
+    });
+    wait_for_status(&session, "hot swap");
+    session.send(DebugCommand::ClearBreakpoint {
+        path: directory.join("HotSwapTarget.java"),
+        line: breakpoint_line,
+    });
+    session.send(DebugCommand::Resume);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut output = String::new();
+    let mut exited = false;
+    while Instant::now() < deadline && !(exited && output.contains("v2")) {
+        while let Some(event) = session.poll() {
+            match event {
+                DebugEvent::Output(line) => {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+                DebugEvent::Exited { .. } => exited = true,
+                DebugEvent::Error(error) => panic!("hot swap error: {error}"),
+                _ => {}
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(output.contains("v2"), "output after hot swap: {output:?}");
+    drop(session);
+    thread::sleep(Duration::from_millis(100));
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::remove_dir_all(v2_directory);
+}
+
+fn wait_for_status(session: &DebugSession, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        while let Some(event) = session.poll() {
+            match event {
+                DebugEvent::Status(text) if text.contains(needle) => return,
+                DebugEvent::Error(error) => panic!("debugger error: {error}"),
+                _ => {}
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("status containing {needle} did not arrive");
+}
+
+fn wait_for_evaluate(session: &DebugSession, expression: &str) -> (Option<String>, Option<String>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        while let Some(event) = session.poll() {
+            if let DebugEvent::EvaluateResult {
+                expression: result_expression,
+                value,
+                error,
+            } = event
+            {
+                if result_expression == expression {
+                    return (value, error);
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("evaluate did not return for {expression}");
+}
+
+fn wait_for_watches(session: &DebugSession, count: usize) -> Vec<WatchValue> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        while let Some(event) = session.poll() {
+            if let DebugEvent::WatchValues(values) = event {
+                if values.len() == count {
+                    return values;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("watches did not return");
 }
 
 fn compile_target(source: &str, class_name: &str) -> (PathBuf, PathBuf) {

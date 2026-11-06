@@ -245,6 +245,14 @@ struct DebugUi {
     breakpoint_errors: Vec<String>,
 }
 
+struct BreakpointConditionEdit {
+    path: PathBuf,
+    line: usize,
+    text: String,
+}
+
+type HotSwapResult = Result<Vec<(String, Vec<u8>)>, String>;
+
 #[cfg_attr(not(feature = "screenshot"), allow(dead_code))]
 struct ScreenshotState {
     path: Option<PathBuf>,
@@ -323,6 +331,13 @@ pub struct ReclipseApp {
     debug_classes: Option<build::CompileResult>,
     debug_pause_exceptions: bool,
     breakpoints: BTreeMap<PathBuf, BTreeSet<usize>>,
+    breakpoint_conditions: HashMap<(PathBuf, usize), String>,
+    breakpoint_condition_edit: Option<BreakpointConditionEdit>,
+    watches: Vec<String>,
+    watch_input: String,
+    watch_results: Vec<reclipse_debug::WatchValue>,
+    hot_swap_running: bool,
+    hot_swap_rx: Option<Receiver<HotSwapResult>>,
     source_signatures: HashMap<String, PathBuf>,
     classpath_view: Option<String>,
     classpath_source: Option<(String, String)>,
@@ -432,6 +447,23 @@ impl ReclipseApp {
                 }
                 map
             },
+            breakpoint_conditions: session
+                .breakpoints
+                .iter()
+                .filter(|breakpoint| !breakpoint.condition.trim().is_empty())
+                .map(|breakpoint| {
+                    (
+                        (breakpoint.path.clone(), breakpoint.line),
+                        breakpoint.condition.clone(),
+                    )
+                })
+                .collect(),
+            breakpoint_condition_edit: None,
+            watches: session.watches.clone(),
+            watch_input: String::new(),
+            watch_results: Vec::new(),
+            hot_swap_running: false,
+            hot_swap_rx: None,
             source_signatures: HashMap::new(),
             classpath_view: None,
             classpath_source: None,
@@ -1219,6 +1251,10 @@ impl ReclipseApp {
                         path: path.clone(),
                         line: *line,
                         class_name,
+                        condition: self
+                            .breakpoint_conditions
+                            .get(&(path.clone(), *line))
+                            .cloned(),
                     });
                 }
             }
@@ -1527,6 +1563,87 @@ impl ReclipseApp {
         }
     }
 
+    fn debug_hot_swap(&mut self) {
+        if self.hot_swap_running {
+            self.toast("Hot swap já está compilando");
+            return;
+        }
+        let Some(debug) = &self.debug else {
+            self.toast("Nenhuma sessão de debug ativa");
+            return;
+        };
+        if !debug.status.is_active() {
+            self.toast("Hot swap requer uma sessão de debug ativa");
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            self.toast("Abra um projeto antes do hot swap");
+            return;
+        };
+        let env = self
+            .classpath_index
+            .as_ref()
+            .map(BuildEnv::from_classpath)
+            .unwrap_or_default();
+        let (sender, receiver) = mpsc::channel();
+        self.hot_swap_rx = Some(receiver);
+        self.hot_swap_running = true;
+        self.log(
+            LogLevel::Info,
+            "Hot swap: recompilando o projeto para redefinir classes carregadas…",
+        );
+        thread::spawn(move || {
+            let cancel = AtomicBool::new(false);
+            let result = match build::compile(&project, &env, &cancel) {
+                Ok(compiled) if compiled.success => build::compiled_classes(&compiled),
+                Ok(compiled) => Err(format!(
+                    "compilação falhou ({} diagnóstico(s))",
+                    compiled.diagnostics.len()
+                )),
+                Err(error) => Err(error),
+            };
+            let _ = sender.send(result);
+        });
+    }
+
+    fn poll_hot_swap(&mut self) {
+        let Some(receiver) = &self.hot_swap_rx else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(classes)) => {
+                self.hot_swap_rx = None;
+                self.hot_swap_running = false;
+                let count = classes.len();
+                if let Some(debug) = &self.debug {
+                    debug
+                        .session
+                        .send(DebugCommand::RedefineClasses { classes });
+                    self.log(
+                        LogLevel::Info,
+                        format!("Hot swap: enviando {count} classe(s) compilada(s)…"),
+                    );
+                } else {
+                    self.log(
+                        LogLevel::Warning,
+                        "Hot swap: sessão encerrada antes de redefinir as classes",
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                self.hot_swap_rx = None;
+                self.hot_swap_running = false;
+                self.log(LogLevel::Error, format!("Hot swap: {error}"));
+                self.toast(format!("Hot swap falhou: {error}"));
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.hot_swap_rx = None;
+                self.hot_swap_running = false;
+            }
+        }
+    }
+
     fn toggle_breakpoint(&mut self, path: PathBuf, line: usize) {
         if line == 0 || !is_java_path(&path) {
             return;
@@ -1556,6 +1673,10 @@ impl ReclipseApp {
                             path: path.clone(),
                             line,
                             class_name,
+                            condition: self
+                                .breakpoint_conditions
+                                .get(&(path.clone(), line))
+                                .cloned(),
                         }));
                 }
             }
@@ -1568,6 +1689,7 @@ impl ReclipseApp {
                 ),
             );
         } else {
+            self.breakpoint_conditions.remove(&(path.clone(), line));
             if let Some(debug) = self.debug.as_ref() {
                 if debug.status.is_active() {
                     debug.session.send(DebugCommand::ClearBreakpoint {
@@ -1584,6 +1706,109 @@ impl ReclipseApp {
                     line
                 ),
             );
+        }
+    }
+
+    fn update_breakpoint_condition(&mut self, path: PathBuf, line: usize, condition: String) {
+        let condition = condition.trim().to_owned();
+        if condition.is_empty() {
+            self.breakpoint_conditions.remove(&(path.clone(), line));
+        } else {
+            self.breakpoint_conditions
+                .insert((path.clone(), line), condition.clone());
+        }
+        if self
+            .breakpoints
+            .get(&path)
+            .is_some_and(|lines| lines.contains(&line))
+        {
+            if let Some(class_name) = self.class_name_for_line(&path, line) {
+                if let Some(debug) = self.debug.as_ref() {
+                    if debug.status.is_active() {
+                        debug.session.send(DebugCommand::ClearBreakpoint {
+                            path: path.clone(),
+                            line,
+                        });
+                        debug
+                            .session
+                            .send(DebugCommand::SetBreakpoint(BreakpointSpec {
+                                path: path.clone(),
+                                line,
+                                class_name,
+                                condition: (!condition.is_empty()).then_some(condition.clone()),
+                            }));
+                    }
+                }
+            }
+        }
+        self.log(
+            LogLevel::Info,
+            if condition.is_empty() {
+                format!(
+                    "Condição removida de {}:{}",
+                    short_file(&path.to_string_lossy()),
+                    line
+                )
+            } else {
+                format!(
+                    "Condição de {}:{}: {condition}",
+                    short_file(&path.to_string_lossy()),
+                    line
+                )
+            },
+        );
+    }
+
+    fn show_breakpoint_condition_dialog(&mut self, ctx: &Context) {
+        let Some(mut edit) = self.breakpoint_condition_edit.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut save = false;
+        let mut remove = false;
+        let mut close = false;
+        egui::Window::new(format!(
+            "Condição — {}:{}",
+            short_file(&edit.path.to_string_lossy()),
+            edit.line
+        ))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_size(egui::vec2(520.0, 140.0))
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(
+                    "Expressão booleana avaliada no frame selecionado. Ex.: i == 3, count > 0 && ready",
+                )
+                .small()
+                .color(theme::muted()),
+            );
+            let response = ui.text_edit_singleline(&mut edit.text);
+            if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
+                save = true;
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Salvar").clicked() {
+                    save = true;
+                }
+                if ui.button("Remover").clicked() {
+                    remove = true;
+                }
+                if ui.button("Fechar").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close {
+            open = false;
+        }
+        if save {
+            self.update_breakpoint_condition(edit.path, edit.line, edit.text);
+        } else if remove {
+            self.update_breakpoint_condition(edit.path, edit.line, String::new());
+        } else if open {
+            self.breakpoint_condition_edit = Some(edit);
         }
     }
 
@@ -1611,10 +1836,13 @@ impl ReclipseApp {
         if events.is_empty() {
             return;
         }
+        let watch_expressions = self.watches.clone();
         let mut logs: Vec<(LogLevel, String)> = Vec::new();
         let mut open: Option<(PathBuf, usize)> = None;
         let mut clear_classes = false;
         let mut toast: Option<String> = None;
+        let mut watch_results_update: Option<Vec<reclipse_debug::WatchValue>> = None;
+        let mut clear_watches = false;
         {
             let signatures = &self.source_signatures;
             let index = self.index.as_ref();
@@ -1651,6 +1879,18 @@ impl ReclipseApp {
                             })
                             .unwrap_or_else(|| "local desconhecido".to_owned());
                         debug.detail = format!("{} · {place}", info.reason.label());
+                        if let Some(error) = &info.condition_error {
+                            debug.detail = format!("{} · condição: {error}", debug.detail);
+                            logs.push((
+                                LogLevel::Warning,
+                                format!("Debug: condição do breakpoint: {error}"),
+                            ));
+                        }
+                        if !watch_expressions.is_empty() {
+                            debug.session.send(DebugCommand::EvaluateWatches {
+                                expressions: watch_expressions.clone(),
+                            });
+                        }
                         logs.push((
                             LogLevel::Warning,
                             format!(
@@ -1682,6 +1922,10 @@ impl ReclipseApp {
                         debug.variables.clear();
                         debug.location = None;
                         debug.paused_thread = None;
+                        clear_watches = true;
+                    }
+                    DebugEvent::WatchValues(values) => {
+                        watch_results_update = Some(values);
                     }
                     DebugEvent::Output(text) => {
                         let lower = text.to_lowercase();
@@ -1742,6 +1986,7 @@ impl ReclipseApp {
                         debug.variables.clear();
                         debug.location = None;
                         clear_classes = true;
+                        clear_watches = true;
                         logs.push((LogLevel::Info, format!("Debug: {message}")));
                         toast = Some(message);
                     }
@@ -1749,6 +1994,7 @@ impl ReclipseApp {
                         debug.status = DebugUiStatus::Failed;
                         debug.detail = error.clone();
                         clear_classes = true;
+                        clear_watches = true;
                         logs.push((LogLevel::Error, format!("Debug: {error}")));
                         toast = Some(error);
                     }
@@ -1764,6 +2010,12 @@ impl ReclipseApp {
         }
         if clear_classes {
             self.debug_classes = None;
+        }
+        if let Some(values) = watch_results_update {
+            self.watch_results = values;
+        }
+        if clear_watches {
+            self.watch_results.clear();
         }
         if let Some((path, line)) = open {
             self.open_at(path, line, 1);
@@ -3418,9 +3670,15 @@ impl ReclipseApp {
                     lines.iter().map(|line| crate::session::BreakpointSession {
                         path: path.clone(),
                         line: *line,
+                        condition: self
+                            .breakpoint_conditions
+                            .get(&(path.clone(), *line))
+                            .cloned()
+                            .unwrap_or_default(),
                     })
                 })
                 .collect(),
+            watches: self.watches.clone(),
             font_size: self.font_size,
             theme: self.theme.config_name().to_owned(),
             launch: self.launch.clone(),
@@ -4507,6 +4765,7 @@ impl ReclipseApp {
                     PaletteEntry::new("Debug: entrar", "F5", Action::DebugStepInto),
                     PaletteEntry::new("Debug: sair", "F7", Action::DebugStepOut),
                     PaletteEntry::new("Debug: encerrar", "Ctrl+F2", Action::DebugStop),
+                    PaletteEntry::new("Debug: hot swap", "", Action::DebugHotSwap),
                     PaletteEntry::new(
                         "Ir para definição",
                         self.keymap.label(KeyAction::GoToDefinition),
@@ -5831,6 +6090,15 @@ impl ReclipseApp {
                             if toolbar_button(ui, "Parar", "Encerrar a sessão de debug") {
                                 actions.push(Action::DebugStop);
                             }
+                            if debug.status.is_active()
+                                && toolbar_button(
+                                    ui,
+                                    "Hot swap",
+                                    "Recompilar e redefinir classes carregadas",
+                                )
+                            {
+                                actions.push(Action::DebugHotSwap);
+                            }
                         } else if toolbar_button(ui, "Debug", "Iniciar debugger JDWP (F11)") {
                             actions.push(Action::Debug);
                         }
@@ -6628,6 +6896,8 @@ impl ReclipseApp {
         let mut select_frame: Option<(u64, usize)> = None;
         let mut open: Option<(PathBuf, usize)> = None;
         let mut remove_breakpoint: Option<(PathBuf, usize)> = None;
+        let mut edit_condition: Option<(PathBuf, usize, String)> = None;
+        let mut hot_swap = false;
         let mut pause_exceptions = debug
             .as_ref()
             .map_or(self.debug_pause_exceptions, |debug| debug.exceptions);
@@ -6777,6 +7047,76 @@ impl ReclipseApp {
                         .color(theme::accent()),
                 );
             }
+            ui.add_space(4.0);
+            ui.label(RichText::new("Watches").small().color(theme::muted()));
+            let mut remove_watch = None;
+            for (index, watch) in self.watches.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("×")
+                        .on_hover_text("Remover watch")
+                        .clicked()
+                    {
+                        remove_watch = Some(index);
+                    }
+                    let result = self
+                        .watch_results
+                        .iter()
+                        .find(|result| result.expression == *watch);
+                    let text = match result {
+                        Some(result) if result.error.is_some() => {
+                            format!("{}: {}", watch, result.error.as_deref().unwrap_or("erro"))
+                        }
+                        Some(result) if result.value.is_some() => {
+                            format!("{} = {}", watch, result.value.as_deref().unwrap_or("?"))
+                        }
+                        _ => format!("{watch} = …"),
+                    };
+                    ui.label(RichText::new(text).size(11.0).monospace().color(
+                        if result.is_some_and(|result| result.error.is_some()) {
+                            theme::red()
+                        } else {
+                            theme::text()
+                        },
+                    ));
+                });
+            }
+            if let Some(index) = remove_watch {
+                self.watches.remove(index);
+                if debug.status == DebugUiStatus::Paused {
+                    debug.session.send(DebugCommand::EvaluateWatches {
+                        expressions: self.watches.clone(),
+                    });
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.watch_input)
+                        .hint_text("watch (ex.: i, total + 1)")
+                        .desired_width(150.0),
+                );
+                if ui.small_button("Adicionar").clicked() && !self.watch_input.trim().is_empty() {
+                    let expression = self.watch_input.trim().to_owned();
+                    if !self.watches.contains(&expression) {
+                        self.watches.push(expression);
+                    }
+                    self.watch_input.clear();
+                    if debug.status == DebugUiStatus::Paused {
+                        debug.session.send(DebugCommand::EvaluateWatches {
+                            expressions: self.watches.clone(),
+                        });
+                    }
+                }
+            });
+            if self.hot_swap_running {
+                ui.label(
+                    RichText::new("hot swap: compilando…")
+                        .size(10.5)
+                        .color(theme::yellow()),
+                );
+            } else if debug.status.is_active() && ui.small_button("Hot swap").clicked() {
+                hot_swap = true;
+            }
             if !debug.breakpoint_errors.is_empty() {
                 for error in debug.breakpoint_errors.iter().rev().take(3) {
                     ui.label(RichText::new(error).size(10.5).color(theme::red()));
@@ -6834,16 +7174,34 @@ impl ReclipseApp {
                         if ui.small_button("×").on_hover_text("Remover").clicked() {
                             remove_breakpoint = Some((path.clone(), line));
                         }
-                        ui.label(
-                            RichText::new(format!(
-                                "{}:{}",
+                        let condition = self
+                            .breakpoint_conditions
+                            .get(&(path.clone(), line))
+                            .cloned()
+                            .unwrap_or_default();
+                        let label = if condition.is_empty() {
+                            format!("{}:{}", short_file(&path.to_string_lossy()), line)
+                        } else {
+                            format!(
+                                "{}:{}  [{}]",
                                 short_file(&path.to_string_lossy()),
-                                line
-                            ))
-                            .size(11.0)
-                            .monospace()
-                            .color(theme::muted()),
+                                line,
+                                truncate_text(&condition, 40)
+                            )
+                        };
+                        ui.label(
+                            RichText::new(label)
+                                .size(11.0)
+                                .monospace()
+                                .color(theme::muted()),
                         );
+                        if ui
+                            .small_button("cond")
+                            .on_hover_text("Editar condição do breakpoint")
+                            .clicked()
+                        {
+                            edit_condition = Some((path.clone(), line, condition));
+                        }
                     });
                 }
             }
@@ -6889,6 +7247,12 @@ impl ReclipseApp {
         }
         if let Some((path, line)) = remove_breakpoint {
             self.toggle_breakpoint(path, line);
+        }
+        if let Some((path, line, text)) = edit_condition {
+            self.breakpoint_condition_edit = Some(BreakpointConditionEdit { path, line, text });
+        }
+        if hot_swap {
+            self.debug_hot_swap();
         }
         if start {
             self.start_debug();
@@ -8205,6 +8569,7 @@ impl ReclipseApp {
             Action::DebugStepInto => self.debug_step(StepKind::Into),
             Action::DebugStepOut => self.debug_step(StepKind::Out),
             Action::DebugStop => self.stop_debug(),
+            Action::DebugHotSwap => self.debug_hot_swap(),
             Action::ToggleSplit => self.toggle_split(),
             Action::ToggleProject => self.show_project = !self.show_project,
             Action::ToggleOutline => self.show_outline = !self.show_outline,
@@ -8407,7 +8772,12 @@ impl ReclipseApp {
                 .get(&path)
                 .is_some_and(|lines| lines.contains(&line));
             if !already {
-                self.toggle_breakpoint(path, line);
+                self.toggle_breakpoint(path.clone(), line);
+            }
+            self.breakpoint_conditions
+                .insert((path, line), "user != null".to_owned());
+            if !self.watches.iter().any(|watch| watch == "user.name") {
+                self.watches.push("user.name".to_owned());
             }
             self.start_debug();
         }
@@ -8653,6 +9023,7 @@ impl eframe::App for ReclipseApp {
         self.poll_build();
         self.poll_javac_diagnostics();
         self.poll_debug();
+        self.poll_hot_swap();
         if self.debug.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -8688,6 +9059,7 @@ impl eframe::App for ReclipseApp {
         self.show_classpath_view(ctx);
         self.show_classpath_source(ctx);
         self.show_launch_dialog(ctx);
+        self.show_breakpoint_condition_dialog(ctx);
         self.show_about(ctx);
         self.show_project_replace_confirm(ctx);
         self.show_recovery(ctx);
@@ -9309,6 +9681,15 @@ fn path_for_location(
             })
             .cloned()
     })
+}
+
+fn truncate_text(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut output: String = text.chars().take(max.saturating_sub(1)).collect();
+    output.push('…');
+    output
 }
 
 fn simple_signature(signature: &str) -> String {
