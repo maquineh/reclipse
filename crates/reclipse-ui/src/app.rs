@@ -36,6 +36,7 @@ use reclipse_plugin_host::{PluginCommand, PluginHost};
 
 use crate::build::{self, BuildEnv};
 use crate::editor_view::Tab;
+use crate::icons::{self, ActionIcon};
 use crate::keymap::{KeyAction, Keymap};
 use crate::palette::{rank, Action, Palette, PaletteEntry, PaletteMode};
 use crate::search::{project_files, FileSearch, ProjectMatch, ProjectSearch};
@@ -6310,107 +6311,195 @@ impl ReclipseApp {
                         ui.spinner();
                         let label = self.build_label.as_deref().unwrap_or("build…");
                         ui.label(RichText::new(label).small().color(theme::yellow()));
-                        if toolbar_button(ui, "Cancelar", "Cancelar build/execução/testes") {
+                        if icons::action_button(
+                            ui,
+                            ActionIcon::Stop,
+                            "Cancelar",
+                            "Cancelar build/execução/testes",
+                        )
+                        .clicked()
+                        {
                             actions.push(Action::CancelBuild);
                         }
                     } else {
-                        let run = ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("Executar").size(12.0).color(theme::bg()),
-                                )
-                                .fill(theme::accent())
-                                .stroke(egui::Stroke::new(1.0, theme::accent())),
-                            )
-                            .on_hover_text("Compilar e executar a classe main (Ctrl+F11)");
-                        if run.clicked() {
+                        if icons::accent_button(
+                            ui,
+                            ActionIcon::Run,
+                            "Executar",
+                            "Compilar e executar a classe main (Ctrl+F11)",
+                        )
+                        .clicked()
+                        {
                             actions.push(Action::Run);
                         }
-                        if toolbar_button(ui, "Compilar", "Compilar com javac") {
+                        if icons::action_button(
+                            ui,
+                            ActionIcon::Compile,
+                            "Compilar",
+                            "Compilar com javac",
+                        )
+                        .clicked()
+                        {
                             actions.push(Action::Compile);
                         }
-                        if toolbar_button(
+                        if icons::action_button(
                             ui,
+                            ActionIcon::Build,
                             "Build",
                             "Compile do Maven/Gradle com output incremental",
-                        ) {
+                        )
+                        .clicked()
+                        {
                             actions.push(Action::BuildCompile);
                         }
-                        if toolbar_button(ui, "Testar", "mvn/gradle test com parser") {
+                        if icons::action_button(
+                            ui,
+                            ActionIcon::Test,
+                            "Testar",
+                            "mvn/gradle test com parser",
+                        )
+                        .clicked()
+                        {
                             actions.push(Action::Test);
                         }
-                        if toolbar_button(ui, "Launch…", "main, args, JVM, env") {
+                        if icons::action_button(
+                            ui,
+                            ActionIcon::Launch,
+                            "Launch…",
+                            "main, args, JVM, env",
+                        )
+                        .clicked()
+                        {
                             actions.push(Action::LaunchConfig);
                         }
                         if let Some(debug) = &self.debug {
                             let status = debug.status;
                             if status == DebugUiStatus::Paused
-                                && toolbar_button(ui, "Continuar", "F8 · resume")
+                                && icons::action_button(
+                                    ui,
+                                    ActionIcon::Continue,
+                                    "Continuar",
+                                    "F8 · resume",
+                                )
+                                .clicked()
                             {
                                 actions.push(Action::DebugContinue);
                             }
                             if status == DebugUiStatus::Paused
-                                && toolbar_button(ui, "Passo", "F6 · step over")
+                                && icons::icon_button(ui, ActionIcon::StepOver, "F6 · step over")
+                                    .clicked()
                             {
                                 actions.push(Action::DebugStepOver);
                             }
                             if status == DebugUiStatus::Paused
-                                && toolbar_button(ui, "Entrar", "F5 · step into")
+                                && icons::icon_button(ui, ActionIcon::StepInto, "F5 · step into")
+                                    .clicked()
                             {
                                 actions.push(Action::DebugStepInto);
                             }
                             if status == DebugUiStatus::Paused
-                                && toolbar_button(ui, "Sair", "F7 · step out")
+                                && icons::icon_button(ui, ActionIcon::StepReturn, "F7 · step out")
+                                    .clicked()
                             {
                                 actions.push(Action::DebugStepOut);
                             }
                             if status == DebugUiStatus::Running
-                                && toolbar_button(ui, "Pausar", "Suspender a JVM (F12)")
+                                && icons::icon_button(
+                                    ui,
+                                    ActionIcon::Pause,
+                                    "Suspender a JVM (F12)",
+                                )
+                                .clicked()
                             {
                                 actions.push(Action::DebugPause);
                             }
-                            if toolbar_button(ui, "Parar", "Encerrar a sessão de debug") {
+                            if icons::icon_button(
+                                ui,
+                                ActionIcon::Stop,
+                                "Encerrar a sessão de debug",
+                            )
+                            .clicked()
+                            {
                                 actions.push(Action::DebugStop);
                             }
                             if debug.status.is_active()
-                                && toolbar_button(
+                                && icons::icon_button(
                                     ui,
-                                    "Hot swap",
+                                    ActionIcon::Restart,
                                     "Recompilar e redefinir classes carregadas",
                                 )
+                                .clicked()
                             {
                                 actions.push(Action::DebugHotSwap);
                             }
-                        } else if toolbar_button(ui, "Debug", "Iniciar debugger JDWP (F11)") {
+                        } else if icons::action_button(
+                            ui,
+                            ActionIcon::Debug,
+                            "Debug",
+                            "Iniciar debugger JDWP (F11)",
+                        )
+                        .clicked()
+                        {
                             actions.push(Action::Debug);
                         }
                     }
                     ui.separator();
-                    if toolbar_button(ui, "Salvar", "Salvar arquivo ativo (Ctrl+S)") {
+                    if icons::action_button(
+                        ui,
+                        ActionIcon::Save,
+                        "Salvar",
+                        "Salvar arquivo ativo (Ctrl+S)",
+                    )
+                    .clicked()
+                    {
                         actions.push(Action::Save);
                     }
-                    if toolbar_button(ui, "Reindexar", "Reindexar projeto (F5)") {
+                    if icons::action_button(
+                        ui,
+                        ActionIcon::Reindex,
+                        "Reindexar",
+                        "Reindexar projeto (F5)",
+                    )
+                    .clicked()
+                    {
                         actions.push(Action::Reindex);
                     }
-                    if toolbar_button(ui, "Buscar", "Buscar no projeto (Ctrl+Shift+F)") {
+                    if icons::action_button(
+                        ui,
+                        ActionIcon::Search,
+                        "Buscar",
+                        "Buscar no projeto (Ctrl+Shift+F)",
+                    )
+                    .clicked()
+                    {
                         actions.push(Action::FindInProject);
                     }
-                    if toolbar_button(ui, "Referências", "Referências (Ctrl+Shift+G)") {
+                    if icons::action_button(
+                        ui,
+                        ActionIcon::References,
+                        "Referências",
+                        "Referências (Ctrl+Shift+G)",
+                    )
+                    .clicked()
+                    {
                         actions.push(Action::FindReferences);
                     }
                     if toolbar_button(ui, "Renomear", "Renomear (Alt+Shift+R)") {
                         actions.push(Action::Rename);
                     }
                     ui.separator();
-                    ui.label(
+                    let java_label = ui.label(
                         RichText::new("JAVA")
                             .monospace()
                             .size(10.0)
                             .color(theme::clr_type()),
                     );
                     if let Some(project) = &self.project {
-                        ui.label(RichText::new(&project.name).small().color(theme::muted()))
-                            .on_hover_text(project.root.display().to_string());
+                        java_label.on_hover_text(format!(
+                            "{} · {}",
+                            project.name,
+                            project.root.display()
+                        ));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new(cp_text).small().color(cp_color));
@@ -7091,11 +7180,7 @@ impl ReclipseApp {
                     .color(theme::muted()),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .small_button("Todos")
-                    .on_hover_text("Executar todos")
-                    .clicked()
-                {
+                if icons::action_button(ui, ActionIcon::Run, "Todos", "Executar todos").clicked() {
                     run = Some(build::TestFilter {
                         class_name: String::new(),
                         method: None,
@@ -7111,11 +7196,7 @@ impl ReclipseApp {
                     .iter()
                     .any(|failure| failure.class_name.as_deref() == Some(&current_class));
                 ui.horizontal(|ui| {
-                    if ui
-                        .small_button("▶")
-                        .on_hover_text("Executar a classe")
-                        .clicked()
-                    {
+                    if icons::icon_button(ui, ActionIcon::Run, "Executar a classe").clicked() {
                         run = Some(build::TestFilter {
                             class_name: current_class.clone(),
                             method: None,
@@ -7144,11 +7225,7 @@ impl ReclipseApp {
             });
             ui.horizontal(|ui| {
                 ui.add_space(10.0);
-                if ui
-                    .small_button("▶")
-                    .on_hover_text("Executar este teste")
-                    .clicked()
-                {
+                if icons::icon_button(ui, ActionIcon::Run, "Executar este teste").clicked() {
                     run = Some(build::TestFilter {
                         class_name: test.class_name.clone(),
                         method: Some(test.method.clone()),
@@ -7210,10 +7287,10 @@ impl ReclipseApp {
                         .color(color),
                 );
                 if debug.status.is_active() {
-                    if ui.small_button("Parar").clicked() {
+                    if icons::icon_button(ui, ActionIcon::Stop, "Encerrar a sessão").clicked() {
                         close = true;
                     }
-                } else if ui.small_button("Limpar").clicked() {
+                } else if icons::icon_button(ui, ActionIcon::Clear, "Limpar sessão").clicked() {
                     close = true;
                 }
             });
@@ -7236,32 +7313,27 @@ impl ReclipseApp {
                         .color(theme::muted()),
                 );
                 ui.horizontal(|ui| {
-                    if ui.small_button("Continuar").on_hover_text("F8").clicked() {
+                    if icons::icon_button(ui, ActionIcon::Continue, "Continuar (F8)").clicked() {
                         command = Some(DebugCommand::Resume);
                     }
-                    if ui
-                        .small_button("Passo")
-                        .on_hover_text("F6 · step over")
+                    if icons::icon_button(ui, ActionIcon::StepOver, "Passo — step over (F6)")
                         .clicked()
                     {
                         command = Some(DebugCommand::Step(StepKind::Over));
                     }
-                    if ui
-                        .small_button("Entrar")
-                        .on_hover_text("F5 · step into")
+                    if icons::icon_button(ui, ActionIcon::StepInto, "Entrar — step into (F5)")
                         .clicked()
                     {
                         command = Some(DebugCommand::Step(StepKind::Into));
                     }
-                    if ui
-                        .small_button("Sair")
-                        .on_hover_text("F7 · step out")
+                    if icons::icon_button(ui, ActionIcon::StepReturn, "Sair — step out (F7)")
                         .clicked()
                     {
                         command = Some(DebugCommand::Step(StepKind::Out));
                     }
                 });
-            } else if debug.status == DebugUiStatus::Running && ui.small_button("Pausar").clicked()
+            } else if debug.status == DebugUiStatus::Running
+                && icons::icon_button(ui, ActionIcon::Pause, "Pausar a JVM").clicked()
             {
                 command = Some(DebugCommand::Pause);
             }
@@ -7433,7 +7505,14 @@ impl ReclipseApp {
                 .color(theme::muted()),
             );
             ui.horizontal(|ui| {
-                if ui.small_button("Debug (F11)").clicked() {
+                if icons::action_button(
+                    ui,
+                    ActionIcon::Debug,
+                    "Debug",
+                    "Iniciar debugger JDWP (F11)",
+                )
+                .clicked()
+                {
                     start = true;
                 }
                 if !self.launch.debug_attach.trim().is_empty() {

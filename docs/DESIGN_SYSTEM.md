@@ -191,11 +191,29 @@ Component implementations live as individual HTML sticker sheet files in
 - **Card** → `@components/card.html`: `card-elevated`, `card-interactive`, `card-interactive-2`
 - **Tabs** → `@components/tabs.html`: `tabs-horizontal`, `tabs-with-icon`
 
+## Ícones de ação
+
+A toolbar, o painel DEBUG e a árvore JUnit usam ícones vetoriais originais
+desenhados em `crates/reclipse-ui/src/icons.rs` com `egui::Painter`:
+
+- **Executar/Continuar**: triângulo play; **Debug**: besouro;
+- **Compilar**: marreta; **Build**: prancheta com check;
+- **Testar**: frasco com líquido e check; **Launch**: play + sliders de configuração;
+- **Step over/into/return**: arcos e setas amarelas; **Pausar**: barras; **Parar**: quadrado;
+- **Hot swap/Reindexar**: setas circulares; **Salvar/Buscar/Referências**: glifos de chrome.
+
+Os desenhos são inspirados nas metáforas do Eclipse/WTP, mas **não copiam**
+assets EPL-2.0; permanecem sob a licença MIT do projeto. Cada ícone carrega a
+cor semântica do tema (verde para run/test, amarelo para step/pause, vermelho
+para stop, accent para build/debug) e o texto mantém a cor de primeiro plano.
+Os botões icon-only usam tooltip com o atalho e a descrição da ação.
+
 ## Implementação atual no Reclipse
 
 O design system está implementado nativamente no shell egui, sem HTML/CSS:
 
 - `crates/reclipse-ui/src/theme.rs`: `ThemeKind` (`RustOxide`, `EclipseCosmic`, `CyberSolar`), as três paletas, o emblema vetorial e os acessores dinâmicos de cor (`accent()`, `panel()`, `clr_keyword()`, ...).
+- `crates/reclipse-ui/src/icons.rs`: ícones vetoriais originais de build, test, launch e debug, com tint semântico por tema e botões com/sem label.
 - `crates/reclipse-ui/src/app.rs`: title bar com emblema, seletor de tema, quick action toolbar, activity bar, breadcrumb, abas com indicador de alteração, console de diagnóstico (`Console`/`Rust Engine`) e status bar.
 - `crates/reclipse-ui/src/editor_view.rs`: linha atual, seleção e destaques de busca derivam da paleta ativa.
 - `session.json`: o campo `theme` persiste `rust-oxide`, `eclipse-cosmic` ou `cyber-solar`; `RECLIPSE_THEME` permite override no startup.

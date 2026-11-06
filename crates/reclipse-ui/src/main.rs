@@ -5,6 +5,7 @@
 mod app;
 mod build;
 mod editor_view;
+mod icons;
 mod jdtls;
 mod keymap;
 mod palette;

@@ -45,6 +45,7 @@ Este repositório contém o **MVP 0.1.0**, o **M1** do editor e a **fundação d
 - **Debugger JDWP nativo**: breakpoints de linha com condição, launch ou attach, stepping (`F5`/`F6`/`F7`/`F8`), call stack, threads, variáveis locais e campos de `this`, watches, evaluator de expressões, hot swap e pausa em exceções não capturadas (`F11`).
 - **Javadoc completo** (`F2`) em uma janela com parágrafos, listas, tags HTML básicas e `{@link}`/`{@code}`; o hover continua mostrando a primeira frase.
 - **Download de sources/Javadoc** via Maven (`dependency:sources` + `dependency:resolve -Dclassifier=javadoc`), com reindexação automática; o hover de tipos externos passa a mostrar a primeira frase do source baixado.
+- **Toolbar e painel DEBUG com ícones vetoriais próprios** para compilar, build, testar, launch e debug (play, besouro, prancheta, frasco, step over/into/return, pause/stop), inspirados nas metáforas do Eclipse/WTP sem copiar assets EPL-2.0.
 - **JUnit inline**: descoberta de testes JUnit 4/5, árvore classe → método no right dock, execução por classe ou método e falhas clicáveis com stack frame.
 - **Editor dividido** com dois painéis e **abas arrastáveis** (drag-and-drop) entre eles.
 - **Organizar imports** (`Ctrl+Shift+I`) e **formatar arquivo** via formatter externo opt-in (`Ctrl+Alt+F`).
@@ -128,6 +129,10 @@ Validação real com Spring Boot 3.5 (Tomcat iniciado, breakpoint em `DemoApplic
 Visualizador de Javadoc completo (`F2`) com parágrafos e inline tags:
 
 ![Javadoc](docs/screenshot-javadoc.png)
+
+Ícones de ação da toolbar e do painel DEBUG (build, test, launch, continue, step over/into/return, pause e stop):
+
+![Ícones de ação](docs/screenshot-toolbar-icons.png)
 
 ## O que ainda não existe
 

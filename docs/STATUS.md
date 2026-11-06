@@ -12,6 +12,7 @@ Atualizado após a validação com Spring Boot e os refinamentos do M2.
 - Rename conservador de tipos, métodos, campos e locais, com atualização de Javadoc e `module-info`.
 - Move de tipo top-level entre pacotes.
 - Javadoc completo (`F2`), download de sources/Javadoc via Maven e JDT LS opt-in com status/reinício.
+- Toolbar, painel DEBUG e JUnit com ícones vetoriais próprios (sem assets EPL do Eclipse).
 
 ### Build, testes e debug (M3/M4)
 
@@ -28,12 +29,12 @@ Atualizado após a validação com Spring Boot e os refinamentos do M2.
 
 ## Validação
 
-- `cargo test --workspace`: **171 testes** aprovados.
+- `cargo test --workspace`: **173 testes** aprovados.
 - `cargo clippy --workspace --all-targets`: sem warnings.
 - `cargo fmt --all -- --check`: limpo.
 - Integração real com JVM: breakpoint, step into/out, exceções, attach, hot swap, classes anônimas e expressões.
 - Spring Boot 3.5 real: Tomcat iniciado e debugger pausado em `DemoApplication.java:13`.
-- Evidências: `docs/screenshot-spring-boot.png`, `docs/screenshot-javadoc.png`, `docs/screenshot-debug.png`.
+- Evidências: `docs/screenshot-spring-boot.png`, `docs/screenshot-javadoc.png`, `docs/screenshot-debug.png`, `docs/screenshot-toolbar-icons.png`.
 
 ## Pendente
 
