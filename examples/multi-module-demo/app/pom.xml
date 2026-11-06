@@ -1,0 +1,16 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>multi-module-demo</artifactId>
+    <version>1.0.0</version>
+  </parent>
+  <artifactId>demo-app</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>demo-core</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+</project>

@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use crate::expr::{self, BinaryOp, Expr, Literal, UnaryOp};
 use crate::model::{
-    BreakpointSpec, DebugCommand, DebugEvent, FrameInfo, LaunchSpec, SourceLocation, StepKind,
-    StopInfo, StopReason, ThreadInfo, VariableInfo, WatchValue,
+    BreakpointSpec, DebugCommand, DebugEvent, ExceptionConfig, FrameInfo, LaunchSpec,
+    SourceLocation, StepKind, StopInfo, StopReason, ThreadInfo, VariableInfo, WatchValue,
 };
 use crate::protocol::{Incoming, JdwpClient, Location, Reader, Value, Writer};
 
@@ -127,8 +127,11 @@ pub(crate) fn run_launch(
         requests: HashMap::new(),
         request_conditions: HashMap::new(),
         class_prepare: HashMap::new(),
-        exception_request: None,
-        pause_on_exceptions,
+        exception_requests: Vec::new(),
+        exception_config: ExceptionConfig {
+            enabled: pause_on_exceptions,
+            ..ExceptionConfig::default()
+        },
         step_request: None,
         stop: None,
         method_cache: HashMap::new(),
@@ -184,8 +187,11 @@ pub(crate) fn run_attach(
         requests: HashMap::new(),
         request_conditions: HashMap::new(),
         class_prepare: HashMap::new(),
-        exception_request: None,
-        pause_on_exceptions,
+        exception_requests: Vec::new(),
+        exception_config: ExceptionConfig {
+            enabled: pause_on_exceptions,
+            ..ExceptionConfig::default()
+        },
         step_request: None,
         stop: None,
         method_cache: HashMap::new(),
@@ -268,8 +274,8 @@ struct Worker {
     request_conditions: HashMap<u32, Option<String>>,
     /// ClassPrepare request IDs keyed by source file name.
     class_prepare: HashMap<String, u32>,
-    exception_request: Option<u32>,
-    pause_on_exceptions: bool,
+    exception_requests: Vec<u32>,
+    exception_config: ExceptionConfig,
     step_request: Option<u32>,
     stop: Option<StopContext>,
     method_cache: HashMap<u64, Vec<MethodInfo>>,
@@ -302,6 +308,8 @@ struct StopRequest {
     thread_id: u64,
     location: Location,
     exception: Option<String>,
+    exception_id: Option<u64>,
+    exception_caught: bool,
     condition: Option<String>,
 }
 
@@ -319,8 +327,9 @@ impl Worker {
                 });
             }
         }
-        if self.pause_on_exceptions {
-            if let Err(error) = self.set_exception_request(true) {
+        if self.exception_config.enabled {
+            let config = self.exception_config.clone();
+            if let Err(error) = self.apply_exception_config(config) {
                 let _ = self.events.send(DebugEvent::Status(format!(
                     "não foi possível pausar em exceções: {error}"
                 )));
@@ -329,6 +338,23 @@ impl Worker {
         let _ = self.events.send(DebugEvent::Started {
             description: description.clone(),
         });
+        // Apply configuration sent right after launch (e.g. exception filters)
+        // before the debuggee runs, so early throws are not missed.
+        loop {
+            match self.commands.try_recv() {
+                Ok(command) => {
+                    if self.handle_command(command)? {
+                        self.finish();
+                        return Ok(());
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.cleanup();
+                    return Ok(());
+                }
+            }
+        }
         if self.resume_after_start {
             self.vm_resume()?;
             let _ = self.events.send(DebugEvent::Resumed);
@@ -421,9 +447,20 @@ impl Worker {
                 }
             },
             DebugCommand::SetPauseOnExceptions(enable) => {
-                self.set_exception_request(enable)?;
+                let mut config = self.exception_config.clone();
+                config.enabled = enable;
+                self.apply_exception_config(config)?;
                 let _ = self.events.send(DebugEvent::Status(if enable {
                     "pausa em exceções não capturadas habilitada".to_owned()
+                } else {
+                    "pausa em exceções desabilitada".to_owned()
+                }));
+            }
+            DebugCommand::SetExceptionConfig(config) => {
+                let enabled = config.enabled;
+                self.apply_exception_config(config)?;
+                let _ = self.events.send(DebugEvent::Status(if enabled {
+                    "filtro de exceções atualizado".to_owned()
                 } else {
                     "pausa em exceções desabilitada".to_owned()
                 }));
@@ -599,19 +636,18 @@ impl Worker {
         Ok(())
     }
 
-    fn set_exception_request(&mut self, enable: bool) -> Result<(), String> {
-        if !enable {
-            if let Some(request_id) = self.exception_request.take() {
-                let mut writer = Writer::default();
-                writer.u8(EVENT_EXCEPTION);
-                writer.u32(request_id);
-                let _ = self.client.request(15, 2, &writer.data);
-            }
-            self.pause_on_exceptions = false;
-            return Ok(());
+    /// (Re)create the VM-wide exception request from `config`. Type filtering
+    /// happens client-side in [`Self::gather_stop`] so not-yet-loaded classes
+    /// still match once thrown.
+    fn apply_exception_config(&mut self, config: ExceptionConfig) -> Result<(), String> {
+        for request_id in self.exception_requests.drain(..) {
+            let mut writer = Writer::default();
+            writer.u8(EVENT_EXCEPTION);
+            writer.u32(request_id);
+            let _ = self.client.request(15, 2, &writer.data);
         }
-        if self.exception_request.is_some() {
-            self.pause_on_exceptions = true;
+        self.exception_config = config.clone();
+        if !config.enabled {
             return Ok(());
         }
         let mut writer = Writer::default();
@@ -620,12 +656,11 @@ impl Worker {
         writer.u32(1);
         writer.u8(MOD_EXCEPTION_ONLY);
         writer.id(0, self.client.sizes.reference_type);
-        writer.u8(0);
-        writer.u8(1);
+        writer.u8(u8::from(config.caught));
+        writer.u8(u8::from(config.uncaught));
         let data = self.client.request(15, 1, &writer.data)?;
         let mut reader = Reader::new(&data, self.client.sizes);
-        self.exception_request = Some(reader.u32()?);
-        self.pause_on_exceptions = true;
+        self.exception_requests.push(reader.u32()?);
         Ok(())
     }
 
@@ -944,6 +979,8 @@ impl Worker {
                             thread_id,
                             location,
                             exception: None,
+                            exception_id: None,
+                            exception_caught: false,
                             condition: self.request_conditions.get(&request_id).cloned().flatten(),
                         });
                     }
@@ -958,6 +995,8 @@ impl Worker {
                             thread_id,
                             location,
                             exception: None,
+                            exception_id: None,
+                            exception_caught: false,
                             condition: None,
                         });
                     }
@@ -966,13 +1005,23 @@ impl Worker {
                     let thread_id = reader.object()?;
                     let location = reader.location()?;
                     let exception = reader.tagged_object().ok();
-                    let _catch = reader.location().ok();
+                    // Null catch location (all-zero) means the exception is uncaught.
+                    let caught = reader
+                        .location()
+                        .ok()
+                        .is_some_and(|catch| catch.type_id != 0 || catch.method_id != 0);
+                    let exception_id = exception.as_ref().and_then(|value| match value {
+                        Value::Object { id, .. } if *id != 0 => Some(*id),
+                        _ => None,
+                    });
                     if stop_request.is_none() {
                         stop_request = Some(StopRequest {
                             reason: StopReason::Exception,
                             thread_id,
                             location,
                             exception: exception.map(|value| self.format_value(value)),
+                            exception_id,
+                            exception_caught: caught,
                             condition: None,
                         });
                     }
@@ -999,6 +1048,11 @@ impl Worker {
     }
 
     fn gather_stop(&mut self, request: StopRequest) -> Result<(), String> {
+        if request.reason == StopReason::Exception && !self.exception_matches(&request) {
+            self.stop = None;
+            self.vm_resume()?;
+            return Ok(());
+        }
         let mut info = self.build_stop_info(&request)?;
         if let Some(condition) = request.condition.as_deref() {
             let locals = self
@@ -1562,6 +1616,58 @@ impl Worker {
         let type_id = reader.reference_type().ok()?;
         self.object_type_cache.insert(object_id, type_id);
         Some(type_id)
+    }
+
+    /// Client-side exception filter: caught/uncaught flags plus class-name
+    /// filters (subclasses match). Unresolvable exceptions are shown rather
+    /// than hidden.
+    fn exception_matches(&mut self, request: &StopRequest) -> bool {
+        if request.exception_caught && !self.exception_config.caught {
+            return false;
+        }
+        if !request.exception_caught && !self.exception_config.uncaught {
+            return false;
+        }
+        let filters = self.exception_config.types.clone();
+        if filters.is_empty() {
+            return true;
+        }
+        let Some(id) = request.exception_id else {
+            return true;
+        };
+        self.exception_type_matches(id, &filters)
+    }
+
+    fn exception_type_matches(&mut self, object_id: u64, filters: &[String]) -> bool {
+        let Some(mut type_id) = self.object_type_id(object_id) else {
+            return true;
+        };
+        let mut visited = HashSet::new();
+        for _ in 0..8 {
+            if !visited.insert(type_id) || type_id == 0 {
+                break;
+            }
+            if let Ok(signature) = self.type_signature(type_id) {
+                if let Some(name) = class_name_from_signature(&signature) {
+                    if filters
+                        .iter()
+                        .any(|filter| exception_name_matches(&name, filter))
+                    {
+                        return true;
+                    }
+                }
+            }
+            let mut writer = Writer::default();
+            writer.id(type_id, self.client.sizes.reference_type);
+            match self.client.request(3, 1, &writer.data) {
+                Ok(data) => {
+                    let mut reader = Reader::new(&data, self.client.sizes);
+                    type_id = reader.reference_type().unwrap_or(0);
+                }
+                Err(_) => break,
+            }
+        }
+        false
     }
 
     fn evaluate(&mut self, expression: &str) {
@@ -2475,6 +2581,27 @@ fn package_prefix(class_name: &str) -> &str {
 fn class_name_from_signature(signature: &str) -> Option<String> {
     let signature = signature.strip_prefix('L')?.strip_suffix(';')?;
     Some(signature.replace('/', "."))
+}
+
+/// Match an exception class (`java.lang.NullPointerException`) against a
+/// user filter (`NullPointerException`, `java.lang.NullPointerException`).
+fn exception_name_matches(class_name: &str, filter: &str) -> bool {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return false;
+    }
+    let filter = filter.replace('/', ".").replace('$', ".");
+    if class_name == filter {
+        return true;
+    }
+    if class_name.ends_with(&format!(".{filter}")) {
+        return true;
+    }
+    // Bare names also match `java.lang` (e.g. `NullPointerException`).
+    if !filter.contains('.') {
+        return class_name == format!("java.lang.{filter}");
+    }
+    false
 }
 
 fn type_name_from_signature(signature: &str) -> String {

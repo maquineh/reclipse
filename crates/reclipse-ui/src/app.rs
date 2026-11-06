@@ -17,8 +17,8 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use reclipse_classpath::{ClasspathIndex, ClasspathStats};
 use reclipse_core::{discover_project, Project, IGNORED_DIRS};
 use reclipse_debug::{
-    BreakpointSpec, DebugCommand, DebugEvent, DebugSession, FrameInfo, SourceLocation, StepKind,
-    ThreadInfo, VariableInfo,
+    BreakpointSpec, DebugCommand, DebugEvent, DebugSession, ExceptionConfig, FrameInfo,
+    SourceLocation, StepKind, ThreadInfo, VariableInfo,
 };
 use reclipse_editor::{Document, SearchMatcher, SearchOptions};
 use reclipse_java::refactor::{
@@ -360,6 +360,9 @@ pub struct ReclipseApp {
     debug: Option<DebugUi>,
     debug_classes: Option<build::CompileResult>,
     debug_pause_exceptions: bool,
+    debug_exception_caught: bool,
+    debug_exception_uncaught: bool,
+    debug_exception_types: String,
     breakpoints: BTreeMap<PathBuf, BTreeSet<usize>>,
     breakpoint_conditions: HashMap<(PathBuf, usize), String>,
     breakpoint_condition_edit: Option<BreakpointConditionEdit>,
@@ -467,6 +470,9 @@ impl ReclipseApp {
             debug: None,
             debug_classes: None,
             debug_pause_exceptions: false,
+            debug_exception_caught: false,
+            debug_exception_uncaught: true,
+            debug_exception_types: String::new(),
             breakpoints: {
                 let mut map: BTreeMap<PathBuf, BTreeSet<usize>> = BTreeMap::new();
                 for breakpoint in &session.breakpoints {
@@ -1531,6 +1537,7 @@ impl ReclipseApp {
                         breakpoint_errors: Vec::new(),
                     });
                     self.toast(format!("Conectando o debugger em {address}"));
+                    self.send_exception_config();
                 }
                 Err(error) => {
                     self.log(LogLevel::Error, format!("Debug: {error}"));
@@ -1599,6 +1606,30 @@ impl ReclipseApp {
                 let _ = sender.send(BuildMessage::Failed(error));
             }
         });
+    }
+
+    /// Current exception filter from the panel fields.
+    fn exception_config(&self) -> ExceptionConfig {
+        ExceptionConfig {
+            enabled: self.debug_pause_exceptions,
+            caught: self.debug_exception_caught,
+            uncaught: self.debug_exception_uncaught,
+            types: self
+                .debug_exception_types
+                .split([',', ';'])
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
+
+    fn send_exception_config(&mut self) {
+        if let Some(debug) = &self.debug {
+            debug
+                .session
+                .send(DebugCommand::SetExceptionConfig(self.exception_config()));
+        }
     }
 
     fn debug_continue(&mut self) {
@@ -2464,6 +2495,7 @@ impl ReclipseApp {
                         LogLevel::Info,
                         format!("Debug {main}: aguardando eventos da JVM…"),
                     );
+                    self.send_exception_config();
                 }
                 BuildMessage::RunFinished { compile, run, main } => {
                     self.flush_build_output();
@@ -7491,7 +7523,36 @@ impl ReclipseApp {
                 .checkbox(&mut pause_exceptions, "Pausar em exceções")
                 .changed()
             {
-                command = Some(DebugCommand::SetPauseOnExceptions(pause_exceptions));
+                self.debug_pause_exceptions = pause_exceptions;
+                self.send_exception_config();
+            }
+            if pause_exceptions {
+                ui.horizontal(|ui| {
+                    if ui
+                        .checkbox(&mut self.debug_exception_uncaught, "não capturadas")
+                        .on_hover_text("Pausar em exceções não capturadas")
+                        .changed()
+                    {
+                        self.send_exception_config();
+                    }
+                    if ui
+                        .checkbox(&mut self.debug_exception_caught, "capturadas")
+                        .on_hover_text("Pausar também em exceções capturadas (try/catch)")
+                        .changed()
+                    {
+                        self.send_exception_config();
+                    }
+                });
+                let types_response = ui.add(
+                    egui::TextEdit::singleline(&mut self.debug_exception_types)
+                        .hint_text("tipos, ex.: NullPointerException, java.io.IOException")
+                        .desired_width(220.0),
+                );
+                if types_response.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                {
+                    self.send_exception_config();
+                }
             }
         } else {
             let count: usize = self.breakpoints.values().map(BTreeSet::len).sum();
@@ -7528,6 +7589,17 @@ impl ReclipseApp {
                 .changed()
             {
                 self.debug_pause_exceptions = pause_exceptions;
+            }
+            if pause_exceptions {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.debug_exception_uncaught, "não capturadas");
+                    ui.checkbox(&mut self.debug_exception_caught, "capturadas");
+                });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.debug_exception_types)
+                        .hint_text("tipos, ex.: NullPointerException, java.io.IOException")
+                        .desired_width(220.0),
+                );
             }
         }
 

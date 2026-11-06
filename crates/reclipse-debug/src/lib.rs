@@ -10,6 +10,6 @@ mod protocol;
 mod session;
 
 pub use model::{
-    BreakpointSpec, DebugCommand, DebugEvent, DebugSession, FrameInfo, LaunchSpec, SourceLocation,
-    StepKind, StopInfo, StopReason, ThreadInfo, VariableInfo, WatchValue,
+    BreakpointSpec, DebugCommand, DebugEvent, DebugSession, ExceptionConfig, FrameInfo, LaunchSpec,
+    SourceLocation, StepKind, StopInfo, StopReason, ThreadInfo, VariableInfo, WatchValue,
 };

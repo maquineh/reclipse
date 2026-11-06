@@ -47,7 +47,8 @@ Atualizado após a validação com Spring Boot e os refinamentos do M2.
 - Avaliação de chamadas de método/índices de array no debugger (entregue:
   `arr[i]` via ArrayReference, `obj.m()`/`Classe.stat()` via InvokeMethod,
   overloads por compatibilidade, rejeição em condições).
-- Debugger 100% validado em projetos multi-módulo.
+- Debugger validado em multi-módulo Maven via teste `steps_across_maven_modules`
+  e matriz em `docs/VALIDATION.md`; falta Gradle real e matriz de JVMs.
 
 ## Como verificar
 

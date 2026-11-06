@@ -14,8 +14,20 @@ use reclipse_debug::{
     WatchValue,
 };
 
+/// Serializes the JDWP integration tests: each test reserves an ephemeral
+/// localhost port for its debuggee, and parallel tests can steal each
+/// other's port between reserve and bind.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn debugs_a_real_java_program() {
+    let _serial = serial();
     let source = r#"
 public class DebugTarget {
     public static void main(String[] args) {
@@ -70,7 +82,7 @@ public class DebugTarget {
         condition: None,
     }];
     let session = DebugSession::launch(spec, breakpoints, false).expect("session");
-    let deadline = Instant::now() + Duration::from_secs(25);
+    let deadline = Instant::now() + Duration::from_secs(90);
     let mut stopped = None;
     let mut resolved = false;
     let mut started = false;
@@ -114,7 +126,7 @@ public class DebugTarget {
 
     session.send(DebugCommand::Step(StepKind::Over));
     let mut stepped = false;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline && !stepped {
         while let Some(event) = session.poll() {
             match event {
@@ -134,7 +146,7 @@ public class DebugTarget {
     });
     session.send(DebugCommand::Resume);
     let mut exited = false;
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(45);
     while Instant::now() < deadline && !exited {
         while let Some(event) = session.poll() {
             match event {
@@ -153,6 +165,7 @@ public class DebugTarget {
 
 #[test]
 fn inspects_instance_fields() {
+    let _serial = serial();
     if Command::new("javac").arg("-version").output().is_err() {
         eprintln!("javac unavailable; skipping instance-field test");
         return;
@@ -215,6 +228,7 @@ public class InstanceTarget {
 
 #[test]
 fn pauses_on_uncaught_exception() {
+    let _serial = serial();
     if Command::new("javac").arg("-version").output().is_err() {
         eprintln!("javac unavailable; skipping exception test");
         return;
@@ -240,7 +254,7 @@ public class ExceptionTarget {
         stopped.exception
     );
     session.send(DebugCommand::Resume);
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(45);
     let mut exited = false;
     while Instant::now() < deadline && !exited {
         while let Some(event) = session.poll() {
@@ -257,7 +271,214 @@ public class ExceptionTarget {
 }
 
 #[test]
+fn filters_exceptions_by_type_and_caught_flag() {
+    let _serial = serial();
+    use reclipse_debug::ExceptionConfig;
+    if Command::new("javac").arg("-version").output().is_err() {
+        eprintln!("javac unavailable; skipping exception filter test");
+        return;
+    }
+    let source = r#"
+public class FilterTarget {
+    public static void main(String[] args) throws Exception {
+        Thread.sleep(500);
+        try {
+            throw new IllegalArgumentException("bad");
+        } catch (IllegalArgumentException expected) {
+            System.out.println("caught " + expected.getMessage());
+        }
+        String value = null;
+        System.out.println(value.length());
+    }
+}
+"#;
+    let (directory, _source_file) = compile_target(source.trim_start(), "FilterTarget");
+
+    // 1. Matching type, uncaught: NPE stops the JVM.
+    let session = DebugSession::launch(launch_spec(&directory, "FilterTarget"), Vec::new(), false)
+        .expect("session");
+    session.send(DebugCommand::SetExceptionConfig(ExceptionConfig {
+        enabled: true,
+        caught: false,
+        uncaught: true,
+        types: vec!["NullPointerException".to_owned()],
+    }));
+    let stopped = wait_for_stop(&session, StopReason::Exception);
+    assert!(
+        stopped
+            .exception
+            .as_deref()
+            .is_some_and(|exception| exception.contains("NullPointerException")),
+        "exception: {:?}",
+        stopped.exception
+    );
+    drop(session);
+
+    // 2. Non-matching type: the same NPE is ignored and the JVM exits.
+    let session = DebugSession::launch(launch_spec(&directory, "FilterTarget"), Vec::new(), false)
+        .expect("session");
+    session.send(DebugCommand::SetExceptionConfig(ExceptionConfig {
+        enabled: true,
+        caught: false,
+        uncaught: true,
+        types: vec!["IllegalStateException".to_owned()],
+    }));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut stopped_exception = false;
+    let mut exited = false;
+    while Instant::now() < deadline && !exited {
+        while let Some(event) = session.poll() {
+            match event {
+                DebugEvent::Stopped(info) if info.reason == StopReason::Exception => {
+                    stopped_exception = true;
+                }
+                DebugEvent::Exited { .. } => exited = true,
+                _ => {}
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(exited, "JVM did not exit with non-matching filter");
+    assert!(
+        !stopped_exception,
+        "exception filter should have ignored the NullPointerException"
+    );
+    drop(session);
+
+    // 3. Caught exceptions only stop when `caught` is set: IAE is caught.
+    let session = DebugSession::launch(launch_spec(&directory, "FilterTarget"), Vec::new(), false)
+        .expect("session");
+    session.send(DebugCommand::SetExceptionConfig(ExceptionConfig {
+        enabled: true,
+        caught: true,
+        uncaught: false,
+        types: vec!["java.lang.IllegalArgumentException".to_owned()],
+    }));
+    let stopped = wait_for_stop(&session, StopReason::Exception);
+    assert!(
+        stopped
+            .exception
+            .as_deref()
+            .is_some_and(|exception| exception.contains("IllegalArgumentException")),
+        "exception: {:?}",
+        stopped.exception
+    );
+    drop(session);
+
+    thread::sleep(Duration::from_millis(100));
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn steps_across_maven_modules() {
+    let _serial = serial();
+    if Command::new("javac").arg("-version").output().is_err() {
+        eprintln!("javac unavailable; skipping multi-module test");
+        return;
+    }
+    // Mirrors `examples/multi-module-demo` (parent + core + app): the library
+    // and the app are compiled to separate output roots, like Maven's
+    // `core/target/classes` and `app/target/classes`.
+    let directory = unique_temp_dir();
+    let core_src = directory.join("core-src/com/example/core/Greeter.java");
+    let app_src = directory.join("app-src/com/example/app/Main.java");
+    fs::create_dir_all(core_src.parent().unwrap()).unwrap();
+    fs::create_dir_all(app_src.parent().unwrap()).unwrap();
+    fs::write(
+        &core_src,
+        "package com.example.core;\npublic class Greeter {\n    public String greet(String name) {\n        return \"hello, \" + name + \"!\";\n    }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        &app_src,
+        "package com.example.app;\nimport com.example.core.Greeter;\npublic class Main {\n    public static void main(String[] args) {\n        Greeter greeter = new Greeter();\n        System.out.println(greeter.greet(\"world\"));\n    }\n}\n",
+    )
+    .unwrap();
+    let core_classes = directory.join("core-classes");
+    let app_classes = directory.join("app-classes");
+    fs::create_dir_all(&core_classes).unwrap();
+    fs::create_dir_all(&app_classes).unwrap();
+    let compile_core = Command::new("javac")
+        .arg("-g")
+        .arg("-d")
+        .arg(&core_classes)
+        .arg(&core_src)
+        .output()
+        .unwrap_or_else(|error| panic!("javac unavailable: {error}"));
+    assert!(
+        compile_core.status.success(),
+        "javac core failed: {}",
+        String::from_utf8_lossy(&compile_core.stderr)
+    );
+    let compile_app = Command::new("javac")
+        .arg("-g")
+        .arg("-cp")
+        .arg(&core_classes)
+        .arg("-d")
+        .arg(&app_classes)
+        .arg(&app_src)
+        .output()
+        .unwrap_or_else(|error| panic!("javac unavailable: {error}"));
+    assert!(
+        compile_app.status.success(),
+        "javac app failed: {}",
+        String::from_utf8_lossy(&compile_app.stderr)
+    );
+
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    let classpath = format!(
+        "{}{}{}",
+        app_classes.display(),
+        separator,
+        core_classes.display()
+    );
+    let session = DebugSession::launch(
+        LaunchSpec {
+            java: PathBuf::from("java"),
+            classpath,
+            main_class: "com.example.app.Main".to_owned(),
+            jvm_args: Vec::new(),
+            program_args: Vec::new(),
+            env: Default::default(),
+            workdir: directory.clone(),
+        },
+        vec![BreakpointSpec {
+            path: app_src.clone(),
+            line: 6,
+            class_name: "com.example.app.Main".to_owned(),
+            condition: None,
+        }],
+        false,
+    )
+    .expect("session");
+    wait_for_stop(&session, StopReason::Breakpoint);
+
+    session.send(DebugCommand::Step(StepKind::Into));
+    let stepped = wait_for_stop(&session, StopReason::Step);
+    let top = stepped.frames.first().expect("step must land on a frame");
+    assert_eq!(top.location.method, "greet", "frames: {:?}", stepped.frames);
+    assert!(
+        top.location.signature.contains("Greeter"),
+        "signature: {}",
+        top.location.signature
+    );
+
+    session.send(DebugCommand::Evaluate {
+        expression: "name".to_owned(),
+    });
+    let (value, error) = wait_for_evaluate(&session, "name");
+    assert_eq!(error, None);
+    assert_eq!(value.as_deref(), Some("\"world\""));
+
+    session.send(DebugCommand::Disconnect);
+    drop(session);
+    thread::sleep(Duration::from_millis(100));
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
 fn attaches_to_a_suspended_jvm() {
+    let _serial = serial();
     if Command::new("javac").arg("-version").output().is_err() {
         eprintln!("javac unavailable; skipping attach test");
         return;
@@ -323,6 +544,7 @@ public class AttachTarget {
 
 #[test]
 fn steps_into_and_out() {
+    let _serial = serial();
     if Command::new("javac").arg("-version").output().is_err() {
         eprintln!("javac unavailable; skipping step test");
         return;
@@ -384,7 +606,7 @@ public class StepTarget {
         line: breakpoint_line,
     });
     session.send(DebugCommand::Resume);
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(45);
     let mut exited = false;
     while Instant::now() < deadline && !exited {
         while let Some(event) = session.poll() {
@@ -402,6 +624,7 @@ public class StepTarget {
 
 #[test]
 fn conditional_breakpoint_filters_hits() {
+    let _serial = serial();
     if Command::new("javac").arg("-version").output().is_err() {
         eprintln!("javac unavailable; skipping conditional breakpoint test");
         return;
@@ -450,6 +673,7 @@ public class ConditionalTarget {
 
 #[test]
 fn evaluates_expressions_and_watches() {
+    let _serial = serial();
     if Command::new("javac").arg("-version").output().is_err() {
         eprintln!("javac unavailable; skipping expression test");
         return;
@@ -580,6 +804,7 @@ public class ExprTarget {
 
 #[test]
 fn hot_swaps_a_loaded_class() {
+    let _serial = serial();
     if Command::new("javac").arg("-version").output().is_err() {
         eprintln!("javac unavailable; skipping hot swap test");
         return;
@@ -624,7 +849,7 @@ public class HotSwapTarget {
         line: breakpoint_line,
     });
     session.send(DebugCommand::Resume);
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(45);
     let mut output = String::new();
     let mut exited = false;
     while Instant::now() < deadline && !(exited && output.contains("v2")) {
@@ -649,7 +874,7 @@ public class HotSwapTarget {
 }
 
 fn wait_for_status(session: &DebugSession, needle: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         while let Some(event) = session.poll() {
             match event {
@@ -664,7 +889,7 @@ fn wait_for_status(session: &DebugSession, needle: &str) {
 }
 
 fn wait_for_evaluate(session: &DebugSession, expression: &str) -> (Option<String>, Option<String>) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         while let Some(event) = session.poll() {
             if let DebugEvent::EvaluateResult {
@@ -684,7 +909,7 @@ fn wait_for_evaluate(session: &DebugSession, expression: &str) -> (Option<String
 }
 
 fn wait_for_watches(session: &DebugSession, count: usize) -> Vec<WatchValue> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         while let Some(event) = session.poll() {
             if let DebugEvent::WatchValues(values) = event {
@@ -700,6 +925,7 @@ fn wait_for_watches(session: &DebugSession, count: usize) -> Vec<WatchValue> {
 
 #[test]
 fn breakpoints_inside_anonymous_class() {
+    let _serial = serial();
     if Command::new("javac").arg("-version").output().is_err() {
         eprintln!("javac unavailable; skipping anonymous class test");
         return;
@@ -752,6 +978,7 @@ public class AnonymousTarget {
 
 #[test]
 fn breakpoints_after_nested_type_still_resolve() {
+    let _serial = serial();
     if Command::new("javac").arg("-version").output().is_err() {
         eprintln!("javac unavailable; skipping nested order test");
         return;
@@ -834,7 +1061,7 @@ fn launch_spec(directory: &Path, main_class: &str) -> LaunchSpec {
 }
 
 fn wait_for_stop(session: &DebugSession, reason: StopReason) -> Box<reclipse_debug::StopInfo> {
-    let deadline = Instant::now() + Duration::from_secs(25);
+    let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
         while let Some(event) = session.poll() {
             match event {

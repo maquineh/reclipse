@@ -49,6 +49,33 @@ pub enum DebugCommand {
     EvaluateWatches { expressions: Vec<String> },
     RedefineClasses { classes: Vec<(String, Vec<u8>)> },
     SetPauseOnExceptions(bool),
+    SetExceptionConfig(ExceptionConfig),
+}
+
+/// Filter for exception breakpoints: which exceptions suspend the debuggee.
+#[derive(Debug, Clone)]
+pub struct ExceptionConfig {
+    /// Master switch (the "Pausar em exceções" checkbox).
+    pub enabled: bool,
+    /// Suspend on exceptions caught by the debuggee.
+    pub caught: bool,
+    /// Suspend on uncaught exceptions.
+    pub uncaught: bool,
+    /// Class name filters (`NullPointerException`,
+    /// `java.lang.IllegalArgumentException`, ...). Empty matches every
+    /// exception; subclasses of a listed type also match.
+    pub types: Vec<String>,
+}
+
+impl Default for ExceptionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            caught: false,
+            uncaught: true,
+            types: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
