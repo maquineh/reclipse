@@ -65,29 +65,30 @@ Entregue:
 - JDK (`jmods`/`rt.jar`) escolhido pelo target do projeto (Maven/Gradle/Eclipse);
 - watch de `pom.xml`/`.classpath`/`build.gradle`/version catalog para recarregar o classpath;
 - índice nativo de classes de JARs/JMODs, sem JVM, com campos, métodos, superclasse e interfaces;
-- fontes via `-sources.jar` e `src.zip`, abertas no visualizador de tipo externo;
+- fontes via `-sources.jar` e `src.zip`, abertas no visualizador de tipo externo; download de sources/Javadoc via Maven;
+- Javadoc completo (`F2`) com parágrafos/listas/HTML básico e inline tags;
 - Open Type com tipos externos; F3 em tipo do classpath abre o visualizador de metadados;
 - resolução de tipos por import, mesmo pacote, wildcard e `java.lang`;
 - diagnóstico de imports, tipos e membros não resolvidos, `static imports` ambíguos e `@Override` inválido no painel Problemas;
 - `javac` incremental em fundo ao salvar (com debounce e cancelamento);
 - inferência de variáveis (linhas anteriores, generics e arrays);
 - **completion de membros inline** por `.`/`Ctrl+Space`, com herança do projeto e do classpath e retorno encadeado com type arguments;
-- overloads ranqueados por tipo com fallback de aridade;
+- overloads ranqueados por tipo, com especificidade de widening numérico, boxing/unboxing e varargs;
 - type variables com substituição (projeto e `Signature` de bytecode), bounds e `Object` como fallback conservador;
 - static imports com precedência single-sobre-wildcard; ambiguidade genuína recusada e diagnosticada;
 - **hover semântico** de tipos, variáveis e símbolos;
 - **referências semânticas de tipos** e de **métodos/campos** (`Ctrl+Shift+G`), com method references e fallback textual;
-- **rename conservador** de tipos, métodos, campos e variáveis locais (`Alt+Shift+R`), com rename de arquivo, imports e proteção de overrides/shadowing;
+- **rename conservador** de tipos, métodos, campos e variáveis locais (`Alt+Shift+R`), com rename de arquivo, imports, Javadoc e `module-info`, proteção de overrides/shadowing;
+- **move de tipo top-level** entre pacotes, com atualização de `package`, imports, referências, Javadoc, `module-info` e arquivo;
 - inferência de `var` e hierarquia de tipos do projeto;
 - **RECLIPSE Studio**: 3 temas comutáveis, activity bar, toolbar, breadcrumb e console de diagnóstico.
 
 Pendente (refinamento, fora do núcleo):
 
-- overloads finos por conversão de narrowing/varargs além das 3 fases JLS;
-- move de um tipo individual entre pacotes e atualização de Javadoc/recursos no rename;
-- JDT LS opt-in já existe; falta empacotamento/UX e matriz de projetos reais;
+- modelagem completa de tipos locais/anônimos como tipos de projeto;
+- JDT LS opt-in: empacotamento, matriz de projetos reais e UX avançada;
 - Gradle Tooling API, bundles de version catalog e dependências de plugins;
-- Javadoc HTML completo e download automático de sources.
+- download de sources/Javadoc no Gradle e links HTML avançados no visualizador.
 
 Aceite final:
 
@@ -111,7 +112,7 @@ Entregue:
 
 Pendente:
 
-- Debugger JDWP/JDI entregue no M4 (DAP, breakpoints condicionais, watches e hot swap pendentes).
+- Debugger JDWP/JDI entregue no M4 (breakpoints condicionais, watches e hot swap incluídos; DAP externo pendente).
 - JUnit independente do runner Maven/Gradle (execução direta via launcher/JUnit Platform).
 - Configurações de execução múltiplas e variáveis por plataforma.
 - Formatter embutido (sem dependência externa).
@@ -142,11 +143,11 @@ Pendente:
 - adaptador DAP para clientes externos;
 - evaluator com chamadas de método, índices de array e campos estáticos;
 - attach remoto com TLS/autenticação e reconexão;
-- validação com Spring Boot real.
+- validação com projetos multi-módulo.
 
 Aceite:
 
-- depurar o `demo-java` e um projeto Spring Boot real;
+- depurar o `demo-java` e um projeto Spring Boot real (validado com Spring Boot 3.5);
 - pausar em exceção e inspecionar frames sem congelar a UI.
 
 ## M5 — Plataforma de plugins (4–6 semanas)

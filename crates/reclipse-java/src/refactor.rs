@@ -2,7 +2,8 @@
 //!
 //! Rename never guesses: unresolved or ambiguous references are left untouched,
 //! shadowed locals abort the operation, and classpath members are read-only.
-//! Javadoc, strings and reflection are not rewritten (reported as warnings).
+//! Javadoc links and module-info directives are rewritten for type/package
+//! renames; strings, resources and reflection are not.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -43,6 +44,7 @@ impl FileEdits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenameKind {
     Type,
+    MoveType,
     Method,
     Field,
     Package,
@@ -53,6 +55,7 @@ impl RenameKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Type => "tipo",
+            Self::MoveType => "tipo (mover)",
             Self::Method => "método",
             Self::Field => "campo",
             Self::Package => "pacote",
@@ -227,6 +230,22 @@ pub fn plan_type_rename(
             }
         }
     }
+    for path in index.files.keys() {
+        let Some(source) = read_source(path) else {
+            continue;
+        };
+        if path
+            .file_name()
+            .is_some_and(|name| name == "module-info.java")
+        {
+            for (start, length) in module_info_type_occurrences(&source, &old_name, fqn) {
+                push_edit(&mut files, path, start, start + length, new_name);
+            }
+        }
+        for (start, length) in javadoc_text_occurrences(&source, &old_name) {
+            push_edit(&mut files, path, start, start + length, new_name);
+        }
+    }
 
     let mut moves = Vec::new();
     let stem = location
@@ -269,6 +288,266 @@ pub fn plan_type_rename(
         files,
         moves,
         warnings: rename_warnings(),
+    })
+}
+
+/// Plan moving a top-level type to another package. Updates the package
+/// declaration, imports, fully-qualified references, Javadoc links and
+/// module-info directives; same-package/import-less files receive an explicit
+/// import.
+pub fn plan_type_move(
+    fqn: &str,
+    new_package: &str,
+    project: &Project,
+    project_types: &ProjectTypes,
+    index: &ProjectIndex,
+    classpath: &ClasspathIndex,
+) -> Result<RenamePlan, String> {
+    let new_package = new_package.trim();
+    if new_package.is_empty() {
+        return Err("informe o pacote de destino".to_owned());
+    }
+    for segment in new_package.split('.') {
+        validate_identifier(segment)?;
+    }
+    if new_package == "java"
+        || new_package.starts_with("java.")
+        || new_package.starts_with("javax.")
+    {
+        return Err("não é permitido mover para o namespace java/javax".to_owned());
+    }
+    let location = project_types
+        .get(fqn)
+        .ok_or_else(|| "o tipo não pertence ao projeto (classpath é somente leitura)".to_owned())?;
+    let Some((old_package, simple_name)) = fqn.rsplit_once('.') else {
+        return Err("mover tipos do pacote default não é suportado".to_owned());
+    };
+    if old_package == new_package {
+        return Err("o tipo já está nesse pacote".to_owned());
+    }
+    let new_fqn = format!("{new_package}.{simple_name}");
+    if project_types.get(&new_fqn).is_some() {
+        return Err(format!("já existe o tipo {new_fqn} no projeto"));
+    }
+    if classpath.get_loose(&new_fqn).is_some() {
+        return Err(format!("já existe o tipo {new_fqn} no classpath"));
+    }
+    let Some(file) = index.files.get(&location.path) else {
+        return Err("arquivo do tipo não encontrado no índice".to_owned());
+    };
+    let top_level = file.symbols.iter().any(|symbol| {
+        symbol.kind.is_type()
+            && symbol.container.is_none()
+            && crate::semantic::type_fqn(file, symbol) == fqn
+    });
+    if !top_level {
+        return Err("mover apenas tipos top-level".to_owned());
+    }
+    let top_level_types = file
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind.is_type() && symbol.container.is_none())
+        .count();
+    if top_level_types > 1 {
+        return Err(format!(
+            "{} contém outros tipos top-level; mova-os separadamente",
+            location.path.display()
+        ));
+    }
+    let source = read_source(&location.path)
+        .ok_or_else(|| format!("não foi possível ler {}", location.path.display()))?;
+    let Some((package_start, package_end)) = file.package_range else {
+        return Err("arquivo sem declaração de pacote".to_owned());
+    };
+    if package_end > source.len() {
+        return Err("faixa de pacote inválida".to_owned());
+    }
+
+    let root = source_root_for(&location.path, project);
+    let new_path = root
+        .join(new_package.replace('.', std::path::MAIN_SEPARATOR_STR))
+        .join(location.path.file_name().unwrap_or_default());
+    if new_path != location.path && new_path.exists() {
+        return Err(format!("o destino {} já existe", new_path.display()));
+    }
+
+    let mut files: Vec<FileEdits> = Vec::new();
+    push_edit(
+        &mut files,
+        &location.path,
+        package_start,
+        package_end,
+        &format!("package {new_package};"),
+    );
+    let references = find_type_references(fqn, project_types, index, classpath);
+    let referred_files: std::collections::HashSet<PathBuf> = references
+        .iter()
+        .map(|reference| reference.file.clone())
+        .collect();
+
+    for (path, current) in &index.files {
+        let Some(current_source) = read_source(path) else {
+            continue;
+        };
+        for (import_index, import) in current.imports.iter().enumerate() {
+            let import_path = import.strip_prefix("static ").unwrap_or(import).trim();
+            let matches = import_path == fqn
+                || import_path.starts_with(&format!("{fqn}."))
+                || static_import_owner(import) == Some(fqn);
+            if !matches {
+                continue;
+            }
+            let Some((start, end)) = current.import_ranges.get(import_index).copied() else {
+                continue;
+            };
+            if end <= start || end > current_source.len() {
+                continue;
+            }
+            let raw = &current_source[start..end];
+            if let Some(offset) = raw.find(old_package) {
+                push_edit(
+                    &mut files,
+                    path,
+                    start + offset,
+                    start + offset + old_package.len(),
+                    new_package,
+                );
+            }
+        }
+        for reference in &current.scoped_type_refs {
+            if reference.name == fqn || reference.name.starts_with(&format!("{fqn}.")) {
+                let start = reference.start_byte;
+                if start < current_source.len() && current_source[start..].starts_with(old_package)
+                {
+                    push_edit(
+                        &mut files,
+                        path,
+                        start,
+                        start + old_package.len(),
+                        new_package,
+                    );
+                }
+            }
+        }
+        if path
+            .file_name()
+            .is_some_and(|name| name == "module-info.java")
+        {
+            for (start, _) in module_info_fqn_occurrences(&current_source, fqn) {
+                push_edit(
+                    &mut files,
+                    path,
+                    start,
+                    start + old_package.len(),
+                    new_package,
+                );
+            }
+        }
+        for (start, _) in javadoc_fqn_occurrences(&current_source, fqn) {
+            push_edit(
+                &mut files,
+                path,
+                start,
+                start + old_package.len(),
+                new_package,
+            );
+        }
+    }
+
+    for path in &referred_files {
+        if *path == location.path {
+            continue;
+        }
+        if path
+            .file_name()
+            .is_some_and(|name| name == "module-info.java")
+        {
+            continue;
+        }
+        let Some(target) = index.files.get(path) else {
+            continue;
+        };
+        if target.package.as_deref() == Some(new_package) {
+            continue;
+        }
+        let already_imported = target.imports.iter().any(|import| {
+            let import_path = import.strip_prefix("static ").unwrap_or(import).trim();
+            import_path == new_fqn
+                || import_path == format!("{new_package}.*")
+                || import_path == fqn
+        });
+        if already_imported {
+            continue;
+        }
+        if target.symbols.iter().any(|symbol| {
+            symbol.kind.is_type() && symbol.name == simple_name && symbol.container.is_none()
+        }) {
+            return Err(format!(
+                "{} já declara um tipo {simple_name}; import automático cancelado",
+                path.display()
+            ));
+        }
+        if target
+            .imports
+            .iter()
+            .any(|import| import.ends_with(&format!(".{simple_name}")) && import.as_str() != fqn)
+        {
+            return Err(format!(
+                "{} já importa outro {simple_name}; import automático cancelado",
+                path.display()
+            ));
+        }
+        let Some(target_source) = read_source(path) else {
+            continue;
+        };
+        let insert_at = target
+            .import_ranges
+            .last()
+            .map(|(_, end)| *end)
+            .or_else(|| target.package_range.map(|(_, end)| end))
+            .unwrap_or(0);
+        if insert_at > target_source.len() {
+            continue;
+        }
+        let prefix = if target.import_ranges.is_empty() {
+            "\n\n"
+        } else {
+            "\n"
+        };
+        push_edit(
+            &mut files,
+            path,
+            insert_at,
+            insert_at,
+            &format!("{prefix}import {new_fqn};"),
+        );
+    }
+
+    files.retain(|file| !file.edits.is_empty());
+    for file in &mut files {
+        file.edits
+            .sort_by_key(|edit| std::cmp::Reverse(edit.start_byte));
+        file.edits
+            .dedup_by(|left, right| left.start_byte == right.start_byte);
+    }
+    if files.is_empty() {
+        return Err("nenhuma ocorrência encontrada".to_owned());
+    }
+    let mut warnings = rename_warnings();
+    warnings.push(format!(
+        "Tipo movido de {old_package} para {new_package}; revise strings, recursos e referências por reflexão."
+    ));
+    Ok(RenamePlan {
+        old_name: fqn.to_owned(),
+        new_name: new_fqn,
+        kind: RenameKind::MoveType,
+        files,
+        moves: if new_path != location.path {
+            vec![(location.path.clone(), new_path)]
+        } else {
+            Vec::new()
+        },
+        warnings,
     })
 }
 
@@ -421,6 +700,22 @@ pub fn plan_package_rename(
             }
         }
     }
+    for path in index.files.keys() {
+        let Some(source) = read_source(path) else {
+            continue;
+        };
+        if path
+            .file_name()
+            .is_some_and(|name| name == "module-info.java")
+        {
+            for (start, length) in module_info_package_occurrences(&source, old_package) {
+                push_edit(&mut files, path, start, start + length, new_package);
+            }
+        }
+        for (start, length) in javadoc_package_occurrences(&source, old_package) {
+            push_edit(&mut files, path, start, start + length, new_package);
+        }
+    }
 
     files.retain(|file| !file.edits.is_empty());
     for file in &mut files {
@@ -431,7 +726,7 @@ pub fn plan_package_rename(
     }
     let mut warnings = rename_warnings();
     warnings.push(format!(
-        "Pacote renomeado com {moved_files} arquivo(s) movido(s); revise referências em strings/Javadoc."
+        "Pacote renomeado com {moved_files} arquivo(s) movido(s); revise strings e referências por reflexão."
     ));
     Ok(RenamePlan {
         old_name: old_package.to_owned(),
@@ -1131,6 +1426,160 @@ fn identifier_occurrences(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
     found
 }
 
+fn type_name_occurrences(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
+    identifier_occurrences(haystack, needle)
+        .into_iter()
+        .filter(|(start, length)| !haystack[start + length..].starts_with('.'))
+        .collect()
+}
+
+fn package_occurrences(haystack: &str, package: &str) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    let mut start = 0;
+    while let Some(position) = haystack[start..].find(package) {
+        let absolute = start + position;
+        let end = absolute + package.len();
+        let left_ok = haystack[..absolute]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !is_identifier_char(character) && character != '.');
+        let right_ok = haystack[end..]
+            .chars()
+            .next()
+            .is_none_or(|character| !is_identifier_char(character));
+        if left_ok && right_ok {
+            found.push((absolute, package.len()));
+        }
+        start = end;
+    }
+    found
+}
+
+fn javadoc_ranges(source: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while let Some(position) = source[index..].find("/**") {
+        let start = index + position;
+        let body = start + 3;
+        let Some(end_position) = source[body..].find("*/") else {
+            break;
+        };
+        let end = body + end_position;
+        ranges.push((body, end));
+        index = end + 2;
+    }
+    ranges
+}
+
+fn javadoc_text_occurrences(source: &str, name: &str) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    for (start, end) in javadoc_ranges(source) {
+        for (offset, length) in type_name_occurrences(&source[start..end], name) {
+            found.push((start + offset, length));
+        }
+    }
+    found
+}
+
+fn javadoc_package_occurrences(source: &str, package: &str) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    for (start, end) in javadoc_ranges(source) {
+        for (offset, length) in package_occurrences(&source[start..end], package) {
+            found.push((start + offset, length));
+        }
+    }
+    found
+}
+
+fn fqn_occurrences(haystack: &str, fqn: &str) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    let mut start = 0;
+    while let Some(position) = haystack[start..].find(fqn) {
+        let absolute = start + position;
+        let end = absolute + fqn.len();
+        let left_ok = haystack[..absolute]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !is_identifier_char(character) && character != '.');
+        let right_ok = haystack[end..]
+            .chars()
+            .next()
+            .is_none_or(|character| !is_identifier_char(character));
+        if left_ok && right_ok {
+            found.push((absolute, fqn.len()));
+        }
+        start = end;
+    }
+    found
+}
+
+fn javadoc_fqn_occurrences(source: &str, fqn: &str) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    for (start, end) in javadoc_ranges(source) {
+        for (offset, length) in fqn_occurrences(&source[start..end], fqn) {
+            found.push((start + offset, length));
+        }
+    }
+    found
+}
+
+fn module_info_fqn_occurrences(source: &str, fqn: &str) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let directive = ["uses ", "provides ", "with ", "permits "]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix));
+        if directive {
+            for (start, length) in fqn_occurrences(line, fqn) {
+                found.push((offset + start, length));
+            }
+        }
+        offset += line.len();
+    }
+    found
+}
+
+fn module_info_type_occurrences(source: &str, name: &str, fqn: &str) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let directive = ["uses ", "provides ", "with ", "permits "]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix));
+        if directive {
+            for (start, length) in type_name_occurrences(line, name) {
+                let reference = &line[start..start + length];
+                if reference == name || fqn.ends_with(&format!(".{name}")) || fqn == name {
+                    found.push((offset + start, length));
+                }
+            }
+        }
+        offset += line.len();
+    }
+    found
+}
+
+fn module_info_package_occurrences(source: &str, package: &str) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let directive = ["exports ", "opens ", "uses ", "provides ", "with "]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix));
+        if directive {
+            for (start, length) in package_occurrences(line, package) {
+                found.push((offset + start, length));
+            }
+        }
+        offset += line.len();
+    }
+    found
+}
+
 fn read_source(path: &Path) -> Option<String> {
     let bytes = fs::read(path).ok()?;
     String::from_utf8(bytes).ok()
@@ -1165,7 +1614,7 @@ fn is_identifier_char(character: char) -> bool {
 
 fn rename_warnings() -> Vec<String> {
     vec![
-        "Javadoc, strings e referências por reflexão não são atualizados.".to_owned(),
+        "Strings, recursos e referências por reflexão não são atualizados; Javadoc e module-info são atualizados quando possível.".to_owned(),
         "Rename de workspace exige buffers Java salvos (buffers sujos bloqueiam).".to_owned(),
     ]
 }
@@ -1329,6 +1778,176 @@ class App {
             std::fs::read_to_string(dir.path().join("src/org/demo/service/Service.java")).unwrap();
         assert!(service_source.contains("package org.demo.service;"));
         let _ = types;
+    }
+
+    #[test]
+    fn type_rename_updates_javadoc_and_module_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src/main/java");
+        let user_path = root.join("com/acme/User.java");
+        let module_path = root.join("module-info.java");
+        std::fs::create_dir_all(user_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &user_path,
+            "package com.acme;\n/** Links to {@link User} and {@link com.acme.User}. */\npublic class User {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &module_path,
+            "module demo {\n    uses com.acme.User;\n    provides com.acme.Service with com.acme.User;\n}\n",
+        )
+        .unwrap();
+        let project = reclipse_core::discover_project(dir.path()).unwrap();
+        let index = crate::build_index(project.clone(), None);
+        let types = ProjectTypes::build(&index);
+        let plan = plan_type_rename(
+            "com.acme.User",
+            "Account",
+            &types,
+            &index,
+            &ClasspathIndex::default(),
+        )
+        .unwrap();
+        let user_source = std::fs::read_to_string(&user_path).unwrap();
+        let updated = apply_text_edits(
+            &user_source,
+            &plan
+                .files
+                .iter()
+                .find(|file| file.path == user_path)
+                .map(|file| file.edits.clone())
+                .unwrap_or_default(),
+        )
+        .unwrap();
+        assert!(updated.contains("{@link Account}"));
+        assert!(updated.contains("{@link com.acme.Account}"));
+        let module_source = std::fs::read_to_string(&module_path).unwrap();
+        let updated = apply_text_edits(
+            &module_source,
+            &plan
+                .files
+                .iter()
+                .find(|file| file.path == module_path)
+                .map(|file| file.edits.clone())
+                .unwrap_or_default(),
+        )
+        .unwrap();
+        assert!(updated.contains("uses com.acme.Account;"));
+        assert!(updated.contains("with com.acme.Account;"));
+    }
+
+    #[test]
+    fn package_rename_updates_javadoc_and_module_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src/main/java");
+        let user_path = root.join("com/acme/User.java");
+        let module_path = root.join("module-info.java");
+        std::fs::create_dir_all(user_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &user_path,
+            "package com.acme;\n/** See {@link com.acme.User}. */\npublic class User {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &module_path,
+            "module demo {\n    exports com.acme;\n    uses com.acme.User;\n}\n",
+        )
+        .unwrap();
+        let project = reclipse_core::discover_project(dir.path()).unwrap();
+        let index = crate::build_index(project.clone(), None);
+        let plan = plan_package_rename(
+            "com.acme",
+            "org.demo",
+            &project,
+            &index,
+            &ClasspathIndex::default(),
+        )
+        .unwrap();
+        let user_source = std::fs::read_to_string(&user_path).unwrap();
+        let updated = apply_text_edits(
+            &user_source,
+            &plan
+                .files
+                .iter()
+                .find(|file| file.path == user_path)
+                .map(|file| file.edits.clone())
+                .unwrap_or_default(),
+        )
+        .unwrap();
+        assert!(updated.contains("{@link org.demo.User}"));
+        let module_source = std::fs::read_to_string(&module_path).unwrap();
+        let updated = apply_text_edits(
+            &module_source,
+            &plan
+                .files
+                .iter()
+                .find(|file| file.path == module_path)
+                .map(|file| file.edits.clone())
+                .unwrap_or_default(),
+        )
+        .unwrap();
+        assert!(updated.contains("exports org.demo;"));
+        assert!(updated.contains("uses org.demo.User;"));
+    }
+
+    #[test]
+    fn type_move_updates_package_imports_javadoc_and_module_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src/main/java");
+        let user_path = root.join("com/acme/User.java");
+        let app_path = root.join("com/acme/App.java");
+        let other_path = root.join("com/other/Other.java");
+        let module_path = root.join("module-info.java");
+        std::fs::create_dir_all(user_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(other_path.parent().unwrap()).unwrap();
+        std::fs::write(&user_path, "package com.acme;\npublic class User {}\n").unwrap();
+        std::fs::write(&app_path, "package com.acme;\nclass App { User user; }\n").unwrap();
+        std::fs::write(
+            &other_path,
+            "package com.other;\nimport com.acme.User;\n/** See {@link com.acme.User}. */\nclass Other { User user; com.acme.User other; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &module_path,
+            "module demo {\n    uses com.acme.User;\n    provides com.acme.Service with com.acme.User;\n}\n",
+        )
+        .unwrap();
+        let project = reclipse_core::discover_project(dir.path()).unwrap();
+        let index = crate::build_index(project.clone(), None);
+        let types = ProjectTypes::build(&index);
+        let plan = plan_type_move(
+            "com.acme.User",
+            "org.demo",
+            &project,
+            &types,
+            &index,
+            &ClasspathIndex::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.kind, RenameKind::MoveType);
+        assert_eq!(plan.moves.len(), 1);
+        assert_eq!(plan.moves[0].1, root.join("org/demo/User.java"));
+        let read = |path: &Path| std::fs::read_to_string(path).unwrap();
+        let changed = |path: &Path| {
+            let source = read(path);
+            let edits = plan
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .map(|file| file.edits.clone())
+                .unwrap_or_default();
+            apply_text_edits(&source, &edits).unwrap()
+        };
+        assert!(changed(&user_path).contains("package org.demo;"));
+        let app = changed(&app_path);
+        assert!(app.contains("import org.demo.User;"), "app: {app}");
+        let other = changed(&other_path);
+        assert!(other.contains("import org.demo.User;"), "other: {other}");
+        assert!(other.contains("org.demo.User other"), "other: {other}");
+        assert!(other.contains("{@link org.demo.User}"), "other: {other}");
+        let module = changed(&module_path);
+        assert!(module.contains("uses org.demo.User;"), "module: {module}");
+        assert!(module.contains("with org.demo.User;"), "module: {module}");
     }
 
     #[test]

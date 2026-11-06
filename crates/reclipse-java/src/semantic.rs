@@ -2409,7 +2409,7 @@ fn arg_conversion_cost(
     }
     if phase == 0 {
         if is_primitive_widening(arg_base, param_base) {
-            return Some(1);
+            return Some(primitive_widening_cost(arg_base, param_base));
         }
         return None;
     }
@@ -2422,7 +2422,7 @@ fn arg_conversion_cost(
             return Some(1);
         }
         if is_primitive_widening(unboxed, param_base) {
-            return Some(2);
+            return Some(2 + primitive_widening_cost(unboxed, param_base));
         }
     }
     if let Some(boxed) = box_for(arg_base) {
@@ -2615,6 +2615,25 @@ fn box_for(name: &str) -> Option<&'static str> {
         "byte" => Some("Byte"),
         "short" => Some("Short"),
         _ => None,
+    }
+}
+
+fn primitive_rank(name: &str) -> Option<u32> {
+    Some(match name {
+        "byte" => 1,
+        "short" | "char" => 2,
+        "int" => 3,
+        "long" => 4,
+        "float" => 5,
+        "double" => 6,
+        _ => return None,
+    })
+}
+
+fn primitive_widening_cost(from: &str, to: &str) -> u32 {
+    match (primitive_rank(from), primitive_rank(to)) {
+        (Some(from), Some(to)) => to.saturating_sub(from).max(1),
+        _ => 1,
     }
 }
 
@@ -4849,6 +4868,32 @@ mod tests {
         assert_eq!(
             pick_overload(&cands, &[Some("String".to_owned())], &subtype),
             None
+        );
+        // Numeric widening prefers the most specific primitive.
+        let cands = vec![
+            (vec!["long".to_owned()], false),
+            (vec!["int".to_owned()], false),
+        ];
+        assert_eq!(
+            pick_overload(&cands, &[Some("byte".to_owned())], &subtype),
+            Some(1)
+        );
+        let cands = vec![
+            (vec!["float".to_owned()], false),
+            (vec!["long".to_owned()], false),
+        ];
+        assert_eq!(
+            pick_overload(&cands, &[Some("int".to_owned())], &subtype),
+            Some(1)
+        );
+        // null is not applicable to primitives.
+        let cands = vec![
+            (vec!["int".to_owned()], false),
+            (vec!["String".to_owned()], false),
+        ];
+        assert_eq!(
+            pick_overload(&cands, &[Some("null".to_owned())], &subtype),
+            Some(1)
         );
         // detail_param_list reports varargs.
         assert_eq!(

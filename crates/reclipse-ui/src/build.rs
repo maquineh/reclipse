@@ -889,6 +889,43 @@ pub fn run_lifecycle(
     })
 }
 
+pub fn download_documentation(
+    project: &Project,
+    env: &HashMap<String, String>,
+    cancel: &AtomicBool,
+    on_output: &mut dyn FnMut(&str),
+) -> Result<ResolveResult, String> {
+    let started = Instant::now();
+    let Some((tool, binary)) = detect_test_tool(project) else {
+        return Err("download de sources/Javadoc requer Maven (pom.xml)".to_owned());
+    };
+    let (args, label) = match tool {
+        TestTool::Maven => (
+            vec![
+                "-B".to_owned(),
+                "dependency:sources".to_owned(),
+                "dependency:resolve".to_owned(),
+                "-Dclassifier=javadoc".to_owned(),
+            ],
+            "mvn dependency:sources/javadoc".to_owned(),
+        ),
+        TestTool::Gradle => {
+            return Err(
+                "Gradle não possui goal padrão para baixar sources/Javadoc; configure os artefatos no build"
+                    .to_owned(),
+            );
+        }
+    };
+    let output = run_piped_stream(&binary, &args, env, &project.root, cancel, on_output)
+        .map_err(|error| format!("falha ao executar {label}: {error}"))?;
+    Ok(ResolveResult {
+        success: output.status_success && !cancel.load(Ordering::SeqCst),
+        tool: label,
+        output: output.combined,
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
 #[derive(Debug)]
 pub struct ResolveResult {
     pub success: bool,

@@ -5,6 +5,11 @@ import com.example.service.MessageService;
 
 /**
  * Small demo project used to exercise Reclipse's native syntax index.
+ *
+ * <p>It demonstrates <b>nested types</b>, fields, methods and a simple
+ * {@link GreetingJob}.</p>
+ *
+ * @see GreetingJob
  */
 public class App {
     private final MessageService service = new MessageService();

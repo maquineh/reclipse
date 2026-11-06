@@ -36,12 +36,15 @@ Este repositório contém o **MVP 0.1.0**, o **M1** do editor e a **fundação d
 - **Hover semântico** de tipos, variáveis e símbolos.
 - **Referências** no projeto (`Ctrl+Shift+G`): semânticas para tipos, métodos, campos e constantes (incluindo herança e method references), referências locais no buffer e fallback textual.
 - **Rename conservador** (`Alt+Shift+R`) de tipos, métodos, campos e variáveis locais/parâmetros:
-  - atualiza declaração, referências e imports;
+  - atualiza declaração, referências, imports, Javadoc e diretivas `module-info`;
   - renomeia o `.java` de tipos top-level e atualiza o índice sem recarregar o classpath;
   - recusa classpath/JDK, colisões, sombreamento de locais e métodos sobrescritos/implementados;
   - aplica edits em lote e um único passo de undo para rename local.
+- **Mover tipo top-level** para outro pacote (`Código → Mover tipo para pacote…`), atualizando `package`, imports, referências qualificadas, Javadoc e `module-info`.
 - **Compilação e execução**: **Compilar** com `javac` (classpath do projeto + `--release` do target), **Build compile/package/clean** do Maven/Gradle com saída incremental, diagnósticos no painel Problemas e **Executar** a classe `main` com `java` (`Ctrl+F11`).
 - **Debugger JDWP nativo**: breakpoints de linha com condição, launch ou attach, stepping (`F5`/`F6`/`F7`/`F8`), call stack, threads, variáveis locais e campos de `this`, watches, evaluator de expressões, hot swap e pausa em exceções não capturadas (`F11`).
+- **Javadoc completo** (`F2`) em uma janela com parágrafos, listas, tags HTML básicas e `{@link}`/`{@code}`; o hover continua mostrando a primeira frase.
+- **Download de sources/Javadoc** via Maven (`dependency:sources` + `dependency:resolve -Dclassifier=javadoc`), com reindexação automática; o hover de tipos externos passa a mostrar a primeira frase do source baixado.
 - **JUnit inline**: descoberta de testes JUnit 4/5, árvore classe → método no right dock, execução por classe ou método e falhas clicáveis com stack frame.
 - **Editor dividido** com dois painéis e **abas arrastáveis** (drag-and-drop) entre eles.
 - **Organizar imports** (`Ctrl+Shift+I`) e **formatar arquivo** via formatter externo opt-in (`Ctrl+Alt+F`).
@@ -118,6 +121,14 @@ Debugger JDWP pausado em um breakpoint, com call stack e variáveis:
 
 ![Debugger](docs/screenshot-debug.png)
 
+Validação real com Spring Boot 3.5 (Tomcat iniciado, breakpoint em `DemoApplication.java`):
+
+![Spring Boot](docs/screenshot-spring-boot.png)
+
+Visualizador de Javadoc completo (`F2`) com parágrafos e inline tags:
+
+![Javadoc](docs/screenshot-javadoc.png)
+
 ## O que ainda não existe
 
 Este MVP é deliberadamente honesto sobre o escopo:
@@ -126,12 +137,12 @@ Este MVP é deliberadamente honesto sobre o escopo:
 - Compila e executa `main` via `javac`/`java` com launch config, roda `mvn test`/`gradle test` com parser e JUnit inline por classe/método, e depura via JDWP; ainda não executa ciclos de build Maven/Gradle completos.
 - O formatter é externo e opt-in (`RECLIPSE_FORMATTER`/`RECLIPSE_FORMATTER_JAR`); organize imports é nativo e conservador.
 - A semântica Java cobre imports/tipos, completion de membros, hover, referências semânticas de tipos/membros, rename conservador, overloads por tipo, type variables com substituição e diagnósticos nativos (tipos/membros não resolvidos, `@Override`, static ambíguo) além do `javac` em fundo; faltam apenas refinamentos (overloads finos por subtipo, Javadoc, modo JDT opt-in). Tipos locais são detectados; tipos anônimos ainda não são modelados.
-- Rename não reescreve Javadoc, strings, configuração por reflexão ou nomes em arquivos de recursos; overrides/implementações e locais sombreados são recusados por segurança, e o rename de workspace exige buffers Java salvos.
+- Rename atualiza Javadoc e diretivas `module-info`; não reescreve strings, configuração por reflexão ou nomes em arquivos de recursos. Overrides/implementações e locais sombreados são recusados por segurança, e o rename de workspace exige buffers Java salvos.
 - Maven/Gradle resolvem dependências transitivas do repositório local e têm download sob demanda e perfis Maven; não há Tooling API nem bundles avançados do Gradle.
 - Multi-cursor agrupa undo de digitação, mas backspace/delete multi ainda são por tecla.
 - Não é um substituto completo do Eclipse para projetos corporativos.
 - Plugins Eclipse/OSGi/SWT **não** são carregados ainda. A compatibilidade headless está no roadmap.
-- Há **JDT LS opt-in** via `RECLIPSE_JDTLS` (diagnósticos extras), desabilitado por padrão; não é um LSP embutido completo.
+- Há **JDT LS opt-in** via `RECLIPSE_JDTLS` (diagnósticos extras), com status na toolbar e reinício pela palette; empacotamento do servidor e uma matriz de testes de projetos reais ainda faltam.
 
 Veja [docs/M1.md](docs/M1.md) para o detalhamento do editor, [docs/M2.md](docs/M2.md) para o classpath/semântica, [docs/M3.md](docs/M3.md) para build/testes e [docs/M4.md](docs/M4.md) para o debugger. O [docs/ROADMAP.md](docs/ROADMAP.md) lista os próximos marcos.
 
@@ -184,6 +195,7 @@ Também é possível abrir a IDE sem argumentos e escolher **Arquivo → Abrir p
 | `Ctrl+F2` | Encerrar a sessão de debug |
 | `Ctrl+Shift+I` | Organizar imports |
 | `Ctrl+Alt+F` | Formatar arquivo (formatter externo) |
+| `F2` | Ver Javadoc completo do símbolo |
 | `Ctrl+Shift+L` | Ajuda de atalhos |
 | `F3` | Ir para definição |
 | `F5` | Reindexar (fora do debug) |
@@ -209,6 +221,8 @@ Para depurar, clique na gutter para criar breakpoints e pressione `F11`; a IDE c
 No painel **DEBUG**, o botão **cond** de cada breakpoint edita uma condição booleana (ex.: `i == 3`); **Watches** avalia expressões a cada parada; **Hot swap** recompila o projeto e redefine as classes já carregadas (mudanças de corpo de método).
 
 O formatter é externo e opt-in: defina `RECLIPSE_FORMATTER` (executável que lê o código pela stdin) ou `RECLIPSE_FORMATTER_JAR` (jar do google-java-format). `Ctrl+Shift+I` organiza imports nativamente.
+
+Sources/Javadoc podem ser baixados pela palette (**Projeto: baixar sources/Javadoc (Maven)**); o classpath é reindexado e o hover de tipos externos passa a usar o source. O JDT LS é opt-in: defina `RECLIPSE_JDTLS` com o caminho do launcher e opcionalmente `RECLIPSE_JDTLS_WORKSPACE`; o status aparece na toolbar e **JDT: reiniciar servidor** está na palette.
 
 Buffers sujos são gravados em backups para recuperação; a sessão guarda abas, cursor, folds, painéis e keybindings.
 

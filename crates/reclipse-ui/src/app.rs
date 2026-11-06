@@ -23,7 +23,7 @@ use reclipse_debug::{
 use reclipse_editor::{Document, SearchMatcher, SearchOptions};
 use reclipse_java::refactor::{
     apply_text_edits, local_binding_at, organize_imports, plan_local_rename, plan_member_rename,
-    plan_package_rename, plan_type_rename, LocalRenamePlan, RenameKind, RenamePlan,
+    plan_package_rename, plan_type_move, plan_type_rename, LocalRenamePlan, RenameKind, RenamePlan,
 };
 use reclipse_java::semantic::{
     completion_context, find_member_references, find_type_references, infer_variable_type,
@@ -105,6 +105,26 @@ enum JdtlsStatus {
     Failed,
 }
 
+impl JdtlsStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "JDT off",
+            Self::Starting => "JDT…",
+            Self::Ready => "JDT on",
+            Self::Failed => "JDT falhou",
+        }
+    }
+
+    fn color(self) -> Color32 {
+        match self {
+            Self::Disabled => theme::muted(),
+            Self::Starting => theme::yellow(),
+            Self::Ready => theme::green(),
+            Self::Failed => theme::red(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct JdtProblem {
     file: PathBuf,
@@ -124,6 +144,7 @@ struct CompletionState {
 
 enum RenameTarget {
     Type(String),
+    MoveType(String),
     Member(MemberTarget),
     Package { old: String },
     Local { path: PathBuf, cursor: usize },
@@ -133,6 +154,7 @@ impl Clone for RenameTarget {
     fn clone(&self) -> Self {
         match self {
             Self::Type(fqn) => Self::Type(fqn.clone()),
+            Self::MoveType(fqn) => Self::MoveType(fqn.clone()),
             Self::Member(target) => Self::Member(target.clone()),
             Self::Package { old } => Self::Package { old: old.clone() },
             Self::Local { path, cursor } => Self::Local {
@@ -251,6 +273,11 @@ struct BreakpointConditionEdit {
     text: String,
 }
 
+struct JavadocView {
+    title: String,
+    text: String,
+}
+
 type HotSwapResult = Result<Vec<(String, Vec<u8>)>, String>;
 
 #[cfg_attr(not(feature = "screenshot"), allow(dead_code))]
@@ -269,6 +296,8 @@ struct ScreenshotState {
     source_class: Option<String>,
     references_word: Option<String>,
     references_done: bool,
+    javadoc_word: Option<String>,
+    javadoc_done: bool,
     rename_word: Option<String>,
     rename_new_name: Option<String>,
     rename_done: bool,
@@ -333,6 +362,7 @@ pub struct ReclipseApp {
     breakpoints: BTreeMap<PathBuf, BTreeSet<usize>>,
     breakpoint_conditions: HashMap<(PathBuf, usize), String>,
     breakpoint_condition_edit: Option<BreakpointConditionEdit>,
+    javadoc_view: Option<JavadocView>,
     watches: Vec<String>,
     watch_input: String,
     watch_results: Vec<reclipse_debug::WatchValue>,
@@ -459,6 +489,7 @@ impl ReclipseApp {
                 })
                 .collect(),
             breakpoint_condition_edit: None,
+            javadoc_view: None,
             watches: session.watches.clone(),
             watch_input: String::new(),
             watch_results: Vec::new(),
@@ -553,6 +584,8 @@ impl ReclipseApp {
                 source_class: std::env::var("RECLIPSE_SCREENSHOT_SOURCE").ok(),
                 references_word: std::env::var("RECLIPSE_SCREENSHOT_REFERENCES").ok(),
                 references_done: false,
+                javadoc_word: std::env::var("RECLIPSE_SCREENSHOT_JAVADOC").ok(),
+                javadoc_done: false,
                 rename_word: std::env::var("RECLIPSE_SCREENSHOT_RENAME").ok(),
                 rename_new_name: std::env::var("RECLIPSE_SCREENSHOT_RENAME_NEW").ok(),
                 rename_done: false,
@@ -702,6 +735,25 @@ impl ReclipseApp {
                 self.jdtls_status_message = Some(error.clone());
                 self.log(LogLevel::Warning, format!("JDT indisponível: {error}"));
             }
+        }
+    }
+
+    fn restart_jdtls(&mut self) {
+        self.jdtls = None;
+        self.jdtls_status = JdtlsStatus::Disabled;
+        self.jdtls_status_message = None;
+        self.jdtls_problems.clear();
+        self.jdtls_versions.clear();
+        self.jdtls_failed_notified = false;
+        self.maybe_start_jdtls();
+        match self.jdtls_status {
+            JdtlsStatus::Disabled => self
+                .toast("JDT LS não configurado; defina RECLIPSE_JDTLS com o caminho do launcher"),
+            JdtlsStatus::Starting => self.toast("JDT LS reiniciando…"),
+            JdtlsStatus::Failed => {
+                self.toast("JDT LS indisponível; veja o console");
+            }
+            JdtlsStatus::Ready => self.toast("JDT LS pronto"),
         }
     }
 
@@ -877,6 +929,7 @@ impl ReclipseApp {
                     self.project = Some(payload.project);
                     self.index = Some(payload.index);
                     self.refresh_source_signatures();
+                    self.prune_breakpoints_to_project();
                     self.index_status = IndexStatus::Ready {
                         files: stats.java_files,
                         symbols: stats.symbols,
@@ -1266,6 +1319,22 @@ impl ReclipseApp {
             }
         }
         specs
+    }
+
+    fn prune_breakpoints_to_project(&mut self) {
+        let Some(root) = self.root.as_ref() else {
+            return;
+        };
+        self.breakpoints.retain(|path, _| path.starts_with(root));
+        self.breakpoint_conditions
+            .retain(|(path, _), _| path.starts_with(root));
+        if self
+            .breakpoint_condition_edit
+            .as_ref()
+            .is_some_and(|edit| !edit.path.starts_with(root))
+        {
+            self.breakpoint_condition_edit = None;
+        }
     }
 
     fn compile_project(&mut self) {
@@ -2229,6 +2298,43 @@ impl ReclipseApp {
         });
     }
 
+    fn download_documentation(&mut self) {
+        if self.build_running {
+            self.toast("Build já em andamento (cancele para recomeçar)");
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            self.toast("Abra um projeto antes de baixar sources/Javadoc");
+            return;
+        };
+        self.build_running = true;
+        self.build_label = Some("sources/javadoc".to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.build_cancel = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.build_rx = Some(receiver);
+        self.show_console = true;
+        self.log(LogLevel::Info, "Baixando sources/Javadoc via Maven…");
+        let env = std::env::vars().collect();
+        thread::spawn(move || {
+            let output_sender = sender.clone();
+            let message =
+                match build::download_documentation(&project, &env, &cancel, &mut |text| {
+                    let _ = output_sender.send(BuildMessage::Output(text.to_owned()));
+                }) {
+                    Ok(result) => BuildMessage::External {
+                        label: result.tool,
+                        success: result.success,
+                        output: result.output,
+                        elapsed_ms: result.elapsed_ms,
+                        reindex_classpath: true,
+                    },
+                    Err(error) => BuildMessage::Failed(error),
+                };
+            let _ = sender.send(message);
+        });
+    }
+
     fn run_lifecycle_phase(&mut self, phase: build::LifecyclePhase) {
         if self.build_running {
             self.toast("Build já em andamento (cancele para recomeçar)");
@@ -3003,6 +3109,73 @@ impl ReclipseApp {
         self.textual_references(word);
     }
 
+    fn open_javadoc(&mut self) {
+        let Some(active) = self.active_tab else {
+            self.toast("Nenhum arquivo ativo");
+            return;
+        };
+        let (word, start, path, source, cursor_line) = {
+            let tab = &self.tabs[active];
+            let Some((word, start, _)) = tab.doc.identifier_at_cursor() else {
+                self.toast("Coloque o cursor sobre um símbolo");
+                return;
+            };
+            (
+                word,
+                start,
+                tab.doc.path.clone(),
+                tab.doc.text(),
+                tab.cursor_line,
+            )
+        };
+        let symbol = self
+            .index
+            .as_ref()
+            .and_then(|index| index.symbols_for(&path))
+            .and_then(|file| {
+                file.symbols
+                    .iter()
+                    .filter(|symbol| symbol.name == word && symbol.line <= cursor_line)
+                    .max_by_key(|symbol| (symbol.line, symbol.depth))
+                    .cloned()
+            });
+        let (title, doc) = if let Some(symbol) = symbol {
+            (
+                format!("{} · {}", symbol.name, symbol.kind.label()),
+                symbol_javadoc_full(&source, symbol.name_start_byte),
+            )
+        } else {
+            (word.clone(), symbol_javadoc_full(&source, start))
+        };
+        let Some(text) = doc else {
+            self.toast("Nenhum Javadoc encontrado para o símbolo");
+            return;
+        };
+        self.javadoc_view = Some(JavadocView { title, text });
+    }
+
+    fn show_javadoc_view(&mut self, ctx: &Context) {
+        let Some(view) = &self.javadoc_view else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new(format!("Javadoc — {}", view.title))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(egui::vec2(620.0, 420.0))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(egui::Label::new(RichText::new(&view.text).size(13.0)).wrap());
+                    });
+            });
+        if !open {
+            self.javadoc_view = None;
+        }
+    }
+
     fn organize_imports(&mut self) {
         let Some(active) = self.active_tab else {
             self.toast("Nenhum arquivo ativo");
@@ -3337,6 +3510,67 @@ impl ReclipseApp {
         });
     }
 
+    fn begin_type_move(&mut self) {
+        if self.rename.is_some() {
+            return;
+        }
+        self.completion = None;
+        let Some(active) = self.active_tab else {
+            self.toast("Nenhum arquivo ativo");
+            return;
+        };
+        let path = self.tabs[active].doc.path.clone();
+        let Some(index) = self.index.as_ref() else {
+            self.toast("Índice semântico ainda não está pronto");
+            return;
+        };
+        let Some(file) = index.symbols_for(&path) else {
+            self.toast("Arquivo fora do índice");
+            return;
+        };
+        let package = file.package.clone().unwrap_or_default();
+        if package.is_empty() {
+            self.toast("Mover tipos do pacote default não é suportado");
+            return;
+        }
+        let Some(symbol) = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind.is_type() && symbol.container.is_none())
+        else {
+            self.toast("Nenhum tipo top-level neste arquivo");
+            return;
+        };
+        let fqn = reclipse_java::semantic::type_fqn(file, symbol);
+        let preview = match (
+            self.project.as_ref(),
+            self.project_types.as_ref(),
+            self.index.as_ref(),
+            self.classpath_index.as_ref(),
+        ) {
+            (Some(project), Some(types), Some(index), Some(classpath)) => plan_type_move(
+                &fqn,
+                &format!("{package}.moved"),
+                project,
+                types,
+                index,
+                classpath,
+            )
+            .ok()
+            .map(|plan| plan.total_edits()),
+            _ => None,
+        };
+        self.rename = Some(RenameState {
+            target: RenameTarget::MoveType(fqn.clone()),
+            old_name: fqn,
+            new_name: package,
+            kind: RenameKind::MoveType,
+            preview,
+            focus_pending: true,
+            error: None,
+        });
+    }
+
     fn apply_rename(&mut self) {
         let Some(state) = self.rename.as_ref() else {
             return;
@@ -3410,6 +3644,10 @@ impl ReclipseApp {
         };
         let plan = match &target {
             RenameTarget::Type(fqn) => plan_type_rename(fqn, &new_name, types, index, classpath),
+            RenameTarget::MoveType(fqn) => match self.project.as_ref() {
+                Some(project) => plan_type_move(fqn, &new_name, project, types, index, classpath),
+                None => Err("nenhum projeto aberto".to_owned()),
+            },
             RenameTarget::Member(target) => {
                 plan_member_rename(target, &new_name, types, index, classpath)
             }
@@ -3451,6 +3689,10 @@ impl ReclipseApp {
                 let kind = plan.kind;
                 self.rename = None;
                 match (kind, moved) {
+                    (RenameKind::MoveType, _) => self.toast(format!(
+                        "{} movido para {new_name} ({count} edições; {moved} arquivo(s) movido(s))",
+                        plan.old_name
+                    )),
                     (RenameKind::Package, moved) => self.toast(format!(
                         "pacote {} renomeado para {new_name} ({count} edições; {moved} arquivo(s) movido(s))",
                         plan.old_name
@@ -3554,7 +3796,11 @@ impl ReclipseApp {
         }
         let mut apply = false;
         let mut cancel = false;
-        egui::Window::new("Renomear")
+        let move_type = self
+            .rename
+            .as_ref()
+            .is_some_and(|state| state.kind == RenameKind::MoveType);
+        egui::Window::new(if move_type { "Mover tipo" } else { "Renomear" })
             .id(egui::Id::new("reclipse_rename"))
             .collapsible(false)
             .resizable(false)
@@ -3570,7 +3816,11 @@ impl ReclipseApp {
                 ui.add_space(4.0);
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut state.new_name)
-                        .hint_text("novo nome")
+                        .hint_text(if move_type {
+                            "novo pacote (ex.: org.demo)"
+                        } else {
+                            "novo nome"
+                        })
                         .desired_width(f32::INFINITY),
                 );
                 if state.focus_pending {
@@ -3594,7 +3844,10 @@ impl ReclipseApp {
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Renomear").clicked() {
+                    if ui
+                        .button(if move_type { "Mover" } else { "Renomear" })
+                        .clicked()
+                    {
                         apply = true;
                     }
                     if ui.button("Cancelar").clicked() {
@@ -4757,6 +5010,12 @@ impl ReclipseApp {
                         "",
                         Action::FetchDeps,
                     ),
+                    PaletteEntry::new(
+                        "Projeto: baixar sources/Javadoc (Maven)",
+                        "",
+                        Action::DownloadDocs,
+                    ),
+                    PaletteEntry::new("JDT: reiniciar servidor (opt-in)", "", Action::RestartJdtls),
                     PaletteEntry::new("Projeto: cancelar build/execução", "", Action::CancelBuild),
                     PaletteEntry::new("Projeto: re-executar última main", "", Action::Rerun),
                     PaletteEntry::new(
@@ -4779,12 +5038,14 @@ impl ReclipseApp {
                     ),
                     PaletteEntry::new("Editar: renomear", "Alt+Shift+R", Action::Rename),
                     PaletteEntry::new("Editar: renomear pacote", "", Action::RenamePackage),
+                    PaletteEntry::new("Editar: mover tipo para pacote", "", Action::MoveType),
                     PaletteEntry::new(
                         "Código: organizar imports",
                         "Ctrl+Shift+I",
                         Action::OrganizeImports,
                     ),
                     PaletteEntry::new("Código: formatar arquivo", "Ctrl+Alt+F", Action::FormatFile),
+                    PaletteEntry::new("Código: ver Javadoc", "F2", Action::ShowJavadoc),
                     PaletteEntry::new(
                         "Navegar: referências",
                         "Ctrl+Shift+G",
@@ -4994,6 +5255,10 @@ impl ReclipseApp {
         }
         if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::F11)) {
             self.start_debug();
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::F2)) {
+            self.open_javadoc();
             return;
         }
         if self
@@ -5734,6 +5999,17 @@ impl ReclipseApp {
                     });
 
                     ui.menu_button("Código", |ui| {
+                        if ui.button("Mover tipo para pacote…").clicked() {
+                            ui.close_menu();
+                            self.begin_type_move();
+                        }
+                        if ui
+                            .add(egui::Button::new("Ver Javadoc").shortcut_text("F2"))
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.open_javadoc();
+                        }
                         if ui
                             .add(
                                 egui::Button::new("Organizar imports")
@@ -6139,6 +6415,17 @@ impl ReclipseApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new(cp_text).small().color(cp_color));
                         ui.separator();
+                        if self.jdtls_status != JdtlsStatus::Disabled {
+                            let response = ui.label(
+                                RichText::new(self.jdtls_status.label())
+                                    .small()
+                                    .color(self.jdtls_status.color()),
+                            );
+                            if let Some(message) = &self.jdtls_status_message {
+                                response.on_hover_text(message);
+                            }
+                            ui.separator();
+                        }
                         if self.build_running {
                             ui.label(
                                 RichText::new(self.build_label.as_deref().unwrap_or("build…"))
@@ -8563,6 +8850,8 @@ impl ReclipseApp {
             Action::Run => self.run_project(),
             Action::Test => self.test_project(),
             Action::FetchDeps => self.fetch_dependencies(),
+            Action::DownloadDocs => self.download_documentation(),
+            Action::RestartJdtls => self.restart_jdtls(),
             Action::CancelBuild => self.cancel_build(),
             Action::Rerun => self.rerun_last(),
             Action::LaunchConfig => {
@@ -8583,8 +8872,10 @@ impl ReclipseApp {
             Action::GoToDefinition => self.goto_definition(),
             Action::Rename => self.begin_rename(),
             Action::RenamePackage => self.begin_package_rename(),
+            Action::MoveType => self.begin_type_move(),
             Action::OrganizeImports => self.organize_imports(),
             Action::FormatFile => self.format_file(),
+            Action::ShowJavadoc => self.open_javadoc(),
             Action::FindReferences => self.find_references(),
             Action::FindInFile => self.begin_file_search(false),
             Action::ReplaceInFile => self.begin_file_search(true),
@@ -8780,10 +9071,19 @@ impl ReclipseApp {
             if !already {
                 self.toggle_breakpoint(path.clone(), line);
             }
+            let spring_boot = source.contains("SpringApplication.run")
+                || path.to_string_lossy().contains("spring-boot");
+            let (condition, watch) = if spring_boot {
+                ("args != null", "args.length")
+            } else {
+                ("user != null", "user.name")
+            };
             self.breakpoint_conditions
-                .insert((path, line), "user != null".to_owned());
-            if !self.watches.iter().any(|watch| watch == "user.name") {
-                self.watches.push("user.name".to_owned());
+                .insert((path, line), condition.to_owned());
+            self.watches
+                .retain(|existing| existing != "user.name" && existing != "args.length");
+            if !self.watches.iter().any(|existing| existing == watch) {
+                self.watches.push(watch.to_owned());
             }
             self.start_debug();
         }
@@ -8881,6 +9181,20 @@ impl ReclipseApp {
                                     self.tabs[active].pending_cursor = Some(character);
                                     self.find_references();
                                     self.screenshot.references_done = true;
+                                }
+                            }
+                        }
+                    }
+                    if !self.screenshot.javadoc_done {
+                        if let Some(word) = self.screenshot.javadoc_word.clone() {
+                            if let Some(active) = self.active_tab {
+                                let text = self.tabs[active].doc.text();
+                                if let Some(position) = text.find(&word) {
+                                    let character = text[..position].chars().count() + 1;
+                                    self.tabs[active].doc.set_cursor(character, false);
+                                    self.tabs[active].pending_cursor = Some(character);
+                                    self.open_javadoc();
+                                    self.screenshot.javadoc_done = true;
                                 }
                             }
                         }
@@ -9066,6 +9380,7 @@ impl eframe::App for ReclipseApp {
         self.show_classpath_source(ctx);
         self.show_launch_dialog(ctx);
         self.show_breakpoint_condition_dialog(ctx);
+        self.show_javadoc_view(ctx);
         self.show_about(ctx);
         self.show_project_replace_confirm(ctx);
         self.show_recovery(ctx);
@@ -9839,6 +10154,20 @@ fn hover_resolved(
             if !class.interfaces.is_empty() {
                 lines.push(format!("implements {}", class.interfaces.join(", ")));
             }
+            if let Some(location) = classpath.source_location(&class.name) {
+                if let Ok(source) = reclipse_classpath::read_source(&location) {
+                    let parsed = reclipse_java::parse_source(Path::new("Hover.java"), &source);
+                    if let Some(symbol) = parsed
+                        .symbols
+                        .iter()
+                        .find(|symbol| symbol.kind.is_type() && symbol.name == class.simple_name())
+                    {
+                        if let Some(doc) = symbol_javadoc(&source, symbol.name_start_byte) {
+                            lines.push(doc);
+                        }
+                    }
+                }
+            }
             (title, lines)
         }
     }
@@ -9849,6 +10178,15 @@ fn hover_resolved(
 /// `name_start` (e.g. `/** ... */ public String greet`), but nothing else
 /// (`(`, `)`, `;`, `{`, `}` in between means the comment belongs elsewhere).
 fn symbol_javadoc(source: &str, name_start: usize) -> Option<String> {
+    symbol_javadoc_body(source, name_start).map(javadoc_first_sentence)
+}
+
+/// Full Javadoc block (HTML-ish) attached to a declaration.
+fn symbol_javadoc_full(source: &str, name_start: usize) -> Option<String> {
+    symbol_javadoc_body(source, name_start).map(javadoc_full_text)
+}
+
+fn symbol_javadoc_body(source: &str, name_start: usize) -> Option<&str> {
     let before = source.get(..name_start.min(source.len()))?;
     let comment_end = before.rfind("*/")?;
     let between = before[comment_end + 2..].trim();
@@ -9864,7 +10202,93 @@ fn symbol_javadoc(source: &str, name_start: usize) -> Option<String> {
     if body.is_empty() {
         return None;
     }
-    Some(javadoc_first_sentence(body))
+    Some(body)
+}
+
+fn javadoc_full_text(body: &str) -> String {
+    let mut output = String::new();
+    for raw_line in body.lines() {
+        let mut line = raw_line.trim().trim_start_matches('*').trim().to_owned();
+        if line.is_empty() {
+            if !output.ends_with("\n\n") && !output.is_empty() {
+                output.push('\n');
+            }
+            continue;
+        }
+        if line.starts_with('@') && !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        line = line
+            .replace("<p>", "\n")
+            .replace("<P>", "\n")
+            .replace("<br>", "\n")
+            .replace("<br/>", "\n")
+            .replace("<br />", "\n")
+            .replace("<li>", "• ")
+            .replace("<LI>", "• ");
+        line = strip_inline_javadoc_tags(&line);
+        line = strip_html_tags(&line);
+        line = decode_html_entities(&line);
+        if output.ends_with('\n') && line.is_empty() {
+            continue;
+        }
+        output.push_str(line.trim_end());
+        output.push('\n');
+    }
+    while output.ends_with('\n') {
+        output.pop();
+    }
+    output
+}
+
+fn strip_inline_javadoc_tags(text: &str) -> String {
+    let mut output = String::new();
+    let mut rest = text;
+    loop {
+        let Some(open) = rest.find("{@") else {
+            output.push_str(rest);
+            break;
+        };
+        output.push_str(&rest[..open]);
+        let Some(close_rel) = rest[open..].find('}') else {
+            output.push_str(&rest[open..]);
+            break;
+        };
+        let close = open + close_rel;
+        let tag = rest[open + 2..close].trim();
+        let content = tag
+            .split_once(char::is_whitespace)
+            .map(|(_, content)| content.trim())
+            .unwrap_or("");
+        let content = content.split('#').next().unwrap_or(content).trim();
+        output.push_str(content.trim_end_matches("()"));
+        rest = &rest[close + 1..];
+    }
+    output
+}
+
+fn strip_html_tags(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for character in text.chars() {
+        match character {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => output.push(character),
+            _ => {}
+        }
+    }
+    output
+}
+
+fn decode_html_entities(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", " ")
 }
 
 fn javadoc_first_sentence(body: &str) -> String {
@@ -10192,6 +10616,17 @@ mod tests {
             "project/gradle/libs.versions.toml"
         )));
         assert!(!is_classpath_config(Path::new("project/App.java")));
+    }
+
+    #[test]
+    fn renders_full_javadoc_with_html() {
+        let text = javadoc_full_text(
+            " Summary.\n * <p>Second paragraph with {@link User} and {@code run()}.</p>\n * @param name the name\n * @return value",
+        );
+        assert!(text.contains("Summary."));
+        assert!(text.contains("Second paragraph with User and run."));
+        assert!(!text.contains('<'));
+        assert!(text.contains("@param"));
     }
 
     #[test]
