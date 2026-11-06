@@ -42,16 +42,18 @@ Este repositório contém o **MVP 0.1.0**, o **M1** do editor, o **M2** (classpa
   - aplica edits em lote e um único passo de undo para rename local.
 - **Mover tipo top-level** para outro pacote (`Código → Mover tipo para pacote…`), atualizando `package`, imports, referências qualificadas, Javadoc e `module-info`.
 - **Compilação e execução**: **Compilar** com `javac` (classpath do projeto + `--release` do target), **Build compile/package/clean** do Maven/Gradle com saída incremental, diagnósticos no painel Problemas e **Executar** a classe `main` com `java` (`Ctrl+F11`).
-- **Debugger JDWP nativo**: breakpoints de linha com condição e filtro por tipo de exceção (capturadas/não capturadas), launch ou **attach local/remoto** (estilo JBoss/WildFly/Spring Boot, com reconexão), stepping (`F5`/`F6`/`F7`/`F8`), call stack, threads, variáveis locais e campos de `this`, watches, evaluator de expressões (inclui `arr[i]` e chamadas `obj.m()`/`Classe.stat()`), hot swap e matriz de validação em `docs/VALIDATION.md` (`F11`).
+- **Debugger JDWP nativo**: breakpoints de linha com condição e filtro por tipo de exceção (capturadas/não capturadas), launch ou **attach local/remoto** (estilo JBoss/WildFly/Spring Boot, com reconexão), **servidor DAP** (`--dap` para VS Code/outros clientes), stepping (`F5`/`F6`/`F7`/`F8`), call stack, threads, variáveis locais e campos de `this`, watches, evaluator de expressões (inclui `arr[i]` e chamadas `obj.m()`/`Classe.stat()`), hot swap e matriz de validação em `docs/VALIDATION.md` (`F11`).
 - **Javadoc completo** (`F2`) em uma janela com parágrafos, listas, tags HTML básicas e `{@link}`/`{@code}`; o hover continua mostrando a primeira frase.
 - **Download de sources/Javadoc** via Maven (`dependency:sources` + `dependency:resolve -Dclassifier=javadoc`), com reindexação automática; o hover de tipos externos passa a mostrar a primeira frase do source baixado.
 - **Toolbar e painel DEBUG com ícones vetoriais próprios** para compilar, build, testar, launch e debug (play, besouro, prancheta, frasco, step over/into/return, pause/stop), inspirados nas metáforas do Eclipse/WTP sem copiar assets EPL-2.0.
 - **Build Path estilo WTP**: menu de contexto **Build Path → Configure Build Path…** no explorer, com diálogo para sources, JARs, containers JRE e output (projetos Eclipse); Maven/Gradle aparecem somente leitura.
-- **JUnit inline**: descoberta de testes JUnit 4/5, árvore classe → método no right dock, execução por classe ou método e falhas clicáveis com stack frame.
+- **JUnit inline**: descoberta de testes JUnit 4/5, árvore classe → método no right dock, execução por classe ou método e falhas clicáveis com stack frame — e **JUnit direto** (console launcher, sem Maven/Gradle).
+- **Gradle via init script**: sincronização do modelo (source sets + dependências) e download de sources/Javadoc para `build/reclipse-docs`; JDT instalável em um clique.
 - **Editor dividido** com dois painéis e **abas arrastáveis** (drag-and-drop) entre eles.
-- **Organizar imports** (`Ctrl+Shift+I`) e **formatar arquivo** via formatter externo opt-in (`Ctrl+Alt+F`).
+- **Organizar imports** (`Ctrl+Shift+I`) e **formatar arquivo** (`Ctrl+Alt+F`): formatter **embutido** por padrão, externo opt-in (`RECLIPSE_FORMATTER`/`RECLIPSE_FORMATTER_JAR`).
+- **Múltiplas launch configs** nomeadas (run/debug/attach) com persistência na sessão.
 - **Console ANSI**: cores SGR, histórico persistido e limites explícitos (600 linhas, 4 KiB/linha).
-- **Rename de pacote** (com subpacotes): atualiza `package`, imports, referências qualificadas e move os `.java` entre source roots.
+- **Rename de pacote** (com subpacotes): atualiza `package`, imports, referências qualificadas e move os `.java` entre source roots; rename **textual opt-in** inclui strings literais, comentários e `.properties`.
 - **Inferência de `var`** em inicializadores simples (`new Type(...)`, literais) para completion/hover.
 - Diagnóstico de **imports não resolvidos** no painel de problemas.
 - **File watcher**: recarga automática de arquivos limpos alterados no disco e banner de conflito para buffers sujos.
@@ -139,16 +141,16 @@ Visualizador de Javadoc completo (`F2`) com parágrafos e inline tags:
 
 Este MVP é deliberadamente honesto sobre o escopo:
 
-- O debugger usa JDWP nativo e entrega launch/attach local e remoto (com retry e reconexão; receitas para JBoss/WildFly/Spring Boot em `docs/REMOTE_DEBUG.md`), breakpoints de linha, condicionais e por tipo de exceção, stepping, call stack, variáveis, campos de `this`, watches, evaluator com chamadas e índices, hot swap e mapeamento de anônimas/lambdas por arquivo-fonte; ainda faltam DAP externo e TLS.
+- O debugger usa JDWP nativo e entrega launch/attach local e remoto (com retry e reconexão; receitas para JBoss/WildFly/Spring Boot em `docs/REMOTE_DEBUG.md`), **servidor DAP** (`--dap`), breakpoints de linha, condicionais e por tipo de exceção, stepping, call stack, variáveis, campos de `this`, watches, evaluator com chamadas e índices, hot swap e mapeamento de anônimas/lambdas por arquivo-fonte; ainda falta TLS.
 - Compila e executa `main` via `javac`/`java` com launch config, roda `mvn test`/`gradle test` com parser e JUnit inline por classe/método, e depura via JDWP; ainda não executa ciclos de build Maven/Gradle completos.
-- O formatter é externo e opt-in (`RECLIPSE_FORMATTER`/`RECLIPSE_FORMATTER_JAR`); organize imports é nativo e conservador.
-- A semântica Java cobre imports/tipos, completion de membros, hover, referências semânticas de tipos/membros, rename conservador, overloads em 3 fases JLS, type variables com bounds, wildcards, diagnósticos nativos (tipos/membros não resolvidos, `@Override`, static ambíguo) além do `javac` em fundo, e JDT LS opt-in. Tipos locais são detectados; tipos anônimos ainda não são modelados como tipos de projeto.
-- Rename atualiza Javadoc e diretivas `module-info`; não reescreve strings, configuração por reflexão ou nomes em arquivos de recursos. Overrides/implementações e locais sombreados são recusados por segurança, e o rename de workspace exige buffers Java salvos.
-- Maven/Gradle resolvem dependências transitivas do repositório local e têm download sob demanda e perfis Maven; não há Tooling API nem bundles avançados do Gradle.
+- O formatter **embutido** é o padrão (externo opt-in); organize imports é nativo e conservador.
+- A semântica Java cobre imports/tipos, completion de membros, hover, referências semânticas de tipos/membros, rename conservador (+ textual opt-in), overloads em 3 fases JLS, type variables com bounds, wildcards, tipos locais/anônimas modelados, diagnósticos nativos além do `javac` em fundo, e JDT LS com instalação one-click.
+- Rename atualiza Javadoc e diretivas `module-info`, com textual opt-in para strings e `.properties`; não reescreve configuração por reflexão. Overrides/implementações e locais sombreados são recusados por segurança, e o rename de workspace exige buffers Java salvos.
+- Maven/Gradle resolvem dependências transitivas do repositório local e têm download sob demanda, perfis Maven, modelo Gradle via init script e sources/Javadoc (Maven + Gradle); não há Tooling API JVM-side nem bundles avançados do Gradle.
 - Multi-cursor agrupa undo de digitação, mas backspace/delete multi ainda são por tecla.
 - Não é um substituto completo do Eclipse para projetos corporativos.
 - Plugins Eclipse/OSGi/SWT **não** são carregados ainda. A compatibilidade headless está no roadmap.
-- Há **JDT LS opt-in** via `RECLIPSE_JDTLS` (diagnósticos extras), com status na toolbar e reinício pela palette; empacotamento do servidor e uma matriz de testes de projetos reais ainda faltam.
+- Há **JDT LS** com instalação one-click pela palette (download do release, launcher automático) ou `RECLIPSE_JDTLS` manual, status na toolbar e reinício pela palette; matriz de projetos reais em `docs/JDTLS.md`.
 
 Veja [docs/STATUS.md](docs/STATUS.md) para o estado consolidado, [docs/M1.md](docs/M1.md) para o editor, [docs/M2.md](docs/M2.md) para classpath/semântica, [docs/M3.md](docs/M3.md) para build/testes e [docs/M4.md](docs/M4.md) para o debugger. O [docs/ROADMAP.md](docs/ROADMAP.md) lista os próximos marcos.
 

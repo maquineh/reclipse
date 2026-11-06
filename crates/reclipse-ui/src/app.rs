@@ -23,7 +23,8 @@ use reclipse_debug::{
 use reclipse_editor::{Document, SearchMatcher, SearchOptions};
 use reclipse_java::refactor::{
     apply_text_edits, local_binding_at, organize_imports, plan_local_rename, plan_member_rename,
-    plan_package_rename, plan_type_move, plan_type_rename, LocalRenamePlan, RenameKind, RenamePlan,
+    plan_package_rename, plan_textual_java_edits, plan_textual_resource_edits, plan_type_move,
+    plan_type_rename, LocalRenamePlan, RenameKind, RenamePlan,
 };
 use reclipse_java::semantic::{
     completion_context, find_member_references, find_type_references, infer_variable_type,
@@ -357,6 +358,8 @@ pub struct ReclipseApp {
     last_build: Option<(bool, u128)>,
     last_run_main: Option<String>,
     launch: build::LaunchConfig,
+    launch_configs: Vec<build::LaunchConfig>,
+    active_launch: usize,
     launch_open: bool,
     buildpath_dialog: Option<crate::buildpath::BuildPathDialog>,
     test_failures: Vec<build::TestFailure>,
@@ -376,6 +379,7 @@ pub struct ReclipseApp {
     watch_results: Vec<reclipse_debug::WatchValue>,
     hot_swap_running: bool,
     hot_swap_rx: Option<Receiver<HotSwapResult>>,
+    rename_textual: bool,
     source_signatures: HashMap<String, PathBuf>,
     classpath_view: Option<String>,
     classpath_source: Option<(String, String)>,
@@ -468,6 +472,14 @@ impl ReclipseApp {
             last_build: None,
             last_run_main: None,
             launch: session.launch.clone(),
+            launch_configs: if session.launch_configs.is_empty() {
+                vec![session.launch.clone()]
+            } else {
+                session.launch_configs.clone()
+            },
+            active_launch: session
+                .active_launch
+                .min(session.launch_configs.len().saturating_sub(1)),
             launch_open: false,
             buildpath_dialog: None,
             test_failures: Vec::new(),
@@ -506,6 +518,7 @@ impl ReclipseApp {
             watch_input: String::new(),
             watch_results: Vec::new(),
             hot_swap_running: false,
+            rename_textual: false,
             hot_swap_rx: None,
             source_signatures: HashMap::new(),
             classpath_view: None,
@@ -2277,6 +2290,64 @@ impl ReclipseApp {
         self.test_project_filtered(None);
     }
 
+    /// Run JUnit directly with the console launcher (no Maven/Gradle).
+    fn test_project_direct(&mut self) {
+        if self.build_running {
+            self.toast("Build já em andamento (cancele para recomeçar)");
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            self.toast("Abra um projeto antes de testar");
+            return;
+        };
+        let mut classes: Vec<String> = self
+            .test_targets
+            .iter()
+            .map(|target| target.class_name.clone())
+            .collect();
+        classes.sort();
+        classes.dedup();
+        if classes.is_empty() {
+            self.toast("Nenhum teste JUnit descoberto");
+            return;
+        }
+        let build_env = self
+            .classpath_index
+            .as_ref()
+            .map(build::BuildEnv::from_classpath)
+            .unwrap_or_default();
+        self.test_failures.clear();
+        self.build_running = true;
+        self.build_label = Some("junit-direto".to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.build_cancel = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.build_rx = Some(receiver);
+        self.show_console = true;
+        let vars: HashMap<String, String> = std::env::vars().collect();
+        self.log(
+            LogLevel::Info,
+            "Executando JUnit direto (console launcher)…",
+        );
+        thread::spawn(move || {
+            let output_sender = sender.clone();
+            let message = match build::run_junit_direct(
+                &project,
+                &build_env,
+                &vars,
+                &classes,
+                &cancel,
+                &mut |text| {
+                    let _ = output_sender.send(BuildMessage::Output(text.to_owned()));
+                },
+            ) {
+                Ok(result) => BuildMessage::TestsFinished(Box::new(result)),
+                Err(error) => BuildMessage::Failed(error),
+            };
+            let _ = sender.send(message);
+        });
+    }
+
     fn test_project_filtered(&mut self, filter: Option<build::TestFilter>) {
         if self.build_running {
             self.toast("Build já em andamento (cancele para recomeçar)");
@@ -2326,6 +2397,91 @@ impl ReclipseApp {
             class_name: class_name.to_owned(),
             method: None,
         }));
+    }
+
+    /// Sync the Gradle model (init-script dump) and reindex the classpath.
+    fn sync_gradle_model(&mut self) {
+        if self.build_running {
+            self.toast("Build já em andamento (cancele para recomeçar)");
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            self.toast("Abra um projeto Gradle antes de sincronizar");
+            return;
+        };
+        self.build_running = true;
+        self.build_label = Some("gradle-modelo".to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.build_cancel = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.build_rx = Some(receiver);
+        self.show_console = true;
+        self.log(LogLevel::Info, "Sincronizando modelo Gradle…");
+        thread::spawn(move || {
+            let output_sender = sender.clone();
+            let message = match build::sync_gradle_model(&project, &cancel, &mut |text| {
+                let _ = output_sender.send(BuildMessage::Output(text.to_owned()));
+            }) {
+                Ok(result) => BuildMessage::External {
+                    label: result.tool,
+                    success: result.success,
+                    output: result.output,
+                    elapsed_ms: result.elapsed_ms,
+                    reindex_classpath: true,
+                },
+                Err(error) => BuildMessage::Failed(error),
+            };
+            let _ = sender.send(message);
+        });
+    }
+
+    /// One-click JDT LS install: resolve the latest tarball, download,
+    /// extract and wire the launcher. Explicit and cancellable.
+    fn install_jdtls(&mut self) {
+        if self.build_running {
+            self.toast("Build já em andamento (cancele para recomeçar)");
+            return;
+        }
+        self.build_running = true;
+        self.build_label = Some("jdtls-instalação".to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.build_cancel = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.build_rx = Some(receiver);
+        self.show_console = true;
+        self.log(LogLevel::Info, "Instalando JDT Language Server…");
+        thread::spawn(move || {
+            let output_sender = sender.clone();
+            let message = (|| -> Result<build::ResolveResult, String> {
+                let started = Instant::now();
+                let url = crate::jdtls_setup::latest_asset_url()?;
+                let launcher = crate::jdtls_setup::install_from_url(
+                    &url,
+                    &mut |text| {
+                        let _ = output_sender.send(BuildMessage::Output(text.to_owned()));
+                    },
+                    &cancel,
+                    std::time::Duration::from_secs(600),
+                )?;
+                Ok(build::ResolveResult {
+                    success: true,
+                    tool: "JDT LS: instalar servidor".to_owned(),
+                    output: format!("instalado: {}", launcher.display()),
+                    elapsed_ms: started.elapsed().as_millis(),
+                })
+            })();
+            let message = match message {
+                Ok(result) => BuildMessage::External {
+                    label: result.tool,
+                    success: result.success,
+                    output: result.output,
+                    elapsed_ms: result.elapsed_ms,
+                    reindex_classpath: false,
+                },
+                Err(error) => BuildMessage::Failed(error),
+            };
+            let _ = sender.send(message);
+        });
     }
 
     fn fetch_dependencies(&mut self) {
@@ -3673,7 +3829,7 @@ impl ReclipseApp {
                     }
                 }
                 Ok(plan) => {
-                    let ranges: Vec<(usize, usize)> = plan
+                    let mut ranges: Vec<(usize, usize)> = plan
                         .edits
                         .iter()
                         .map(|edit| {
@@ -3683,15 +3839,27 @@ impl ReclipseApp {
                             )
                         })
                         .collect();
+                    let mut extra = 0;
+                    if self.rename_textual {
+                        for edit in plan_textual_java_edits(&source, &plan.old_name, &plan.new_name)
+                        {
+                            ranges.push((
+                                source[..edit.start_byte].chars().count(),
+                                source[..edit.end_byte].chars().count(),
+                            ));
+                            extra += 1;
+                        }
+                    }
                     self.tabs[index].doc.replace_ranges(ranges, &plan.new_name);
                     self.tabs[index].invalidate_highlight();
                     self.tabs[index].focus();
                     self.rename = None;
                     self.toast(format!(
-                        "{} renomeado para {} ({} ocorrência(s))",
+                        "{} renomeado para {} ({} ocorrência(s){})",
                         plan.old_name,
                         plan.new_name,
-                        plan.edits.len()
+                        plan.edits.len() + extra,
+                        if extra > 0 { ", inclui textual" } else { "" },
                     ));
                 }
                 Err(error) => {
@@ -3728,7 +3896,7 @@ impl ReclipseApp {
             },
             RenameTarget::Local { .. } => unreachable!(),
         };
-        let plan = match plan {
+        let mut plan = match plan {
             Ok(plan) => plan,
             Err(error) => {
                 if let Some(state) = &mut self.rename {
@@ -3751,6 +3919,10 @@ impl ReclipseApp {
                 ));
             }
             return;
+        }
+
+        if self.rename_textual {
+            self.extend_plan_textual(&mut plan);
         }
 
         match self.apply_workspace_rename(&plan) {
@@ -3782,6 +3954,98 @@ impl ReclipseApp {
                 if let Some(state) = &mut self.rename {
                     state.error = Some(error);
                 }
+            }
+        }
+    }
+
+    /// `.properties` files under the project root for opt-in textual rename.
+    /// Skips hidden, build output and VCS directories; depth-limited.
+    fn resource_files_for_textual(root: &Path) -> Vec<PathBuf> {
+        const SKIPPED: &[&str] = &[
+            "target",
+            "build",
+            "bin",
+            "out",
+            ".git",
+            ".reclipse",
+            "node_modules",
+        ];
+        let mut files = Vec::new();
+        let mut stack = vec![(root.to_path_buf(), 0)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > 8 || files.len() >= 500 {
+                break;
+            }
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                if path.is_dir() {
+                    if !SKIPPED.iter().any(|skipped| name == *skipped) {
+                        stack.push((path, depth + 1));
+                    }
+                } else if path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("properties"))
+                {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// Opt-in textual rename: string literals/comments in Java files plus
+    /// `.properties` resources. Merged into the semantic plan (disjoint by
+    /// construction); open dirty non-Java buffers are skipped, never clobbered.
+    fn extend_plan_textual(&mut self, plan: &mut RenamePlan) {
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let dirty: std::collections::HashSet<PathBuf> = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.doc.dirty)
+            .map(|tab| tab.doc.path.clone())
+            .collect();
+        let mut extra: Vec<(PathBuf, Vec<reclipse_java::refactor::TextEdit>)> = Vec::new();
+        for path in &project.java_files {
+            if dirty.contains(path) {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(path) else {
+                continue;
+            };
+            let edits = plan_textual_java_edits(&text, &plan.old_name, &plan.new_name);
+            if !edits.is_empty() {
+                extra.push((path.clone(), edits));
+            }
+        }
+        for path in Self::resource_files_for_textual(&project.root) {
+            if dirty.contains(&path) {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let edits = plan_textual_resource_edits(&text, &plan.old_name, &plan.new_name);
+            if !edits.is_empty() {
+                extra.push((path, edits));
+            }
+        }
+        for (path, mut edits) in extra {
+            if let Some(existing) = plan.files.iter_mut().find(|file| file.path == path) {
+                existing.edits.append(&mut edits);
+            } else {
+                plan.files
+                    .push(reclipse_java::refactor::FileEdits { path, edits });
             }
         }
     }
@@ -3913,6 +4177,10 @@ impl ReclipseApp {
                 if let Some(error) = &state.error {
                     ui.label(RichText::new(error).small().color(theme::red()));
                 }
+                ui.checkbox(
+                    &mut self.rename_textual,
+                    "incluir strings e recursos (textual, opt-in)",
+                );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui
@@ -4012,6 +4280,8 @@ impl ReclipseApp {
             font_size: self.font_size,
             theme: self.theme.config_name().to_owned(),
             launch: self.launch.clone(),
+            launch_configs: self.launch_configs.clone(),
+            active_launch: self.active_launch,
             keybindings: self.keybindings.clone(),
         }
     }
@@ -5077,6 +5347,16 @@ impl ReclipseApp {
                     PaletteEntry::new("Projeto: executar", "Ctrl+F11", Action::Run),
                     PaletteEntry::new("Projeto: testar (mvn/gradle)", "", Action::Test),
                     PaletteEntry::new(
+                        "Projeto: testar (JUnit direto, sem runner)",
+                        "",
+                        Action::TestDirect,
+                    ),
+                    PaletteEntry::new(
+                        "Gradle: sincronizar modelo (init script)",
+                        "",
+                        Action::SyncGradleModel,
+                    ),
+                    PaletteEntry::new(
                         "Projeto: baixar dependências (mvn/gradle)",
                         "",
                         Action::FetchDeps,
@@ -5092,6 +5372,11 @@ impl ReclipseApp {
                         Action::ConfigureBuildPath,
                     ),
                     PaletteEntry::new("JDT: reiniciar servidor (opt-in)", "", Action::RestartJdtls),
+                    PaletteEntry::new(
+                        "JDT: instalar servidor (download)",
+                        "",
+                        Action::InstallJdtls,
+                    ),
                     PaletteEntry::new("Projeto: cancelar build/execução", "", Action::CancelBuild),
                     PaletteEntry::new("Projeto: re-executar última main", "", Action::Rerun),
                     PaletteEntry::new(
@@ -7078,6 +7363,15 @@ impl ReclipseApp {
         }
     }
 
+    /// Point `self.launch` at the active named configuration.
+    fn sync_launch_from_list(&mut self) {
+        if self.launch_configs.is_empty() {
+            self.launch_configs.push(build::LaunchConfig::default());
+        }
+        self.active_launch = self.active_launch.min(self.launch_configs.len() - 1);
+        self.launch = self.launch_configs[self.active_launch].clone();
+    }
+
     fn show_launch_dialog(&mut self, ctx: &Context) {
         if !self.launch_open {
             return;
@@ -7096,6 +7390,68 @@ impl ReclipseApp {
                         .color(theme::muted()),
                 );
                 ui.separator();
+                ui.label(RichText::new("Configurações").strong());
+                let mut select: Option<usize> = None;
+                let mut delete: Option<usize> = None;
+                let mut add = false;
+                let mut duplicate = false;
+                for (index, config) in self.launch_configs.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let name = if config.name.trim().is_empty() {
+                            format!("config {}", index + 1)
+                        } else {
+                            config.name.clone()
+                        };
+                        if ui
+                            .selectable_label(index == self.active_launch, name)
+                            .clicked()
+                        {
+                            select = Some(index);
+                        }
+                        if self.launch_configs.len() > 1
+                            && ui.small_button("×").on_hover_text("Excluir").clicked()
+                        {
+                            delete = Some(index);
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    if ui.small_button("＋ Nova").clicked() {
+                        add = true;
+                    }
+                    if ui.small_button("Duplicar").clicked() {
+                        duplicate = true;
+                    }
+                });
+                ui.separator();
+                ui.label("Nome:");
+                ui.text_edit_singleline(&mut self.launch.name);
+                if add {
+                    self.launch_configs.push(build::LaunchConfig {
+                        name: format!("config {}", self.launch_configs.len() + 1),
+                        ..Default::default()
+                    });
+                    self.active_launch = self.launch_configs.len() - 1;
+                    self.sync_launch_from_list();
+                }
+                if duplicate {
+                    let mut copy = self.launch.clone();
+                    copy.name = format!("{} (cópia)", copy.name);
+                    self.launch_configs.push(copy);
+                    self.active_launch = self.launch_configs.len() - 1;
+                    self.sync_launch_from_list();
+                }
+                if let Some(index) = select {
+                    self.active_launch = index;
+                    self.sync_launch_from_list();
+                }
+                if let Some(index) = delete {
+                    self.launch_configs.remove(index);
+                    self.active_launch = self
+                        .active_launch
+                        .min(self.launch_configs.len().saturating_sub(1));
+                    self.sync_launch_from_list();
+                }
                 ui.label("Classe main (vazio = auto-detectar):");
                 ui.text_edit_singleline(&mut self.launch.main_class);
                 if !self.main_classes.is_empty() {
@@ -7116,6 +7472,10 @@ impl ReclipseApp {
                 ui.text_edit_singleline(&mut self.launch.debug_attach);
                 ui.label("Ambiente (KEY=VAL por linha):");
                 ui.text_edit_multiline(&mut self.launch.env_vars);
+                // Edits go to the active entry; the list persists in the session.
+                if self.active_launch < self.launch_configs.len() {
+                    self.launch_configs[self.active_launch] = self.launch.clone();
+                }
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Executar").clicked() {
@@ -9204,10 +9564,13 @@ impl ReclipseApp {
             Action::BuildClean => self.run_lifecycle_phase(build::LifecyclePhase::Clean),
             Action::Run => self.run_project(),
             Action::Test => self.test_project(),
+            Action::TestDirect => self.test_project_direct(),
+            Action::SyncGradleModel => self.sync_gradle_model(),
             Action::FetchDeps => self.fetch_dependencies(),
             Action::DownloadDocs => self.download_documentation(),
             Action::ConfigureBuildPath => self.open_buildpath(),
             Action::RestartJdtls => self.restart_jdtls(),
+            Action::InstallJdtls => self.install_jdtls(),
             Action::CancelBuild => self.cancel_build(),
             Action::Rerun => self.rerun_last(),
             Action::LaunchConfig => {

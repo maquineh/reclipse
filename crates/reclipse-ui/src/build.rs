@@ -35,15 +35,29 @@ impl BuildEnv {
 }
 
 /// Launch configuration: which main to run and with what args/env.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct LaunchConfig {
+    pub name: String,
     pub main_class: String,
     pub program_args: String,
     pub jvm_args: String,
     pub env_vars: String,
     /// `host:port` for attaching instead of launching a JVM. Empty launches.
     pub debug_attach: String,
+}
+
+impl Default for LaunchConfig {
+    fn default() -> Self {
+        Self {
+            name: "padrão".to_owned(),
+            main_class: String::new(),
+            program_args: String::new(),
+            jvm_args: String::new(),
+            env_vars: String::new(),
+            debug_attach: String::new(),
+        }
+    }
 }
 
 impl LaunchConfig {
@@ -683,27 +697,28 @@ fn find_wrapper(root: &Path, wrappers: &[&str], fallbacks: &[&str]) -> Option<Pa
     None
 }
 
-/// Format Java source through an external formatter.
+/// Format Java source: external formatter when configured, built-in otherwise.
 ///
 /// Opt-in via `RECLIPSE_FORMATTER` (executable that reads stdin, e.g. a
 /// `google-java-format` wrapper) or `RECLIPSE_FORMATTER_JAR` (invoked with
-/// `java -jar <jar> -`). The native engine does not reimplement formatting.
+/// `java -jar <jar> -`). Without either, the native formatter
+/// (`reclipse_java::format`) reindents and normalizes spacing.
 pub fn format_source(source: &str) -> Result<String, String> {
     use std::io::Write;
     use std::process::Stdio;
 
-    let (program, args) = if let Ok(program) = std::env::var("RECLIPSE_FORMATTER") {
-        (PathBuf::from(program), vec!["-".to_owned()])
+    let external = if let Ok(program) = std::env::var("RECLIPSE_FORMATTER") {
+        Some((PathBuf::from(program), vec!["-".to_owned()]))
     } else if let Ok(jar) = std::env::var("RECLIPSE_FORMATTER_JAR") {
-        (
+        Some((
             jdk_binary(None, "java")?,
             vec!["-jar".to_owned(), jar, "-".to_owned()],
-        )
+        ))
     } else {
-        return Err(
-            "formatter não configurado: defina RECLIPSE_FORMATTER ou RECLIPSE_FORMATTER_JAR"
-                .to_owned(),
-        );
+        None
+    };
+    let Some((program, args)) = external else {
+        return Ok(reclipse_java::format::format_source(source));
     };
     let mut child = Command::new(&program)
         .args(&args)
@@ -910,10 +925,7 @@ pub fn download_documentation(
             "mvn dependency:sources/javadoc".to_owned(),
         ),
         TestTool::Gradle => {
-            return Err(
-                "Gradle não possui goal padrão para baixar sources/Javadoc; configure os artefatos no build"
-                    .to_owned(),
-            );
+            return download_gradle_documentation(project, env, cancel, on_output);
         }
     };
     let output = run_piped_stream(&binary, &args, env, &project.root, cancel, on_output)
@@ -934,6 +946,502 @@ pub struct ResolveResult {
     pub elapsed_ms: u128,
 }
 
+/// Sync the Gradle project model via the init-script dump
+/// (`reclipse_classpath::fetch_gradle_model`): source roots and external
+/// dependencies cached in `.reclipse/gradle-model.json`, then reindexed.
+/// Offline-first and explicit: this is the Gradle equivalent of asking the
+/// Tooling API for the project model, without a JVM-side client.
+pub fn sync_gradle_model(
+    project: &Project,
+    cancel: &AtomicBool,
+    on_output: &mut dyn FnMut(&str),
+) -> Result<ResolveResult, String> {
+    use std::time::Duration;
+    let started = Instant::now();
+    let binaries = reclipse_classpath::gradle_binaries(&project.root);
+    let binary = binaries
+        .into_iter()
+        .next()
+        .ok_or_else(|| "modelo Gradle requer o wrapper ou binário do Gradle".to_owned())?;
+    on_output(&format!(
+        "sincronizando modelo Gradle via {}…",
+        binary.display()
+    ));
+    let model = reclipse_classpath::fetch_gradle_model(
+        &project.root,
+        &binary,
+        Duration::from_secs(120),
+        &mut |line: &str| on_output(line),
+    )?;
+    let projects = model.projects.len();
+    let sources: usize = model.projects.iter().map(|p| p.sources.len()).sum();
+    Ok(ResolveResult {
+        success: !cancel.load(Ordering::SeqCst),
+        tool: "gradle modelo".to_owned(),
+        output: format!(
+            "modelo Gradle sincronizado: {projects} projeto(s), {sources} source root(s) em .reclipse/gradle-model.json"
+        ),
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+/// Download Gradle sources/Javadoc with an init script.///
+/// Gradle has no `dependency:sources` equivalent, so the IDE generates a
+/// `reclipseFetchDocs` task via `-I` that resolves the `sources` and
+/// `javadoc` classifiers of every `group:artifact:version` found in
+/// `build.gradle(.kts)`/`libs.versions.toml` into `<root>/build/reclipse-docs`.
+/// The classpath source lookup (`reclipse_classpath::source`) reads that
+/// directory. Missing artifacts are skipped artifact-by-artifact.
+pub fn download_gradle_documentation(
+    project: &Project,
+    env: &HashMap<String, String>,
+    cancel: &AtomicBool,
+    on_output: &mut dyn FnMut(&str),
+) -> Result<ResolveResult, String> {
+    let started = Instant::now();
+    let binary = find_wrapper(
+        &project.root,
+        &["gradlew.bat", "gradlew"],
+        &["gradle.bat", "gradle"],
+    )
+    .unwrap_or_else(|| PathBuf::from("gradle"));
+    let coordinates = gradle_coordinates(&project.root);
+    if coordinates.is_empty() {
+        return Err(
+            "nenhuma coordenada group:artifact:version encontrada no build Gradle".to_owned(),
+        );
+    }
+    let out_dir = project.root.join("build").join("reclipse-docs");
+    let script = gradle_docs_init_script(&coordinates, &out_dir);
+    let script_path =
+        std::env::temp_dir().join(format!("reclipse-docs-{}.gradle", std::process::id()));
+    std::fs::write(&script_path, script)
+        .map_err(|error| format!("falha ao gerar init script Gradle: {error}"))?;
+    let args = vec![
+        "-q".to_owned(),
+        "-I".to_owned(),
+        script_path.display().to_string(),
+        "reclipseFetchDocs".to_owned(),
+        "--console=plain".to_owned(),
+    ];
+    let output = run_piped_stream(&binary, &args, env, &project.root, cancel, on_output)
+        .map_err(|error| format!("falha ao executar gradle reclipseFetchDocs: {error}"))?;
+    Ok(ResolveResult {
+        success: output.status_success && !cancel.load(Ordering::SeqCst),
+        tool: "gradle reclipseFetchDocs".to_owned(),
+        output: output.combined,
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+/// Init script text: one `reclipseFetchDocs` task per project copying
+/// `sources`/`javadoc` artifacts of `coordinates` into `out_dir`.
+pub fn gradle_docs_init_script(coordinates: &[(String, String, String)], out_dir: &Path) -> String {
+    let out = out_dir.display().to_string().replace('\\', "/");
+    let mut coords = String::new();
+    for (group, artifact, version) in coordinates {
+        coords.push_str(&format!("'{group}:{artifact}:{version}', "));
+    }
+    format!(
+        "allprojects {{\n\
+         \ttasks.register('reclipseFetchDocs') {{\n\
+         \t\tdoLast {{\n\
+         \t\t\tdef outDir = new File('{out}')\n\
+         \t\t\toutDir.mkdirs()\n\
+         \t\t\tdef coords = [{coords}]\n\
+         \t\t\tcoords.each {{ c ->\n\
+         \t\t\t\t['sources', 'javadoc'].each {{ classifier ->\n\
+         \t\t\t\t\ttry {{\n\
+         \t\t\t\t\t\tdef conf = project.configurations.detachedConfiguration(\n\
+         \t\t\t\t\t\t\tproject.dependencies.create(\"${{c}}:${{classifier}}\"))\n\
+         \t\t\t\t\t\tconf.resolve().each {{ f -> project.copy {{ from f; into outDir }} }}\n\
+         \t\t\t\t\t}} catch (Exception ignored) {{}}\n\
+         \t\t\t\t}}\n\
+         \t\t\t}}\n\
+         \t\t}}\n\
+         \t}}\n\
+         }}\n"
+    )
+}
+
+/// `group:artifact:version` triples found in Gradle build files and the
+/// version catalog. Best effort: quoted coordinates, `group:`/`name:` map
+/// syntax and `module = "g:a"` + `version.ref` entries.
+pub fn gradle_coordinates(root: &Path) -> Vec<(String, String, String)> {
+    let mut text = String::new();
+    for name in ["build.gradle", "build.gradle.kts"] {
+        if let Ok(contents) = std::fs::read_to_string(root.join(name)) {
+            text.push_str(&contents);
+            text.push('\n');
+        }
+    }
+    let mut coordinates = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if let Some(coordinate) = gradle_map_coordinate(trimmed) {
+            coordinates.push(coordinate);
+            continue;
+        }
+        for quote in ['\'', '"'] {
+            let mut rest = trimmed;
+            while let Some(start) = rest.find(quote) {
+                let after = &rest[start + 1..];
+                let Some(end) = after.find(quote) else {
+                    break;
+                };
+                let value = &after[..end];
+                let parts: Vec<&str> = value.split(':').collect();
+                if parts.len() == 3
+                    && !parts.iter().any(|part| part.is_empty())
+                    && !value.contains("${")
+                {
+                    coordinates.push((
+                        parts[0].to_owned(),
+                        parts[1].to_owned(),
+                        parts[2].to_owned(),
+                    ));
+                }
+                rest = &after[end + 1..];
+            }
+        }
+    }
+    let catalog = root.join("gradle").join("libs.versions.toml");
+    let fallback_catalog = root.join("libs.versions.toml");
+    let catalog_path = if catalog.is_file() {
+        catalog
+    } else {
+        fallback_catalog
+    };
+    if let Ok(contents) = std::fs::read_to_string(&catalog_path) {
+        let mut versions: HashMap<String, String> = HashMap::new();
+        let mut section = String::new();
+        for line in contents.lines() {
+            let line = line.split('#').next().unwrap_or(line).trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('[') && line.ends_with(']') {
+                section = line[1..line.len() - 1].trim().to_owned();
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let (key, value) = (key.trim(), value.trim());
+            if section == "versions" {
+                if let Some(version) = unquote_simple(value) {
+                    versions.insert(key.to_owned(), version);
+                }
+            }
+            if section == "libraries" {
+                if let Some((group, artifact, version)) = catalog_coordinate(value, &versions) {
+                    coordinates.push((group, artifact, version));
+                }
+            }
+        }
+    }
+    coordinates.sort();
+    coordinates.dedup();
+    coordinates
+        .into_iter()
+        .filter(|(_, _, version)| !version.is_empty())
+        .collect()
+}
+
+fn gradle_map_coordinate(line: &str) -> Option<(String, String, String)> {
+    if !line.contains("group:") || !line.contains("name:") || !line.contains("version:") {
+        return None;
+    }
+    let group = quoted_after(line, "group:")?;
+    let artifact = quoted_after(line, "name:")?;
+    let version = quoted_after(line, "version:")?;
+    if version.contains("${") {
+        return None;
+    }
+    Some((group, artifact, version))
+}
+
+fn catalog_coordinate(
+    value: &str,
+    versions: &HashMap<String, String>,
+) -> Option<(String, String, String)> {
+    let value = value.trim();
+    if value.starts_with('"') || value.starts_with('\'') {
+        let coordinate = unquote_simple(value)?;
+        let parts: Vec<&str> = coordinate.split(':').collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        return Some((
+            parts[0].to_owned(),
+            parts[1].to_owned(),
+            parts[2].to_owned(),
+        ));
+    }
+    let inner = value.strip_prefix('{')?.strip_suffix('}')?;
+    let mut module = None;
+    let mut group = None;
+    let mut name = None;
+    let mut version = None;
+    for part in inner.split(',') {
+        let Some((key, raw)) = part.split_once('=') else {
+            continue;
+        };
+        match (key.trim(), raw.trim()) {
+            ("module", raw) => module = unquote_simple(raw),
+            ("group", raw) => group = unquote_simple(raw),
+            ("name", raw) => name = unquote_simple(raw),
+            ("version", raw) => {
+                if !raw.starts_with('{') {
+                    version = unquote_simple(raw);
+                }
+            }
+            ("version.ref", raw) => {
+                let reference = unquote_simple(raw).unwrap_or_default();
+                version = versions.get(&reference).cloned();
+            }
+            _ => {}
+        }
+    }
+    let (group, artifact) = if let Some(module) = module {
+        module
+            .split_once(':')
+            .map(|(group, artifact)| (group.to_owned(), artifact.to_owned()))?
+    } else {
+        (group?, name?)
+    };
+    Some((group, artifact, version.unwrap_or_default()))
+}
+
+fn unquote_simple(value: &str) -> Option<String> {
+    let value = value.trim();
+    let quote = value.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        if value.chars().all(|character| {
+            character.is_alphanumeric() || character == '.' || character == '-' || character == '_'
+        }) {
+            return Some(value.to_owned());
+        }
+        return None;
+    }
+    value
+        .strip_prefix(quote)?
+        .strip_suffix(quote)
+        .map(str::to_owned)
+}
+
+fn quoted_after(line: &str, key: &str) -> Option<String> {
+    let start = line.find(key)? + key.len();
+    let rest = line[start..].trim_start();
+    let quote = rest
+        .chars()
+        .next()
+        .filter(|value| *value == '\'' || *value == '"')?;
+    let rest = &rest[quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_owned())
+}
+
+/// Locate `junit-platform-console-standalone` in the local Maven repository.
+/// Used to run JUnit directly, without Maven/Gradle.
+pub fn junit_console_jar() -> Option<PathBuf> {
+    let repo = if let Some(path) = std::env::var_os("M2_REPO") {
+        PathBuf::from(path)
+    } else if let Some(home) = std::env::var_os("USERPROFILE") {
+        PathBuf::from(home).join(".m2").join("repository")
+    } else if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home).join(".m2").join("repository")
+    } else {
+        return None;
+    };
+    let base = repo
+        .join("org")
+        .join("junit")
+        .join("platform")
+        .join("junit-platform-console-standalone");
+    let entries = std::fs::read_dir(base).ok()?;
+    let mut jars = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let dir = entry.path();
+        let Ok(listing) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for candidate in listing.filter_map(Result::ok) {
+            let path = candidate.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("junit-platform-console-standalone-")
+                        && name.ends_with(".jar")
+                        && !name.contains("sources")
+                        && !name.contains("javadoc")
+                })
+            {
+                jars.push(path);
+            }
+        }
+    }
+    jars.sort();
+    jars.pop()
+}
+
+/// Run JUnit directly with the console launcher, without Maven/Gradle:
+/// compile with `javac`, then
+/// `java -cp <console.jar> org.junit.platform.console.ConsoleLauncher`.
+pub fn run_junit_direct(
+    project: &Project,
+    build_env: &BuildEnv,
+    vars: &HashMap<String, String>,
+    test_classes: &[String],
+    cancel: &AtomicBool,
+    on_output: &mut dyn FnMut(&str),
+) -> Result<TestResult, String> {
+    let started = Instant::now();
+    let console = junit_console_jar().ok_or_else(|| {
+        "JUnit direto requer junit-platform-console-standalone no repositório local \
+         (~/.m2/repository/org/junit/platform). Rode \"Projeto: baixar dependências\" \
+         num projeto Maven com junit-jupiter ou copie o jar para lá"
+            .to_owned()
+    })?;
+    if test_classes.is_empty() {
+        return Err("nenhuma classe de teste descoberta (JUnit 4/5)".to_owned());
+    }
+    let compiled = compile(project, build_env, cancel)?;
+    if !compiled.success {
+        return Err(format!(
+            "compilação falhou ({} erro(s)); ver painel Problemas",
+            compiled
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.is_error)
+                .count()
+        ));
+    }
+    let java = jdk_binary(build_env.jdk_home.as_deref(), "java")?;
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    let mut classpath = vec![
+        console.display().to_string(),
+        compiled.classes_dir.path().display().to_string(),
+    ];
+    classpath.extend(build_env.jars.iter().map(|jar| jar.display().to_string()));
+    let mut args = vec![
+        "-cp".to_owned(),
+        classpath.join(separator),
+        "org.junit.platform.console.ConsoleLauncher".to_owned(),
+        "execute".to_owned(),
+        "--details=tree".to_owned(),
+        "--details-theme=ascii".to_owned(),
+    ];
+    for class in test_classes {
+        args.push("--select-class".to_owned());
+        args.push(class.clone());
+    }
+    let output = run_piped_stream(&java, &args, vars, &project.root, cancel, on_output)
+        .map_err(|error| format!("falha ao executar JUnit direto: {error}"))?;
+    let summary = parse_junit_console_output(&output.combined);
+    Ok(TestResult {
+        success: output.status_success
+            && summary.errors == 0
+            && summary.failures == 0
+            && !cancel.load(Ordering::SeqCst),
+        tool: "junit direto (console launcher)".to_owned(),
+        summary,
+        output: output.combined,
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+/// Parse the JUnit Platform console launcher tree output:
+/// `[ N tests successful ]`, `[ N tests failed ]`, `[ N tests skipped ]`,
+/// plus `=> com.Foo.method()` failure headers with `at` frames.
+pub fn parse_junit_console_output(output: &str) -> TestSummary {
+    let mut summary = TestSummary::default();
+    let mut current: Option<TestFailure> = None;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(count) = bracket_count(trimmed, "tests successful")
+            .or_else(|| bracket_count(trimmed, "test successful"))
+        {
+            summary.total += count;
+        } else if let Some(count) =
+            bracket_count(trimmed, "tests failed").or_else(|| bracket_count(trimmed, "test failed"))
+        {
+            summary.total += count;
+            summary.failures += count;
+        } else if let Some(count) = bracket_count(trimmed, "tests skipped")
+            .or_else(|| bracket_count(trimmed, "tests aborted"))
+            .or_else(|| bracket_count(trimmed, "test skipped"))
+            .or_else(|| bracket_count(trimmed, "test aborted"))
+        {
+            summary.total += count;
+            summary.skipped += count;
+        } else if let Some(header) = trimmed.strip_prefix("=>") {
+            if let Some(previous) = current.take() {
+                summary.failures_detail.push(previous);
+            }
+            let header = header.trim();
+            let (class_name, method) = header
+                .rsplit_once('.')
+                .map(|(class, method)| {
+                    let method = method.split('(').next().unwrap_or(method);
+                    (
+                        Some(class.trim().to_owned()),
+                        Some(method.trim().to_owned()),
+                    )
+                })
+                .unwrap_or((None, None));
+            current = Some(TestFailure {
+                file: PathBuf::new(),
+                line: 0,
+                message: header.to_owned(),
+                class_name,
+                method,
+            });
+        } else if let Some(failure) = current.as_mut() {
+            if let Some(frame) = parse_console_frame(trimmed) {
+                if failure.file.as_os_str().is_empty() {
+                    failure.file = PathBuf::from(frame.0);
+                    failure.line = frame.1;
+                }
+                if failure.message.len() < 400 {
+                    failure.message = format!("{} | {trimmed}", failure.message);
+                }
+            }
+        }
+        if summary.failures_detail.len() + usize::from(current.is_some()) >= 200 {
+            break;
+        }
+    }
+    if let Some(previous) = current.take() {
+        summary.failures_detail.push(previous);
+    }
+    summary.failures_detail.truncate(200);
+    summary
+}
+
+fn bracket_count(line: &str, needle: &str) -> Option<usize> {
+    let trimmed = line.trim().trim_matches(['[', ']', ' ']);
+    let (count, rest) = trimmed.split_once(char::is_whitespace)?;
+    if rest.trim_start().starts_with(needle) {
+        count.trim().parse().ok()
+    } else {
+        None
+    }
+}
+
+/// `at com.acme.AppTest.shouldWork(AppTest.java:27)` → `(AppTest.java, 27)`.
+fn parse_console_frame(line: &str) -> Option<(String, usize)> {
+    let line = line.strip_prefix("at ")?;
+    let open = line.rfind('(')?;
+    let close = line.rfind(')')?;
+    let inside = line.get(open + 1..close)?;
+    let (file, line) = inside.rsplit_once(':')?;
+    Some((file.to_owned(), line.parse().unwrap_or(0)))
+}
 /// Download dependencies into the local repository using the project's own
 /// build tool (`mvn dependency:resolve` / `gradle dependencies`).
 /// Offline-first: this is the only operation that touches the network, and it
@@ -1243,6 +1751,31 @@ public class Hello {
     }
 
     #[test]
+    fn parses_console_launcher_tree_output() {
+        let output = r#"
++-- JUnit Jupiter [OK]
+| +-- com.acme.AppTest [OK]
+| | +-- works() [OK]
+| | +-- fails() X
+Failures (1):
+  => com.acme.AppTest.fails()
+     org.opentest4j.AssertionFailedError: expected true
+     at com.acme.AppTest.fails(AppTest.java:27)
+[         2 tests successful ]
+[         1 tests failed     ]
+"#;
+        let summary = parse_junit_console_output(output);
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.failures, 1);
+        assert_eq!(summary.failures_detail.len(), 1);
+        let failure = &summary.failures_detail[0];
+        assert_eq!(failure.file, PathBuf::from("AppTest.java"));
+        assert_eq!(failure.line, 27);
+        assert_eq!(failure.class_name.as_deref(), Some("com.acme.AppTest"));
+        assert_eq!(failure.method.as_deref(), Some("fails"));
+    }
+
+    #[test]
     fn detects_maven_and_gradle_wrappers() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("pom.xml"), "<project/>").unwrap();
@@ -1251,5 +1784,41 @@ public class Hello {
         let (tool, binary) = detect_test_tool(&project).unwrap();
         assert_eq!(tool, TestTool::Maven);
         assert!(binary.ends_with("mvnw.cmd"));
+    }
+
+    #[test]
+    fn parses_gradle_coordinates_and_builds_docs_init_script() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("build.gradle"),
+            "dependencies {\n    implementation 'com.acme:app:1.2.3'\n    implementation group: 'org.x', name: 'lib', version: '4.5'\n}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("gradle")).unwrap();
+        std::fs::write(
+            dir.path().join("gradle/libs.versions.toml"),
+            "[versions]\nquarkus = \"3.0\"\n[libraries]\nquarkus-core = { module = \"io.quarkus:quarkus-core\", version.ref = \"quarkus\" }\n",
+        )
+        .unwrap();
+        let coordinates = gradle_coordinates(dir.path());
+        assert!(coordinates.contains(&(
+            "com.acme".to_owned(),
+            "app".to_owned(),
+            "1.2.3".to_owned()
+        )));
+        assert!(coordinates.contains(&("org.x".to_owned(), "lib".to_owned(), "4.5".to_owned())));
+        assert!(coordinates.contains(&(
+            "io.quarkus".to_owned(),
+            "quarkus-core".to_owned(),
+            "3.0".to_owned()
+        )));
+        let script = gradle_docs_init_script(
+            &coordinates,
+            &dir.path().join("build").join("reclipse-docs"),
+        );
+        assert!(script.contains("reclipseFetchDocs"));
+        assert!(script.contains("'com.acme:app:1.2.3'"));
+        assert!(script.contains("sources"));
+        assert!(script.contains("javadoc"));
     }
 }

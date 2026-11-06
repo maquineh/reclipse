@@ -25,8 +25,17 @@ pub struct JdtlsConfig {
 
 impl JdtlsConfig {
     pub fn from_env(project_root: &Path) -> Option<Self> {
-        let command = std::env::var("RECLIPSE_JDTLS").ok()?;
-        let command = command.trim().to_owned();
+        // Explicit opt-in wins; otherwise use the one-click install.
+        let command = match std::env::var("RECLIPSE_JDTLS")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+        {
+            Some(command) => command,
+            None => crate::jdtls_setup::installed_launcher()?
+                .display()
+                .to_string(),
+        };
         if command.is_empty() {
             return None;
         }
@@ -633,8 +642,27 @@ mod tests {
     }
 
     #[test]
-    fn config_is_opt_in() {
+    fn config_prefers_env_then_installed_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("HOME");
+        let previous_profile = std::env::var_os("USERPROFILE");
+        std::env::set_var("HOME", dir.path());
+        std::env::set_var("USERPROFILE", dir.path());
         std::env::remove_var("RECLIPSE_JDTLS");
+        // Empty home: no server anywhere.
         assert!(JdtlsConfig::from_env(Path::new(".")).is_none());
+        std::env::set_var("RECLIPSE_JDTLS", "C:/tools/jdtls.cmd");
+        assert!(JdtlsConfig::from_env(Path::new(".")).is_some());
+        std::env::remove_var("RECLIPSE_JDTLS");
+        if let Some(previous) = previous_home {
+            std::env::set_var("HOME", previous);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(previous) = previous_profile {
+            std::env::set_var("USERPROFILE", previous);
+        } else {
+            std::env::remove_var("USERPROFILE");
+        }
     }
 }

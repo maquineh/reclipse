@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use reclipse_core::{BuildSystem, Project};
 
+use crate::gradle_model;
 use crate::maven::{self, Coordinate};
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,20 @@ pub fn resolve(project: &Project) -> Result<ClasspathResolution> {
         }
         BuildSystem::Gradle => {
             resolve_gradle(project, &mut jars, &mut warnings);
+            // Cached Gradle model (init-script dump): extra source roots and
+            // coordinates resolved from the local repository.
+            if let Some(model) = gradle_model::load_model_cache(&project.root) {
+                sources.extend(gradle_model::model_sources(&model));
+                if let Some(repo) = maven_repository() {
+                    let coordinates = gradle_model::model_coordinates(&model);
+                    if !coordinates.is_empty() {
+                        let resolution = maven::resolve_coordinates(&repo, &coordinates);
+                        jars.extend(resolution.jars);
+                        warnings.extend(resolution.warnings);
+                    }
+                }
+            }
+            sources.extend(gradle_model::extra_source_roots(&project.root));
         }
         BuildSystem::Plain => {}
     }

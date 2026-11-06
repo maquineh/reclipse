@@ -1,5 +1,6 @@
 //! Reclipse Java engine: syntax indexing today, semantic analysis next.
 
+pub mod format;
 pub mod index;
 pub mod parse;
 pub mod refactor;

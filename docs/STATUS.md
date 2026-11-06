@@ -39,16 +39,12 @@ Atualizado após a validação com Spring Boot e os refinamentos do M2.
 
 ## Pendente
 
-- Modelagem completa de tipos locais/anônimos como tipos de projeto.
-- Rename/move atualizando strings, recursos e referências por reflexão.
-- Download de sources/Javadoc no Gradle.
-- Empacotamento do JDT LS e matriz com projetos Maven multi-módulo/Gradle reais.
-- Adaptador DAP externo e TLS no attach remoto (retry + reconexão entregues, com receitas JBoss/WildFly/Spring Boot em `docs/REMOTE_DEBUG.md`).
-- Avaliação de chamadas de método/índices de array no debugger (entregue:
-  `arr[i]` via ArrayReference, `obj.m()`/`Classe.stat()` via InvokeMethod,
-  overloads por compatibilidade, rejeição em condições).
-- Debugger validado em multi-módulo Maven via teste `steps_across_maven_modules`
-  e matriz em `docs/VALIDATION.md`; falta Gradle real e matriz de JVMs.
+- Modelagem de tipos anônimos com ordinais por método (hoje mesclados por método) e `this`/`super` em corpos anônimos.
+- Rename/move atualizando referências por reflexão e nomes em arquivos de recursos não-textuais.
+- Bundles de version catalog e dependências de plugins Gradle; Tooling API JVM-side.
+- Adaptador DAP: variáveis de frames não-selecionados, selectFrame e pontos de log.
+- TLS/autenticação no attach remoto; matriz de JVMs na validação.
+- Variáveis de ambiente por plataforma nas launch configs.
 
 ## Como verificar
 

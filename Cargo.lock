@@ -2878,6 +2878,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "reclipse-core",
+ "serde",
+ "serde_json",
  "tempfile",
  "zip",
 ]
@@ -2890,6 +2892,16 @@ dependencies = [
  "dunce",
  "tempfile",
  "walkdir",
+]
+
+[[package]]
+name = "reclipse-dap"
+version = "0.1.0"
+dependencies = [
+ "reclipse-debug",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2956,6 +2968,7 @@ dependencies = [
  "notify",
  "reclipse-classpath",
  "reclipse-core",
+ "reclipse-dap",
  "reclipse-debug",
  "reclipse-editor",
  "reclipse-java",

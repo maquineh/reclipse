@@ -113,10 +113,8 @@ Entregue:
 
 Pendente:
 
-- JUnit independente do runner Maven/Gradle (execução direta via launcher/JUnit Platform).
-- Configurações de execução múltiplas e variáveis por plataforma.
-- Formatter embutido (sem dependência externa).
-- Debugger JDWP/JDI em andamento no M4 (núcleo, evaluator, exceções e remoto entregues; DAP externo pendente).
+- Variáveis de ambiente por plataforma nas launch configs.
+- Debugger JDWP/JDI em andamento no M4 (núcleo, evaluator, exceções, remoto e DAP entregues; TLS pendente).
 
 Aceite:
 
@@ -142,10 +140,10 @@ Entregue:
 
 Pendente:
 
-- adaptador DAP para clientes externos;
-- campos estáticos, `new`, casts e lambdas no evaluator (sem chamadas em condições);
-- TLS/autenticação no attach remoto;
-- Gradle real e matriz de JVMs na validação.
+- adaptador DAP para clientes externos (entregue: crate `reclipse-dap`, modo `--dap`);
+- campos estáticos, `new`, casts e lambdas no evaluator (chamadas, índices e filtros entregues);
+- TLS/autenticação no attach remoto (retry e reconexão entregues);
+- matriz de JVMs na validação (modelo Gradle via init script entregue).
 
 Aceite:
 

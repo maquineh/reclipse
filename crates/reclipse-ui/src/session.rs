@@ -67,6 +67,10 @@ pub struct Session {
     pub font_size: f32,
     pub theme: String,
     pub launch: crate::build::LaunchConfig,
+    #[serde(default)]
+    pub launch_configs: Vec<crate::build::LaunchConfig>,
+    #[serde(default)]
+    pub active_launch: usize,
     pub keybindings: Keybindings,
 }
 
@@ -86,6 +90,8 @@ impl Default for Session {
             font_size: 14.5,
             theme: "rust-oxide".to_owned(),
             launch: crate::build::LaunchConfig::default(),
+            launch_configs: Vec::new(),
+            active_launch: 0,
             keybindings: Keybindings::default(),
         }
     }
@@ -186,6 +192,34 @@ mod tests {
         let old = br#"{"show_project":false}"#;
         assert!(parse_session(old).unwrap().breakpoints.is_empty());
         assert!(parse_session(old).unwrap().watches.is_empty());
+    }
+
+    #[test]
+    fn persists_multiple_launch_configs() {
+        let mut session = Session::default();
+        session.launch_configs = vec![
+            crate::build::LaunchConfig {
+                name: "app".to_owned(),
+                main_class: "com.acme.App".to_owned(),
+                ..Default::default()
+            },
+            crate::build::LaunchConfig {
+                name: "debug-remoto".to_owned(),
+                debug_attach: "servidor:5005".to_owned(),
+                ..Default::default()
+            },
+        ];
+        session.active_launch = 1;
+        let json = serde_json::to_vec(&session).unwrap();
+        let reloaded = parse_session(&json).unwrap();
+        assert_eq!(reloaded.launch_configs.len(), 2);
+        assert_eq!(reloaded.active_launch, 1);
+        assert_eq!(reloaded.launch_configs[1].debug_attach, "servidor:5005");
+        // Old sessions without the new fields still load.
+        let legacy = br#"{"show_project":true}"#;
+        let parsed = parse_session(legacy).unwrap();
+        assert!(parsed.launch_configs.is_empty());
+        assert_eq!(parsed.active_launch, 0);
     }
 
     #[test]

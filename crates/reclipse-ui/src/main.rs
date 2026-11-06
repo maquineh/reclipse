@@ -8,6 +8,7 @@ mod buildpath;
 mod editor_view;
 mod icons;
 mod jdtls;
+mod jdtls_setup;
 mod keymap;
 mod palette;
 mod recovery;
@@ -19,7 +20,14 @@ mod tree;
 use std::path::PathBuf;
 
 fn main() -> eframe::Result {
-    let initial = std::env::args().nth(1).map(PathBuf::from);
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--dap") {
+        // External-client mode: speak DAP on stdio, no GUI.
+        let mut adapter = reclipse_dap::Adapter::new(reclipse_dap::ReclipseBackend::new());
+        reclipse_dap::serve_stdio(&mut |request| adapter.handle(request));
+        return Ok(());
+    }
+    let initial = args.into_iter().nth(1).map(PathBuf::from);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

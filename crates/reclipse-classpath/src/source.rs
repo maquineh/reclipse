@@ -35,6 +35,12 @@ pub fn source_location(class: &ClassInfo) -> Option<SourceLocation> {
                 return Some(SourceLocation { archive, entry });
             }
             let archive = sources_jar(origin)?;
+            if archive.is_file() {
+                return Some(SourceLocation { archive, entry });
+            }
+            // Gradle docs fetched by `reclipseFetchDocs` land in
+            // `<project>/build/reclipse-docs/<artifact>-<version>-sources.jar`.
+            let archive = gradle_docs_jar(origin)?;
             archive
                 .is_file()
                 .then_some(SourceLocation { archive, entry })
@@ -91,6 +97,28 @@ fn sources_jar(origin: &Path) -> Option<PathBuf> {
     }
     let stem = file_name.strip_suffix(".jar")?;
     Some(origin.with_file_name(format!("{stem}-sources.jar")))
+}
+
+/// Sources fetched by the Gradle `reclipseFetchDocs` init script:
+/// walk up to the project root looking for `build/reclipse-docs/`.
+fn gradle_docs_jar(origin: &Path) -> Option<PathBuf> {
+    let stem = origin
+        .file_name()?
+        .to_string_lossy()
+        .strip_suffix(".jar")?
+        .to_owned();
+    let mut directory = origin.parent()?;
+    for _ in 0..8 {
+        let candidate = directory
+            .join("build")
+            .join("reclipse-docs")
+            .join(format!("{stem}-sources.jar"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        directory = directory.parent()?;
+    }
+    None
 }
 
 fn rt_sources_zip(origin: &Path) -> Option<PathBuf> {
@@ -183,5 +211,22 @@ mod tests {
             source_location(&class("com.acme.App", &binary.display().to_string())).unwrap();
         assert_eq!(location.archive, sources);
         assert_eq!(location.entry, "com/acme/App.java");
+    }
+
+    #[test]
+    fn finds_gradle_docs_in_build_reclipse_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Gradle cache layout: binary far from the fetched docs.
+        let binary = dir
+            .path()
+            .join("cache/modules-2/files-2.1/com.acme/app/1.2.3/hash/app-1.2.3.jar");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"jar").unwrap();
+        let docs = dir.path().join("build/reclipse-docs");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("app-1.2.3-sources.jar"), b"zip").unwrap();
+        let location =
+            source_location(&class("com.acme.App", &binary.display().to_string())).unwrap();
+        assert_eq!(location.archive, docs.join("app-1.2.3-sources.jar"));
     }
 }

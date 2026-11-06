@@ -88,6 +88,188 @@ pub struct LocalRenamePlan {
     pub edits: Vec<TextEdit>,
 }
 
+/// Opt-in textual occurrences of `old` inside Java string/char literals and
+/// comments (WTP-style "update textual matches"). Whole-word only; the
+/// semantic rename stays authoritative, these edits are additive.
+pub fn plan_textual_java_edits(source: &str, old: &str, new: &str) -> Vec<TextEdit> {
+    if old.is_empty() || old == new {
+        return Vec::new();
+    }
+    let chars: Vec<char> = source.chars().collect();
+    // Byte offsets per char index.
+    let mut byte_offsets = Vec::with_capacity(chars.len() + 1);
+    let mut byte = 0;
+    for character in &chars {
+        byte_offsets.push(byte);
+        byte += character.len_utf8();
+    }
+    byte_offsets.push(byte);
+    let mut edits = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let character = chars[index];
+        if character == '/' && chars.get(index + 1) == Some(&'/') {
+            index = scan_textual_line(&chars, &byte_offsets, index + 2, old, new, &mut edits);
+        } else if character == '/' && chars.get(index + 1) == Some(&'*') {
+            index = scan_textual_block(&chars, &byte_offsets, index + 2, old, new, &mut edits);
+        } else if character == '"' || character == '\'' {
+            index = scan_textual_string(&chars, &byte_offsets, index, old, new, &mut edits);
+        } else {
+            index += 1;
+        }
+    }
+    edits
+}
+
+fn scan_textual_line(
+    chars: &[char],
+    bytes: &[usize],
+    mut index: usize,
+    old: &str,
+    new: &str,
+    edits: &mut Vec<TextEdit>,
+) -> usize {
+    let start = index;
+    while index < chars.len() && chars[index] != '\n' {
+        index += 1;
+    }
+    collect_word_edits(chars, bytes, start, index, old, new, edits);
+    index
+}
+
+fn scan_textual_block(
+    chars: &[char],
+    bytes: &[usize],
+    mut index: usize,
+    old: &str,
+    new: &str,
+    edits: &mut Vec<TextEdit>,
+) -> usize {
+    let start = index;
+    while index < chars.len() {
+        if chars[index] == '*' && chars.get(index + 1) == Some(&'/') {
+            collect_word_edits(chars, bytes, start, index, old, new, edits);
+            return index + 2;
+        }
+        index += 1;
+    }
+    collect_word_edits(chars, bytes, start, index.min(chars.len()), old, new, edits);
+    index
+}
+
+fn scan_textual_string(
+    chars: &[char],
+    bytes: &[usize],
+    index: usize,
+    old: &str,
+    new: &str,
+    edits: &mut Vec<TextEdit>,
+) -> usize {
+    let quote = chars[index];
+    let mut cursor = index + 1;
+    // Text blocks (`"""`) may span newlines; other literals end at EOL.
+    if quote == '"' && chars.get(cursor) == Some(&'"') && chars.get(cursor + 1) == Some(&'"') {
+        cursor += 2;
+        let start = cursor;
+        while cursor < chars.len() {
+            if chars[cursor] == '"'
+                && chars.get(cursor + 1) == Some(&'"')
+                && chars.get(cursor + 2) == Some(&'"')
+            {
+                collect_word_edits(chars, bytes, start, cursor, old, new, edits);
+                return cursor + 3;
+            }
+            cursor += 1;
+        }
+        collect_word_edits(
+            chars,
+            bytes,
+            start,
+            cursor.min(chars.len()),
+            old,
+            new,
+            edits,
+        );
+        return cursor;
+    }
+    let start = cursor;
+    while cursor < chars.len() && chars[cursor] != '\n' {
+        if chars[cursor] == '\\' {
+            cursor += 2;
+            continue;
+        }
+        if chars[cursor] == quote {
+            collect_word_edits(chars, bytes, start, cursor, old, new, edits);
+            return cursor + 1;
+        }
+        cursor += 1;
+    }
+    // Unterminated literal: still offer matches up to EOL.
+    collect_word_edits(
+        chars,
+        bytes,
+        start,
+        cursor.min(chars.len()),
+        old,
+        new,
+        edits,
+    );
+    cursor
+}
+
+fn collect_word_edits(
+    chars: &[char],
+    bytes: &[usize],
+    start: usize,
+    end: usize,
+    old: &str,
+    new: &str,
+    edits: &mut Vec<TextEdit>,
+) {
+    let end = end.min(chars.len());
+    if start >= end || old.is_empty() {
+        return;
+    }
+    let text: String = chars[start..end].iter().collect();
+    let mut search = 0;
+    while let Some(found) = text[search..].find(old) {
+        let absolute = start + search + found;
+        let before = absolute.checked_sub(1).and_then(|index| chars.get(index));
+        let after = chars.get(absolute + old.chars().count());
+        if is_word_boundary(before) && is_word_boundary(after) {
+            edits.push(TextEdit {
+                start_byte: bytes[absolute],
+                end_byte: bytes[absolute + old.chars().count()],
+                replacement: new.to_owned(),
+            });
+        }
+        search += found + old.len().max(1);
+    }
+}
+
+fn is_word_boundary(character: Option<&char>) -> bool {
+    !matches!(character, Some(character) if character.is_alphanumeric() || *character == '_' || *character == '$')
+}
+
+/// Whole-word textual edits for resource files (`.properties`, ...).
+/// Comment lines (`#`/`!`) are included: keys and values may reference names.
+pub fn plan_textual_resource_edits(text: &str, old: &str, new: &str) -> Vec<TextEdit> {
+    if old.is_empty() || old == new {
+        return Vec::new();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut byte_offsets = Vec::with_capacity(chars.len() + 1);
+    let mut byte = 0;
+    for character in &chars {
+        byte_offsets.push(byte);
+        byte += character.len_utf8();
+    }
+    byte_offsets.push(byte);
+    let mut edits = Vec::new();
+    collect_word_edits(&chars, &byte_offsets, 0, chars.len(), old, new, &mut edits);
+    edits
+}
+
 /// Plan a type rename: declaration, semantic type references and imports.
 pub fn plan_type_rename(
     fqn: &str,
@@ -131,10 +313,14 @@ pub fn plan_type_rename(
             .any(|name| name == &old_name)
             .then_some(path)
     }) {
-        return Err(format!(
-            "há um tipo local chamado '{old_name}' em {}; rename cancelado por segurança",
-            path.display()
-        ));
+        // Renaming the local itself is fine; renaming anything else while a
+        // same-named local exists elsewhere is refused for safety.
+        if path != &location.path {
+            return Err(format!(
+                "há um tipo local chamado '{old_name}' em {}; rename cancelado por segurança",
+                path.display()
+            ));
+        }
     }
 
     let mut files: Vec<FileEdits> = Vec::new();
@@ -1625,6 +1811,31 @@ mod tests {
     use crate::parse_source;
 
     #[test]
+    fn textual_edits_only_touch_strings_comments_and_words() {
+        let source = "class App {\n    // count the items\n    String label = \"counted\";\n    String other = \"count\";\n    int count = other.length();\n    /* multi\n       count here */\n}\n";
+        let edits = plan_textual_java_edits(source, "count", "total");
+        // "count the items" (comment), "count" (string), "count here" (block).
+        // "counted" and the identifier `count` are untouched.
+        assert_eq!(edits.len(), 3);
+        let updated = apply_text_edits(source, &edits).unwrap();
+        assert!(updated.contains("// total the items"));
+        assert!(updated.contains("\"total\""));
+        assert!(updated.contains("total here"));
+        assert!(updated.contains("\"counted\""));
+        assert!(updated.contains("int count = other.length();"));
+    }
+
+    #[test]
+    fn textual_resource_edits_match_words() {
+        let text = "greeting=hello count\ncount.count=counted\n";
+        let edits = plan_textual_resource_edits(text, "count", "total");
+        assert_eq!(edits.len(), 3);
+        let updated = apply_text_edits(text, &edits).unwrap();
+        assert!(updated.contains("hello total"));
+        assert!(updated.contains("total.total=counted") || updated.contains("counted"));
+    }
+
+    #[test]
     fn validates_java_identifiers() {
         assert!(validate_identifier("user").is_ok());
         assert!(validate_identifier("_User2").is_ok());
@@ -1701,6 +1912,36 @@ class App {
             plan.moves.first().map(|(_, to)| to.clone()),
             Some(user_path.with_file_name("Account.java"))
         );
+    }
+
+    #[test]
+    fn type_rename_updates_local_declaration_and_references() {
+        let path = PathBuf::from("com/acme/App.java");
+        let file = parse_source(
+            &path,
+            "package com.acme; class App { void run() { class Local { int value; } Local x = new Local(); } }",
+        );
+        let project = reclipse_core::Project {
+            root: PathBuf::from("."),
+            name: "test".to_owned(),
+            build_system: reclipse_core::BuildSystem::Plain,
+            source_roots: Vec::new(),
+            java_files: vec![path.clone()],
+            all_files: vec![path.clone()],
+        };
+        let index = ProjectIndex::from_files(project, vec![file], 0);
+        let types = ProjectTypes::build(&index);
+        let plan = plan_type_rename(
+            "com.acme.App.Local",
+            "Scoped",
+            &types,
+            &index,
+            &ClasspathIndex::default(),
+        )
+        .unwrap();
+        // Declaration + `Local x` + `new Local()`: no file move for locals.
+        assert!(plan.total_edits() >= 3, "edits: {}", plan.total_edits());
+        assert!(plan.moves.is_empty());
     }
 
     #[test]

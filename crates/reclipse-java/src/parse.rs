@@ -67,7 +67,12 @@ pub struct JavaSymbol {
     /// 1-based column (in characters, as reported by tree-sitter).
     pub column: usize,
     /// Dot-separated enclosing type chain, e.g. `Outer.Inner`.
+    /// Anonymous classes contribute `<anonymous>`; local types contribute
+    /// their own name under the enclosing type.
     pub container: Option<String>,
+    /// True for type declarations scoped to a method/block (and their members
+    /// via the container chain), as opposed to project-level types.
+    pub is_local: bool,
     /// Nesting depth used by the outline view.
     pub depth: usize,
     /// Short declaration head, e.g. `public static void main(String[] args)`.
@@ -273,7 +278,7 @@ fn visit_type_refs(node: Node<'_>, source: &[u8], file: &mut FileSymbols) {
         if let Some(name) = node.child_by_field_name("name") {
             if is_local_type_declaration(node) {
                 let name = text(name, source);
-                if !name.is_empty() {
+                if !name.is_empty() && !file.local_type_names.contains(&name) {
                     file.local_type_names.push(name);
                 }
             } else {
@@ -553,7 +558,7 @@ fn visit_node(
                 "enum_declaration" => SymbolKind::Enum,
                 _ => SymbolKind::Annotation,
             };
-            push_type(node, source, file, container, depth, kind, false);
+            push_type(node, source, file, container, depth, kind, false, false);
         }
         "record_declaration" => {
             push_type(
@@ -564,6 +569,7 @@ fn visit_node(
                 depth,
                 SymbolKind::Record,
                 true,
+                false,
             );
         }
         "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
@@ -608,7 +614,13 @@ fn visit_node(
                 detail: Some(declaration_head(node, source)),
                 name_start_byte: name_node.start_byte(),
                 name_end_byte: name_node.end_byte(),
+                is_local: false,
             });
+            // Method bodies can declare local types and anonymous classes:
+            // index them (members included) instead of skipping the block.
+            if let Some(body) = node.child_by_field_name("body") {
+                index_block_contents(body, source, file, container, depth + 1);
+            }
         }
         "field_declaration" | "constant_declaration" => {
             let mut cursor = node.walk();
@@ -627,15 +639,20 @@ fn visit_node(
                                 detail: Some(declaration_head(node, source)),
                                 name_start_byte: name_node.start_byte(),
                                 name_end_byte: name_node.end_byte(),
+                                is_local: false,
                             });
                         }
                     }
+                    // Initializers can hide anonymous classes
+                    // (`Runnable r = new Runnable() { ... };`).
+                    index_statement(child, source, file, container, depth);
                 }
             }
         }
         "block" | "static_initializer" => {
-            // Local classes are not project symbols. Entering blocks would also
-            // misattribute local members to the enclosing type.
+            // Blocks can declare local types and anonymous classes (e.g. in
+            // initializers): index those, ignoring plain statements.
+            index_block_contents(node, source, file, container, depth);
         }
         "enum_constant" => {
             if let Some(name_node) = node.child_by_field_name("name") {
@@ -651,7 +668,17 @@ fn visit_node(
                         detail: None,
                         name_start_byte: name_node.start_byte(),
                         name_end_byte: name_node.end_byte(),
+                        is_local: false,
                     });
+                }
+            }
+            // Constant-specific bodies behave like anonymous classes.
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "class_body" {
+                    container.push("<anonymous>".to_owned());
+                    visit_children(child, source, file, container, depth + 1);
+                    container.pop();
                 }
             }
         }
@@ -659,6 +686,112 @@ fn visit_node(
             // Walk structural nodes only. Bodies are entered explicitly by
             // `push_type`, which avoids indexing locals as fields/methods.
             visit_children(node, source, file, container, depth);
+        }
+    }
+}
+
+/// Index the contents of a method/block body: local type declarations (with
+/// their members) and anonymous class bodies. Plain statements are skipped;
+/// nested type members keep their own container chain.
+fn index_block_contents(
+    node: Node<'_>,
+    source: &[u8],
+    file: &mut FileSymbols,
+    container: &mut Vec<String>,
+    depth: usize,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        index_statement(child, source, file, container, depth);
+    }
+}
+
+fn index_statement(
+    node: Node<'_>,
+    source: &[u8],
+    file: &mut FileSymbols,
+    container: &mut Vec<String>,
+    depth: usize,
+) {
+    match node.kind() {
+        "class_declaration"
+        | "interface_declaration"
+        | "enum_declaration"
+        | "record_declaration"
+        | "annotation_type_declaration" => {
+            if !is_local_type_declaration(node) {
+                return;
+            }
+            let Some(name_node) = node.child_by_field_name("name") else {
+                return;
+            };
+            let name = text(name_node, source);
+            if name.is_empty() {
+                return;
+            }
+            if !file.local_type_names.contains(&name) {
+                file.local_type_names.push(name.clone());
+            }
+            let kind = match node.kind() {
+                "class_declaration" => SymbolKind::Class,
+                "interface_declaration" => SymbolKind::Interface,
+                "enum_declaration" => SymbolKind::Enum,
+                "record_declaration" => SymbolKind::Record,
+                _ => SymbolKind::Annotation,
+            };
+            push_type(node, source, file, container, depth, kind, false, true);
+        }
+        "object_creation_expression" => {
+            // Anonymous class: index its members under `<anonymous>`.
+            let mut cursor = node.walk();
+            let mut body = None;
+            for child in node.children(&mut cursor) {
+                if child.kind() == "class_body" {
+                    body = Some(child);
+                    break;
+                }
+                // Arguments may nest further anonymous classes.
+                index_statement(child, source, file, container, depth);
+            }
+            if let Some(body) = body {
+                container.push("<anonymous>".to_owned());
+                visit_children(body, source, file, container, depth + 1);
+                container.pop();
+            }
+        }
+        "enum_constant" => {
+            // Enum constant bodies behave like anonymous classes.
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "class_body" {
+                    container.push("<anonymous>".to_owned());
+                    visit_children(child, source, file, container, depth + 1);
+                    container.pop();
+                } else {
+                    index_statement(child, source, file, container, depth);
+                }
+            }
+        }
+        "lambda_expression" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                index_statement(child, source, file, container, depth);
+            }
+        }
+        "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
+            // Reached inside a local class body: full handling (symbol +
+            // nested locals) lives in `visit_node`.
+            visit_node(node, source, file, container, depth);
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                // Skip leaf noise; recurse into everything else so nested
+                // blocks, lambdas and initializers are covered.
+                if child.child_count() > 0 || child.is_named() {
+                    index_statement(child, source, file, container, depth);
+                }
+            }
         }
     }
 }
@@ -671,6 +804,7 @@ fn push_type(
     depth: usize,
     kind: SymbolKind,
     is_record: bool,
+    is_local: bool,
 ) {
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
@@ -690,6 +824,7 @@ fn push_type(
         detail: Some(declaration_head(node, source)),
         name_start_byte: name_node.start_byte(),
         name_end_byte: name_node.end_byte(),
+        is_local,
     });
 
     if let Some(relation) = type_relation(node, source, container, &name) {
@@ -717,6 +852,7 @@ fn push_type(
                                 detail: Some(declaration_head(child, source)),
                                 name_start_byte: field_name.start_byte(),
                                 name_end_byte: field_name.end_byte(),
+                                is_local: false,
                             });
                         }
                     }
@@ -1328,7 +1464,40 @@ class App {
 "#;
         let file = parse_source(Path::new("App.java"), source);
         assert_eq!(file.local_type_names, vec!["Local".to_owned()]);
-        assert!(!file.symbols.iter().any(|symbol| symbol.name == "Local"));
+        // Locals are now project symbols, scoped to the enclosing type.
+        let local = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Local")
+            .unwrap();
+        assert!(local.is_local);
+        assert_eq!(local.container.as_deref(), Some("App"));
+        // Its members are indexed under the local type.
+        assert!(file.symbols.iter().any(
+            |symbol| symbol.name == "value" && symbol.container.as_deref() == Some("App.Local")
+        ));
+    }
+
+    #[test]
+    fn indexes_anonymous_class_members() {
+        let source = r#"
+class App {
+    Runnable job = new Runnable() {
+        public void run() { helper(); }
+        int retries = 3;
+    };
+    void helper() {}
+}
+"#;
+        let file = parse_source(Path::new("App.java"), source);
+        let run = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "run" && symbol.kind == SymbolKind::Method)
+            .unwrap();
+        assert_eq!(run.container.as_deref(), Some("App.<anonymous>"));
+        assert!(file.symbols.iter().any(|symbol| symbol.name == "retries"
+            && symbol.container.as_deref() == Some("App.<anonymous>")));
     }
 
     #[test]

@@ -5,6 +5,7 @@ members = [
     "crates/reclipse-java",
     "crates/reclipse-classpath",
     "crates/reclipse-debug",
+    "crates/reclipse-dap",
     "crates/reclipse-editor",
     "crates/reclipse-plugin-api",
     "crates/reclipse-plugin-host",
@@ -36,6 +37,7 @@ walkdir = "2.5"
 
 reclipse-core = { path = "crates/reclipse-core" }
 reclipse-classpath = { path = "crates/reclipse-classpath" }
+reclipse-dap = { path = "crates/reclipse-dap" }
 reclipse-debug = { path = "crates/reclipse-debug" }
 reclipse-java = { path = "crates/reclipse-java" }
 reclipse-editor = { path = "crates/reclipse-editor" }

@@ -531,6 +531,21 @@ pub fn resolve_type(
         return None;
     }
 
+    // Local classes shadow everything else in their file (approximated at
+    // file scope: same-named locals in different methods are rare).
+    if !name.contains('.') {
+        if let Some(symbol) = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.is_local && symbol.name == name)
+        {
+            let fqn = type_fqn(file, symbol);
+            if let Some(location) = project.get(&fqn) {
+                return Some(ResolvedType::Project(location.clone()));
+            }
+        }
+    }
+
     if name.contains('.') {
         if let Some(found) = resolve_fqn(name, project, classpath) {
             return Some(found);
@@ -659,10 +674,15 @@ pub fn find_type_references(
     let mut references = Vec::new();
     let simple = fqn.rsplit('.').next().unwrap_or(fqn);
     for (path, file) in &index.files {
-        // Local classes are not project types; skip files that shadow the
-        // target's simple name to avoid renaming a local declaration.
+        // Local classes shadow the target's simple name: skip files where a
+        // same-named local hides the target — unless the target IS that local.
         if file.local_type_names.iter().any(|name| name == simple) {
-            continue;
+            let is_target_local = file.symbols.iter().any(|symbol| {
+                symbol.is_local && symbol.name == simple && type_fqn(file, symbol) == fqn
+            });
+            if !is_target_local {
+                continue;
+            }
         }
         for reference in &file.type_refs {
             let Some(resolved) = resolve_type(&reference.name, file, project, classpath) else {
@@ -3878,6 +3898,7 @@ mod tests {
             line: 1,
             column: 1,
             container: container.map(str::to_owned),
+            is_local: false,
             depth: container.is_some() as usize,
             detail: Some(detail.to_owned()),
             name_start_byte: 0,
@@ -4940,6 +4961,24 @@ mod tests {
         assert_eq!(object_list.ty.name(), "java.util.List");
         assert_eq!(object_list.args.len(), 1);
         assert_eq!(object_list.args[0].ty.name(), "java.lang.Object");
+    }
+
+    #[test]
+    fn resolves_and_renames_local_types() {
+        let (index, types) = project_with_files(vec![(
+            PathBuf::from("com/acme/App.java"),
+            "package com.acme; class App { void run() { class Local { int value; } Local x = new Local(); x.value = 1; } }",
+        )]);
+        let file = index
+            .files
+            .get(&PathBuf::from("com/acme/App.java"))
+            .unwrap();
+        let classpath = ClasspathIndex::default();
+        let resolved = resolve_type("Local", file, &types, &classpath).unwrap();
+        assert_eq!(resolved.name(), "com.acme.App.Local");
+        // References to the local resolve, including the member access.
+        let references = find_type_references("com.acme.App.Local", &types, &index, &classpath);
+        assert!(references.len() >= 2, "references: {references:?}");
     }
 
     #[test]
