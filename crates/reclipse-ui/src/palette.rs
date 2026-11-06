@@ -18,6 +18,7 @@ pub enum Action {
     Test,
     FetchDeps,
     DownloadDocs,
+    ConfigureBuildPath,
     RestartJdtls,
     CancelBuild,
     Rerun,

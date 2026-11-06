@@ -42,7 +42,7 @@ use crate::palette::{rank, Action, Palette, PaletteEntry, PaletteMode};
 use crate::search::{project_files, FileSearch, ProjectMatch, ProjectSearch};
 use crate::session::Keybindings;
 use crate::theme;
-use crate::tree::FileTree;
+use crate::tree::{FileTree, TreeEvent};
 
 const CONSOLE_MAX_LINES: usize = 600;
 const CONSOLE_MAX_LINE_CHARS: usize = 4096;
@@ -355,6 +355,7 @@ pub struct ReclipseApp {
     last_run_main: Option<String>,
     launch: build::LaunchConfig,
     launch_open: bool,
+    buildpath_dialog: Option<crate::buildpath::BuildPathDialog>,
     test_failures: Vec<build::TestFailure>,
     test_targets: Vec<reclipse_java::JavaTestMethod>,
     debug: Option<DebugUi>,
@@ -465,6 +466,7 @@ impl ReclipseApp {
             last_run_main: None,
             launch: session.launch.clone(),
             launch_open: false,
+            buildpath_dialog: None,
             test_failures: Vec::new(),
             test_targets: Vec::new(),
             debug: None,
@@ -688,6 +690,7 @@ impl ReclipseApp {
         self.javac_diag_rx = None;
         self.javac_diag_cancel = None;
         self.launch_open = false;
+        self.buildpath_dialog = None;
         self.jdtls = None;
         self.jdtls_status = JdtlsStatus::Disabled;
         self.jdtls_status_message = None;
@@ -5048,6 +5051,11 @@ impl ReclipseApp {
                         "",
                         Action::DownloadDocs,
                     ),
+                    PaletteEntry::new(
+                        "Projeto: Build Path → Configure Build Path…",
+                        "",
+                        Action::ConfigureBuildPath,
+                    ),
                     PaletteEntry::new("JDT: reiniciar servidor (opt-in)", "", Action::RestartJdtls),
                     PaletteEntry::new("Projeto: cancelar build/execução", "", Action::CancelBuild),
                     PaletteEntry::new("Projeto: re-executar última main", "", Action::Rerun),
@@ -6899,6 +6907,142 @@ impl ReclipseApp {
         }
     }
 
+    fn open_buildpath(&mut self) {
+        let Some(root) = self.root.clone() else {
+            self.toast("Abra um projeto antes de configurar o build path");
+            return;
+        };
+        let Some(project) = self.project.clone() else {
+            self.toast("Projeto ainda em descoberta; aguarde o índice");
+            return;
+        };
+        let manifest = if project.root.join("build.gradle.kts").is_file() {
+            Some("build.gradle.kts".to_owned())
+        } else if project.root.join("build.gradle").is_file() {
+            Some("build.gradle".to_owned())
+        } else {
+            None
+        };
+        let resolved_sources = project
+            .source_roots
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        let resolved_jars = self
+            .classpath_index
+            .as_ref()
+            .map(|index| {
+                index
+                    .jars
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.buildpath_dialog = Some(crate::buildpath::BuildPathDialog::open(
+            root,
+            project.build_system,
+            manifest,
+            resolved_sources,
+            resolved_jars,
+        ));
+    }
+
+    fn save_buildpath(&mut self) {
+        let Some(dialog) = self.buildpath_dialog.take() else {
+            return;
+        };
+        let path = dialog.root.join(".classpath");
+        let text = crate::buildpath::serialize_classpath(&dialog.model);
+        match std::fs::write(&path, text) {
+            Ok(()) => {
+                // Our own write must not raise an external-change banner, but it
+                // must still trigger a classpath reindex.
+                self.watch_ignored
+                    .insert(path.clone(), Instant::now() + Duration::from_secs(2));
+                self.tree.invalidate();
+                self.classpath_reload_at = Some(Instant::now() + Duration::from_millis(500));
+                self.toast(format!("Build path salvo: {}", path.display()));
+                self.log(
+                    LogLevel::Success,
+                    format!("Build path salvo em {}", path.display()),
+                );
+            }
+            Err(error) => {
+                self.toast(format!("Falha ao salvar .classpath: {error}"));
+                self.buildpath_dialog = Some(dialog);
+            }
+        }
+    }
+
+    fn show_buildpath_dialog(&mut self, ctx: &Context) {
+        if self.buildpath_dialog.is_none() {
+            return;
+        }
+        // Owned string would fight the dialog borrow; rebuild each frame.
+        let jdk_info = self.classpath_index.as_ref().and_then(|index| {
+            index.jdk_home.as_ref().map(|home| {
+                format!(
+                    "JDK em uso: {} ({})",
+                    index.stats.jdk_version.as_deref().unwrap_or("?"),
+                    home.display()
+                )
+            })
+        });
+        let mut open = true;
+        let mut action = crate::buildpath::DialogAction::None;
+        egui::Window::new("Configure Build Path")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(egui::vec2(560.0, 520.0))
+            .show(ctx, |ui| {
+                let Some(dialog) = self.buildpath_dialog.as_mut() else {
+                    return;
+                };
+                action = dialog.show(ui, jdk_info.as_deref());
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if dialog.manifest.is_none() && ui.button("Salvar").clicked() {
+                        action = crate::buildpath::DialogAction::Save;
+                    }
+                    if ui.button("Fechar").clicked() {
+                        action = crate::buildpath::DialogAction::Close;
+                    }
+                });
+            });
+        match action {
+            crate::buildpath::DialogAction::Save => self.save_buildpath(),
+            crate::buildpath::DialogAction::Close => {
+                self.buildpath_dialog = None;
+            }
+            crate::buildpath::DialogAction::OpenManifest => {
+                let (root, manifest) = self
+                    .buildpath_dialog
+                    .as_ref()
+                    .map(|dialog| {
+                        (
+                            dialog.root.clone(),
+                            dialog
+                                .manifest
+                                .clone()
+                                .unwrap_or_else(|| "pom.xml".to_owned()),
+                        )
+                    })
+                    .unwrap_or_else(|| (PathBuf::new(), "pom.xml".to_owned()));
+                self.buildpath_dialog = None;
+                if !root.as_os_str().is_empty() {
+                    self.open_file(root.join(&manifest));
+                }
+            }
+            crate::buildpath::DialogAction::None => {
+                if !open {
+                    self.buildpath_dialog = None;
+                }
+            }
+        }
+    }
+
     fn show_launch_dialog(&mut self, ctx: &Context) {
         if !self.launch_open {
             return;
@@ -7815,7 +7959,15 @@ impl ReclipseApp {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| root.display().to_string());
-            ui.label(RichText::new(name).strong());
+            let header = ui.label(RichText::new(name).strong());
+            header.context_menu(|ui| {
+                ui.menu_button("Build Path", |ui| {
+                    if ui.button("Configure Build Path…").clicked() {
+                        actions.push(Action::ConfigureBuildPath);
+                        ui.close_menu();
+                    }
+                });
+            });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.small_button("Abrir").clicked() {
                     actions.push(Action::OpenFolder);
@@ -7844,8 +7996,13 @@ impl ReclipseApp {
             );
         }
 
-        if let Some(path) = self.tree.show(ui, &root) {
-            actions.push(Action::OpenPath(path));
+        for event in self.tree.show(ui, &root) {
+            match event {
+                TreeEvent::Open(path) => actions.push(Action::OpenPath(path)),
+                TreeEvent::ConfigureBuildPath(_) => {
+                    actions.push(Action::ConfigureBuildPath);
+                }
+            }
         }
     }
 
@@ -9002,6 +9159,7 @@ impl ReclipseApp {
             Action::Test => self.test_project(),
             Action::FetchDeps => self.fetch_dependencies(),
             Action::DownloadDocs => self.download_documentation(),
+            Action::ConfigureBuildPath => self.open_buildpath(),
             Action::RestartJdtls => self.restart_jdtls(),
             Action::CancelBuild => self.cancel_build(),
             Action::Rerun => self.rerun_last(),
@@ -9530,6 +9688,7 @@ impl eframe::App for ReclipseApp {
         self.show_classpath_view(ctx);
         self.show_classpath_source(ctx);
         self.show_launch_dialog(ctx);
+        self.show_buildpath_dialog(ctx);
         self.show_breakpoint_condition_dialog(ctx);
         self.show_javadoc_view(ctx);
         self.show_about(ctx);

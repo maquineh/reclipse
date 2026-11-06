@@ -21,30 +21,48 @@ pub struct FileTree {
     children: HashMap<PathBuf, Vec<Entry>>,
 }
 
+#[derive(Debug, Clone)]
+pub enum TreeEvent {
+    Open(PathBuf),
+    ConfigureBuildPath(PathBuf),
+}
+
+fn build_path_menu(ui: &mut Ui, path: &Path, events: &mut Vec<TreeEvent>) {
+    ui.menu_button("Build Path", |ui| {
+        if ui.button("Configure Build Path…").clicked() {
+            events.push(TreeEvent::ConfigureBuildPath(path.to_path_buf()));
+            ui.close_menu();
+        }
+    });
+}
+
 impl FileTree {
-    pub fn show(&mut self, ui: &mut Ui, root: &Path) -> Option<PathBuf> {
-        let mut opened = None;
-        self.show_dir(ui, root, 0, &mut opened);
-        opened
+    pub fn show(&mut self, ui: &mut Ui, root: &Path) -> Vec<TreeEvent> {
+        let mut events = Vec::new();
+        self.show_dir(ui, root, 0, &mut events);
+        events
     }
 
     pub fn invalidate(&mut self) {
         self.children.clear();
     }
 
-    fn show_dir(&mut self, ui: &mut Ui, dir: &Path, depth: usize, opened: &mut Option<PathBuf>) {
+    fn show_dir(&mut self, ui: &mut Ui, dir: &Path, depth: usize, events: &mut Vec<TreeEvent>) {
         if depth > 32 {
             return;
         }
         for entry in self.entries(dir) {
             if entry.is_dir {
                 let header = RichText::new(&entry.name).color(theme::text());
-                egui::CollapsingHeader::new(header)
+                let response = egui::CollapsingHeader::new(header)
                     .id_salt(("reclipse_tree_dir", &entry.path))
                     .default_open(depth < 5)
                     .show(ui, |ui| {
-                        self.show_dir(ui, &entry.path, depth + 1, opened);
+                        self.show_dir(ui, &entry.path, depth + 1, events);
                     });
+                response.header_response.context_menu(|ui| {
+                    build_path_menu(ui, &entry.path, events);
+                });
             } else {
                 let is_java = entry
                     .path
@@ -58,12 +76,13 @@ impl FileTree {
                     theme::muted()
                 };
                 let label = format!("  {}", entry.name);
-                if ui
-                    .selectable_label(false, RichText::new(label).color(color))
-                    .clicked()
-                {
-                    *opened = Some(entry.path.clone());
+                let response = ui.selectable_label(false, RichText::new(label).color(color));
+                if response.clicked() {
+                    events.push(TreeEvent::Open(entry.path.clone()));
                 }
+                response.context_menu(|ui| {
+                    build_path_menu(ui, &entry.path, events);
+                });
             }
         }
     }

@@ -4,6 +4,7 @@
 
 mod app;
 mod build;
+mod buildpath;
 mod editor_view;
 mod icons;
 mod jdtls;
