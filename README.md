@@ -222,7 +222,7 @@ No painel **DEBUG**, o botão **cond** de cada breakpoint edita uma condição b
 
 O formatter é externo e opt-in: defina `RECLIPSE_FORMATTER` (executável que lê o código pela stdin) ou `RECLIPSE_FORMATTER_JAR` (jar do google-java-format). `Ctrl+Shift+I` organiza imports nativamente.
 
-Sources/Javadoc podem ser baixados pela palette (**Projeto: baixar sources/Javadoc (Maven)**); o classpath é reindexado e o hover de tipos externos passa a usar o source. O JDT LS é opt-in: defina `RECLIPSE_JDTLS` com o caminho do launcher e opcionalmente `RECLIPSE_JDTLS_WORKSPACE`; o status aparece na toolbar e **JDT: reiniciar servidor** está na palette.
+Sources/Javadoc podem ser baixados pela palette (**Projeto: baixar sources/Javadoc (Maven)**); o classpath é reindexado e o hover de tipos externos passa a usar o source. O JDT LS é opt-in: defina `RECLIPSE_JDTLS` com o caminho do launcher e opcionalmente `RECLIPSE_JDTLS_WORKSPACE`; o status aparece na toolbar e **JDT: reiniciar servidor** está na palette. Detalhes e matriz: [docs/JDTLS.md](docs/JDTLS.md).
 
 Buffers sujos são gravados em backups para recuperação; a sessão guarda abas, cursor, folds, painéis e keybindings.
 
