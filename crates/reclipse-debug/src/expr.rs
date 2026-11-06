@@ -1,9 +1,11 @@
 //! Small Java-like expression parser used by evaluate, conditional breakpoints
 //! and watches.
 //!
-//! Supported: literals, local names, one-level field access, parentheses,
-//! unary `! - +`, arithmetic, comparisons and boolean operators. Method calls
-//! and arbitrary object construction are intentionally rejected.
+//! Supported: literals, local names, one-level field access, array indexing
+//! (`arr[i]`), method calls (`obj.m(a)`, `this.m()`, `Classe.stat(a)`),
+//! parentheses, unary `! - +`, arithmetic, comparisons and boolean operators.
+//! `new`, casts and lambdas are intentionally rejected; method calls are
+//! executed through JDWP invocation on the paused JVM (side effects possible).
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Literal {
@@ -44,6 +46,12 @@ pub(crate) enum Expr {
     Literal(Literal),
     Name(String),
     Field(Box<Expr>, String),
+    Index(Box<Expr>, Box<Expr>),
+    Call {
+        receiver: Option<Box<Expr>>,
+        method: String,
+        args: Vec<Expr>,
+    },
     Unary(UnaryOp, Box<Expr>),
     Binary(BinaryOp, Box<Expr>, Box<Expr>),
 }
@@ -61,6 +69,9 @@ enum Token {
     Dot,
     LeftParen,
     RightParen,
+    LeftBracket,
+    RightBracket,
+    Comma,
     Not,
     Minus,
     Plus,
@@ -94,7 +105,7 @@ pub(crate) fn parse(input: &str) -> Result<Expr, String> {
     let expr = parser.parse_or()?;
     if parser.peek() != &Token::End {
         return Err(format!(
-            "token inesperado após a expressão: {:?} (chamadas de método não são suportadas)",
+            "token inesperado após a expressão: {:?}",
             parser.peek()
         ));
     }
@@ -118,6 +129,18 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
             }
             ')' => {
                 tokens.push(Token::RightParen);
+                index += 1;
+            }
+            '[' => {
+                tokens.push(Token::LeftBracket);
+                index += 1;
+            }
+            ']' => {
+                tokens.push(Token::RightBracket);
+                index += 1;
+            }
+            ',' => {
+                tokens.push(Token::Comma);
                 index += 1;
             }
             '.' => {
@@ -408,14 +431,76 @@ impl Parser {
 
     fn parse_postfix(&mut self) -> Result<Expr, String> {
         let mut value = self.parse_primary()?;
-        while self.peek() == &Token::Dot {
-            self.next();
-            let Token::Ident(field) = self.next() else {
-                return Err("esperado nome de campo após `.`".to_owned());
+        // Direct call: `name(args)` — receiver is the implicit `this`.
+        if self.peek() == &Token::LeftParen {
+            let Expr::Name(name) = value else {
+                return Err("chamada de método exige um nome ou `objeto.método`".to_owned());
             };
-            value = Expr::Field(Box::new(value), field);
+            let args = self.parse_args()?;
+            value = Expr::Call {
+                receiver: None,
+                method: name,
+                args,
+            };
+        }
+        loop {
+            match self.peek() {
+                Token::Dot => {
+                    self.next();
+                    let Token::Ident(field) = self.next() else {
+                        return Err("esperado nome de campo após `.`".to_owned());
+                    };
+                    if self.peek() == &Token::LeftParen {
+                        let args = self.parse_args()?;
+                        value = Expr::Call {
+                            receiver: Some(Box::new(value)),
+                            method: field,
+                            args,
+                        };
+                    } else {
+                        value = Expr::Field(Box::new(value), field);
+                    }
+                }
+                Token::LeftBracket => {
+                    self.next();
+                    let index = self.parse_or()?;
+                    if self.next() != Token::RightBracket {
+                        return Err("colchete não fechado".to_owned());
+                    }
+                    value = Expr::Index(Box::new(value), Box::new(index));
+                }
+                _ => break,
+            }
         }
         Ok(value)
+    }
+
+    /// Consume `(`, a comma-separated argument list, and `)`.
+    fn parse_args(&mut self) -> Result<Vec<Expr>, String> {
+        if self.next() != Token::LeftParen {
+            return Err("esperado `(` nos argumentos".to_owned());
+        }
+        if self.peek() == &Token::RightParen {
+            self.next();
+            return Ok(Vec::new());
+        }
+        let mut args = Vec::new();
+        loop {
+            args.push(self.parse_or()?);
+            if args.len() > 8 {
+                return Err("máximo de 8 argumentos na chamada".to_owned());
+            }
+            match self.next() {
+                Token::Comma => continue,
+                Token::RightParen => break,
+                other => {
+                    return Err(format!(
+                        "esperado `,` ou `)` nos argumentos, encontrei {other:?}"
+                    ));
+                }
+            }
+        }
+        Ok(args)
     }
 
     fn parse_primary(&mut self) -> Result<Expr, String> {
@@ -488,10 +573,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_method_calls_and_bad_syntax() {
-        assert!(parse("list.size()").is_err());
+    fn parses_calls_and_index() {
+        assert!(matches!(parse("list.get(0)").unwrap(), Expr::Call { .. }));
+        assert!(matches!(parse("nums[i + 1]").unwrap(), Expr::Index(_, _)));
+        assert!(matches!(
+            parse("user.getName().length()").unwrap(),
+            Expr::Call { .. }
+        ));
+        assert!(matches!(
+            parse("Math.max(a, b)").unwrap(),
+            Expr::Call { .. }
+        ));
+        assert!(parse("size()").is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_syntax() {
         assert!(parse("i = 1").is_err());
         assert!(parse("i &&").is_err());
         assert!(parse("").is_err());
+        assert!(parse("a[0").is_err());
+        assert!(parse("a(b,)").is_err());
+        assert!(parse("(int) x").is_err());
     }
 }

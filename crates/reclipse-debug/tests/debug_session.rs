@@ -459,10 +459,12 @@ public class ExprTarget {
     static class User {
         final String name;
         User(String name) { this.name = name; }
+        String greet() { return "hi " + name; }
     }
 
     public static void main(String[] args) {
         User user = new User("Ada");
+        int[] nums = {10, 20, 30};
         int total = 0;
         for (int i = 0; i < 5; i++) {
             total += i;
@@ -523,6 +525,52 @@ public class ExprTarget {
     assert_eq!(watches[0].value.as_deref(), Some("0"));
     assert_eq!(watches[1].value.as_deref(), Some("10"));
     assert_eq!(watches[2].value.as_deref(), Some("\"Ada\""));
+
+    // Array indexing.
+    session.send(DebugCommand::Evaluate {
+        expression: "nums[1]".to_owned(),
+    });
+    let (value, error) = wait_for_evaluate(&session, "nums[1]");
+    assert_eq!(error, None);
+    assert_eq!(value.as_deref(), Some("20"));
+
+    session.send(DebugCommand::Evaluate {
+        expression: "nums[i + 1]".to_owned(),
+    });
+    let (value, error) = wait_for_evaluate(&session, "nums[i + 1]");
+    assert_eq!(error, None);
+    assert_eq!(value.as_deref(), Some("20"));
+
+    // Out of bounds is a clean error, not a crash.
+    session.send(DebugCommand::Evaluate {
+        expression: "nums[9]".to_owned(),
+    });
+    let (_, error) = wait_for_evaluate(&session, "nums[9]");
+    assert!(error.is_some(), "expected out-of-bounds error");
+
+    // Instance method invocation via JDWP.
+    session.send(DebugCommand::Evaluate {
+        expression: "user.greet()".to_owned(),
+    });
+    let (value, error) = wait_for_evaluate(&session, "user.greet()");
+    assert_eq!(error, None);
+    assert_eq!(value.as_deref(), Some("\"hi Ada\""));
+
+    // Chained call on a field.
+    session.send(DebugCommand::Evaluate {
+        expression: "user.name.length()".to_owned(),
+    });
+    let (value, error) = wait_for_evaluate(&session, "user.name.length()");
+    assert_eq!(error, None);
+    assert_eq!(value.as_deref(), Some("3"));
+
+    // Static call on a JDK class.
+    session.send(DebugCommand::Evaluate {
+        expression: "Math.max(3, 7)".to_owned(),
+    });
+    let (value, error) = wait_for_evaluate(&session, "Math.max(3, 7)");
+    assert_eq!(error, None);
+    assert_eq!(value.as_deref(), Some("7"));
 
     session.send(DebugCommand::Disconnect);
     drop(session);

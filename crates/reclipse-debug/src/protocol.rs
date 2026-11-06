@@ -374,6 +374,11 @@ impl<'a> Reader<'a> {
 
     pub(crate) fn value(&mut self) -> Result<Value, String> {
         let tag = self.u8()?;
+        self.untagged(tag)
+    }
+
+    /// Read a value whose tag was transmitted separately (JDWP `arrayregion`).
+    pub(crate) fn untagged(&mut self, tag: u8) -> Result<Value, String> {
         Ok(match tag {
             b'B' => Value::Byte(self.u8()? as i8),
             b'Z' => Value::Boolean(self.u8()? != 0),
@@ -419,6 +424,10 @@ pub(crate) struct Writer {
 impl Writer {
     pub(crate) fn u8(&mut self, value: u8) {
         self.data.push(value);
+    }
+
+    pub(crate) fn u16(&mut self, value: u16) {
+        self.data.extend_from_slice(&value.to_be_bytes());
     }
 
     pub(crate) fn u32(&mut self, value: u32) {

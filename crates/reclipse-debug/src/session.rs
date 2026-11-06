@@ -239,7 +239,15 @@ enum EvalValue {
     Float(f64),
     Char(char),
     String(String),
-    Object { id: u64 },
+    /// A `java.lang.String` instance in the debuggee: keeps the object id so
+    /// chained calls (`user.name.length()`) can invoke on it.
+    StringObject {
+        id: u64,
+        value: String,
+    },
+    Object {
+        id: u64,
+    },
 }
 
 type LocalValues = HashMap<String, (String, EvalValue)>;
@@ -277,8 +285,8 @@ struct Worker {
 struct MethodInfo {
     id: u64,
     name: String,
-    #[allow(dead_code)]
     signature: String,
+    is_static: bool,
 }
 
 #[derive(Clone)]
@@ -999,9 +1007,11 @@ impl Worker {
                 .map(|stop| stop.locals.clone())
                 .unwrap_or_default();
             let this_object_id = self.stop.as_ref().and_then(|stop| stop.this_object_id);
-            match expr::parse(condition)
-                .and_then(|parsed| self.eval_expr(&parsed, &locals, this_object_id))
-            {
+            // Conditions never invoke methods: side effects and re-suspension
+            // inside event handling would risk deadlocking the debuggee.
+            match expr::parse(condition).and_then(|parsed| {
+                self.eval_expr(&parsed, &locals, this_object_id, request.thread_id, false)
+            }) {
                 Ok(EvalValue::Bool(true)) => {}
                 Ok(EvalValue::Bool(false)) => {
                     self.stop = None;
@@ -1177,12 +1187,16 @@ impl Worker {
         let count = reader.u32()? as usize;
         let mut methods = Vec::with_capacity(count);
         for _ in 0..count {
+            let id = reader.method()?;
+            let name = reader.string()?;
+            let signature = reader.string()?;
+            let modifiers = reader.u32()?;
             methods.push(MethodInfo {
-                id: reader.method()?,
-                name: reader.string()?,
-                signature: reader.string()?,
+                id,
+                name,
+                signature,
+                is_static: modifiers & 0x0008 != 0,
             });
-            let _modifiers = reader.u32()?;
         }
         self.method_cache.insert(type_id, methods.clone());
         Ok(methods)
@@ -1462,7 +1476,10 @@ impl Worker {
                 if id == 0 {
                     EvalValue::Null
                 } else if tag == b's' {
-                    EvalValue::String(self.string_value(id).unwrap_or_default())
+                    EvalValue::StringObject {
+                        id,
+                        value: self.string_value(id).unwrap_or_default(),
+                    }
                 } else {
                     EvalValue::Object { id }
                 }
@@ -1586,7 +1603,8 @@ impl Worker {
         };
         let locals = stop.locals.clone();
         let this_object_id = stop.this_object_id;
-        self.eval_expr(&parsed, &locals, this_object_id)
+        let thread_id = stop.thread_id;
+        self.eval_expr(&parsed, &locals, this_object_id, thread_id, true)
     }
 
     fn eval_expr(
@@ -1594,6 +1612,8 @@ impl Worker {
         expression: &Expr,
         locals: &HashMap<String, (String, EvalValue)>,
         this_object_id: Option<u64>,
+        thread_id: u64,
+        allow_invoke: bool,
     ) -> Result<EvalValue, String> {
         match expression {
             Expr::Literal(literal) => Ok(match literal {
@@ -1616,11 +1636,58 @@ impl Worker {
                     .ok_or_else(|| format!("variável `{name}` não encontrada no frame selecionado"))
             }
             Expr::Field(base, field) => {
-                let base = self.eval_expr(base, locals, this_object_id)?;
+                let base = self.eval_expr(base, locals, this_object_id, thread_id, allow_invoke)?;
                 self.eval_field(base, field)
             }
+            Expr::Index(base, index) => {
+                let base = self.eval_expr(base, locals, this_object_id, thread_id, allow_invoke)?;
+                let index =
+                    self.eval_expr(index, locals, this_object_id, thread_id, allow_invoke)?;
+                let position = match index {
+                    EvalValue::Int(position) => position,
+                    EvalValue::Char(character) => character as u32 as i64,
+                    other => {
+                        return Err(format!(
+                            "índice de array deve ser inteiro, recebeu {}",
+                            self.display_eval_value(&other)
+                        ));
+                    }
+                };
+                self.eval_array_element(base, position)
+            }
+            Expr::Call {
+                receiver,
+                method,
+                args,
+            } => {
+                if !allow_invoke {
+                    return Err(
+                        "chamadas de método não são permitidas em condição de breakpoint"
+                            .to_owned(),
+                    );
+                }
+                let mut evaluated = Vec::with_capacity(args.len());
+                for arg in args {
+                    evaluated.push(self.eval_expr(
+                        arg,
+                        locals,
+                        this_object_id,
+                        thread_id,
+                        allow_invoke,
+                    )?);
+                }
+                self.eval_call(
+                    receiver.as_deref(),
+                    method,
+                    evaluated,
+                    locals,
+                    this_object_id,
+                    thread_id,
+                )
+            }
             Expr::Unary(operator, value) => {
-                let value = self.eval_expr(value, locals, this_object_id)?;
+                let value =
+                    self.eval_expr(value, locals, this_object_id, thread_id, allow_invoke)?;
                 match operator {
                     UnaryOp::Not => match value {
                         EvalValue::Bool(value) => Ok(EvalValue::Bool(!value)),
@@ -1646,10 +1713,16 @@ impl Worker {
                 }
             }
             Expr::Binary(BinaryOp::And, left, right) => {
-                let left = self.eval_expr(left, locals, this_object_id)?;
+                let left = self.eval_expr(left, locals, this_object_id, thread_id, allow_invoke)?;
                 match left {
                     EvalValue::Bool(false) => Ok(EvalValue::Bool(false)),
-                    EvalValue::Bool(true) => match self.eval_expr(right, locals, this_object_id)? {
+                    EvalValue::Bool(true) => match self.eval_expr(
+                        right,
+                        locals,
+                        this_object_id,
+                        thread_id,
+                        allow_invoke,
+                    )? {
                         EvalValue::Bool(value) => Ok(EvalValue::Bool(value)),
                         other => Err(format!(
                             "`&&` requer boolean, recebeu {}",
@@ -1663,11 +1736,17 @@ impl Worker {
                 }
             }
             Expr::Binary(BinaryOp::Or, left, right) => {
-                let left = self.eval_expr(left, locals, this_object_id)?;
+                let left = self.eval_expr(left, locals, this_object_id, thread_id, allow_invoke)?;
                 match left {
                     EvalValue::Bool(true) => Ok(EvalValue::Bool(true)),
                     EvalValue::Bool(false) => {
-                        match self.eval_expr(right, locals, this_object_id)? {
+                        match self.eval_expr(
+                            right,
+                            locals,
+                            this_object_id,
+                            thread_id,
+                            allow_invoke,
+                        )? {
                             EvalValue::Bool(value) => Ok(EvalValue::Bool(value)),
                             other => Err(format!(
                                 "`||` requer boolean, recebeu {}",
@@ -1682,8 +1761,9 @@ impl Worker {
                 }
             }
             Expr::Binary(operator, left, right) => {
-                let left = self.eval_expr(left, locals, this_object_id)?;
-                let right = self.eval_expr(right, locals, this_object_id)?;
+                let left = self.eval_expr(left, locals, this_object_id, thread_id, allow_invoke)?;
+                let right =
+                    self.eval_expr(right, locals, this_object_id, thread_id, allow_invoke)?;
                 self.eval_binary(*operator, left, right)
             }
         }
@@ -1700,6 +1780,383 @@ impl Worker {
         }
     }
 
+    /// Read `base[position]` through `ArrayReference.GetValues`.
+    fn eval_array_element(&mut self, base: EvalValue, position: i64) -> Result<EvalValue, String> {
+        let EvalValue::Object { id } = base else {
+            return Err(format!(
+                "índice `[..]` exige array, recebeu {}",
+                self.display_eval_value(&base)
+            ));
+        };
+        if position < 0 {
+            return Err(format!("índice de array negativo: {position}"));
+        }
+        let Some(type_id) = self.object_type_id(id) else {
+            return Err(format!("objeto {id} sem tipo"));
+        };
+        let signature = self.type_signature(type_id).unwrap_or_default();
+        if !signature.starts_with('[') {
+            return Err(format!(
+                "índice `[..]` exige array, recebeu {}",
+                type_name_from_signature(&signature)
+            ));
+        }
+        let mut length_writer = Writer::default();
+        length_writer.id(id, self.client.sizes.object);
+        let length_data = self.client.request(13, 1, &length_writer.data)?;
+        let mut length_reader = Reader::new(&length_data, self.client.sizes);
+        let length = length_reader.u32()? as i64;
+        if position >= length {
+            return Err(format!(
+                "índice {position} fora dos limites (tamanho {length})"
+            ));
+        }
+        let mut writer = Writer::default();
+        writer.id(id, self.client.sizes.object);
+        writer.u32(position as u32);
+        writer.u32(1);
+        let data = self.client.request(13, 2, &writer.data)?;
+        let mut reader = Reader::new(&data, self.client.sizes);
+        // Reply is an `arrayregion`: single tag, element count, untagged values.
+        let tag = reader.u8()?;
+        let count = reader.u32()? as usize;
+        if count == 0 {
+            return Err("array retornou nenhum elemento".to_owned());
+        }
+        Ok(self.eval_value(reader.untagged(tag)?))
+    }
+
+    /// Resolve and invoke `receiver.method(args)` (or `this.method(args)` when
+    /// `receiver` is `None`, or `Classe.stat(args)` for class names).
+    fn eval_call(
+        &mut self,
+        receiver: Option<&Expr>,
+        method: &str,
+        args: Vec<EvalValue>,
+        locals: &HashMap<String, (String, EvalValue)>,
+        this_object_id: Option<u64>,
+        thread_id: u64,
+    ) -> Result<EvalValue, String> {
+        if args.len() > 8 {
+            return Err("máximo de 8 argumentos na chamada".to_owned());
+        }
+        // Static path: `receiver` is a class name, not a variable.
+        if let Some(Expr::Name(name)) = receiver {
+            if name != "this" && !locals.contains_key(name) {
+                if let Some((_, declaring)) = self.resolve_class(name) {
+                    return self.invoke_static(declaring, method, &args, thread_id);
+                }
+            }
+        }
+        let base = match receiver {
+            None => this_object_id
+                .map(|id| EvalValue::Object { id })
+                .ok_or_else(|| {
+                    format!("método `{method}` exige receptor (frame estático sem `this`)")
+                })?,
+            Some(target) => {
+                // Recurse without invocation to keep `a.b(c)` failures local;
+                // nested calls are evaluated by the outer `eval_expr`.
+                self.eval_expr(target, locals, this_object_id, thread_id, true)?
+            }
+        };
+        let object_id = match base {
+            EvalValue::Object { id } | EvalValue::StringObject { id, .. } => id,
+            _ => {
+                return Err(format!(
+                    "não é possível chamar `{method}` em {}",
+                    self.display_eval_value(&base)
+                ));
+            }
+        };
+        self.invoke_instance(object_id, method, &args, thread_id)
+    }
+
+    /// Look up a class by fully-qualified or `java.lang` simple name.
+    /// Returns `(class_id, declaring_type_id)`.
+    fn resolve_class(&mut self, name: &str) -> Option<(u64, u64)> {
+        let mut candidates = Vec::new();
+        if name.contains('.') {
+            candidates.push(signature_for_class(name));
+        } else {
+            candidates.push(format!("Ljava/lang/{name};"));
+            candidates.push(format!("L{name};"));
+        }
+        for signature in candidates {
+            let Ok(classes) = self.classes_by_signature(&signature) else {
+                continue;
+            };
+            if let Some((_, type_id)) = classes
+                .iter()
+                .find(|(tag, _)| *tag == 1)
+                .or_else(|| classes.first())
+                .copied()
+            {
+                return Some((type_id, type_id));
+            }
+        }
+        None
+    }
+
+    /// Find a non-constructor method by name/arity, walking superclasses.
+    fn find_method(
+        &mut self,
+        mut type_id: u64,
+        method: &str,
+        static_only: Option<bool>,
+    ) -> Result<Vec<(u64, MethodInfo)>, String> {
+        let mut found = Vec::new();
+        let mut visited = HashSet::new();
+        let mut depth = 0;
+        while type_id != 0 && depth < 8 && visited.insert(type_id) {
+            for info in self.methods(type_id)? {
+                if info.name == method
+                    && !info.name.starts_with('<')
+                    && static_only.is_none_or(|only_static| info.is_static == only_static)
+                {
+                    found.push((type_id, info));
+                }
+            }
+            if !found.is_empty() {
+                return Ok(found);
+            }
+            let mut writer = Writer::default();
+            writer.id(type_id, self.client.sizes.reference_type);
+            match self.client.request(3, 1, &writer.data) {
+                Ok(data) => {
+                    let mut reader = Reader::new(&data, self.client.sizes);
+                    type_id = reader.reference_type().unwrap_or(0);
+                }
+                Err(_) => break,
+            }
+            depth += 1;
+        }
+        Err(format!("método `{method}` não encontrado"))
+    }
+
+    fn invoke_instance(
+        &mut self,
+        object_id: u64,
+        method: &str,
+        args: &[EvalValue],
+        thread_id: u64,
+    ) -> Result<EvalValue, String> {
+        let Some(type_id) = self.object_type_id(object_id) else {
+            return Err(format!("objeto {object_id} sem tipo"));
+        };
+        let candidates = self.find_method(type_id, method, Some(false))?;
+        let (declaring, info) = self.pick_overload(&candidates, args, method)?;
+        self.invoke(thread_id, false, object_id, declaring, &info, args)
+    }
+
+    fn invoke_static(
+        &mut self,
+        declaring: u64,
+        method: &str,
+        args: &[EvalValue],
+        thread_id: u64,
+    ) -> Result<EvalValue, String> {
+        let candidates = self.find_method(declaring, method, Some(true))?;
+        let (declaring, info) = self.pick_overload(&candidates, args, method)?;
+        self.invoke(thread_id, true, declaring, declaring, &info, args)
+    }
+
+    /// Pick the overload whose parameter descriptors accept `args`.
+    fn pick_overload(
+        &self,
+        candidates: &[(u64, MethodInfo)],
+        args: &[EvalValue],
+        method: &str,
+    ) -> Result<(u64, MethodInfo), String> {
+        let mut scored: Vec<(u32, u64, MethodInfo)> = Vec::new();
+        for (declaring, info) in candidates {
+            let params = parse_sig_params(&info.signature);
+            if params.len() != args.len() {
+                continue;
+            }
+            let mut total = 0u32;
+            let mut compatible = true;
+            for (arg, param) in args.iter().zip(params.iter()) {
+                match arg_score(arg, param) {
+                    Some(score) => total += score,
+                    None => {
+                        compatible = false;
+                        break;
+                    }
+                }
+            }
+            if compatible {
+                scored.push((total, *declaring, info.clone()));
+            }
+        }
+        if scored.is_empty() {
+            let arities: Vec<String> = candidates
+                .iter()
+                .map(|(_, info)| {
+                    format!("{}({})", info.name, parse_sig_params(&info.signature).len())
+                })
+                .collect();
+            return Err(format!(
+                "nenhuma sobrecarga de `{method}` aceita {} argumento(s) (candidatas: {})",
+                args.len(),
+                arities.join(", ")
+            ));
+        }
+        scored.sort_by_key(|(score, _, _)| *score);
+        if scored.len() > 1 && scored[0].0 == scored[1].0 {
+            return Err(format!("chamada a `{method}` é ambígua entre sobrecargas"));
+        }
+        let (_, declaring, info) = scored.into_iter().next().unwrap();
+        Ok((declaring, info))
+    }
+
+    /// Execute a resolved method via JDWP (`ObjectReference` or
+    /// `ClassType` `InvokeMethod`, single-threaded).
+    fn invoke(
+        &mut self,
+        thread_id: u64,
+        is_static: bool,
+        target_id: u64,
+        declaring_id: u64,
+        info: &MethodInfo,
+        args: &[EvalValue],
+    ) -> Result<EvalValue, String> {
+        let params = parse_sig_params(&info.signature);
+        let mut writer = Writer::default();
+        if is_static {
+            // ClassType.InvokeMethod: class, thread, method, args, options.
+            writer.id(target_id, self.client.sizes.reference_type);
+            writer.id(thread_id, self.client.sizes.object);
+        } else {
+            // ObjectReference.InvokeMethod: object, thread, class, method, args, options.
+            writer.id(target_id, self.client.sizes.object);
+            writer.id(thread_id, self.client.sizes.object);
+            writer.id(declaring_id, self.client.sizes.reference_type);
+        }
+        writer.id(info.id, self.client.sizes.method);
+        writer.u32(args.len() as u32);
+        for (arg, param) in args.iter().zip(params.iter()) {
+            self.write_arg(&mut writer, arg, param)?;
+        }
+        // 0x02 = INVOKE_SINGLE_THREADED: only the invoking thread resumes.
+        writer.u32(0x02);
+        let (set, command) = if is_static { (3, 3) } else { (9, 6) };
+        let data = self
+            .client
+            .request(set, command, &writer.data)
+            .map_err(|error| format!("falha ao invocar `{}`: {error}", info.name))?;
+        let mut reader = Reader::new(&data, self.client.sizes);
+        let value = reader.value()?;
+        let exception = reader.tagged_object()?;
+        if let Value::Object { id, .. } = exception {
+            if id != 0 {
+                return Err(format!(
+                    "método `{}` lançou exceção: {}",
+                    info.name,
+                    self.format_object(b'L', id)
+                ));
+            }
+        }
+        Ok(self.eval_value(value))
+    }
+
+    /// Encode one argument with the tag of its parameter descriptor.
+    fn write_arg(
+        &mut self,
+        writer: &mut Writer,
+        arg: &EvalValue,
+        param: &str,
+    ) -> Result<(), String> {
+        let tag = param.as_bytes().first().copied().unwrap_or(b'L');
+        match (arg, tag) {
+            (EvalValue::Int(value), b'B') => {
+                writer.u8(b'B');
+                writer.u8(*value as i8 as u8);
+            }
+            (EvalValue::Int(value), b'S') => {
+                writer.u8(b'S');
+                writer.u16(*value as i16 as u16);
+            }
+            (EvalValue::Int(value), b'C') => {
+                writer.u8(b'C');
+                writer.u16(*value as u16);
+            }
+            (EvalValue::Int(value), b'I') => {
+                writer.u8(b'I');
+                writer.u32(*value as i32 as u32);
+            }
+            (EvalValue::Int(value), b'J') => {
+                writer.u8(b'J');
+                writer.u64(*value as u64);
+            }
+            (EvalValue::Int(value), b'F') => {
+                writer.u8(b'F');
+                writer.u32((*value as f32).to_bits());
+            }
+            (EvalValue::Int(value), b'D') => {
+                writer.u8(b'D');
+                writer.u64((*value as f64).to_bits());
+            }
+            (EvalValue::Float(value), b'F') => {
+                writer.u8(b'F');
+                writer.u32((*value as f32).to_bits());
+            }
+            (EvalValue::Float(value), b'D') => {
+                writer.u8(b'D');
+                writer.u64(value.to_bits());
+            }
+            (EvalValue::Bool(value), b'Z') => {
+                writer.u8(b'Z');
+                writer.u8(u8::from(*value));
+            }
+            (EvalValue::Char(value), b'C') => {
+                writer.u8(b'C');
+                writer.u16(*value as u16);
+            }
+            (EvalValue::Char(value), b'I') => {
+                writer.u8(b'I');
+                writer.u32(*value as u32);
+            }
+            (EvalValue::String(value), b'L') => {
+                let id = self.create_string(value)?;
+                writer.u8(b'L');
+                writer.id(id, self.client.sizes.object);
+            }
+            // Debuggee strings are passed by id, without re-creating them.
+            (EvalValue::StringObject { id, .. }, b'L') => {
+                writer.u8(b'L');
+                writer.id(*id, self.client.sizes.object);
+            }
+            (EvalValue::Object { id }, b'L') | (EvalValue::Object { id }, b'[') => {
+                writer.u8(tag);
+                writer.id(*id, self.client.sizes.object);
+            }
+            (EvalValue::Null, b'L') | (EvalValue::Null, b'[') => {
+                writer.u8(tag);
+                writer.id(0, self.client.sizes.object);
+            }
+            _ => {
+                return Err(format!(
+                    "argumento {} incompatível com parâmetro `{param}`",
+                    self.display_eval_value(arg)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Create a `java.lang.String` in the debuggee (`VirtualMachine.CreateString`).
+    fn create_string(&mut self, value: &str) -> Result<u64, String> {
+        if value.chars().count() > 500 {
+            return Err("string longa demais para argumento (máximo 500 caracteres)".to_owned());
+        }
+        let mut writer = Writer::default();
+        writer.string(value);
+        let data = self.client.request(1, 11, &writer.data)?;
+        let mut reader = Reader::new(&data, self.client.sizes);
+        reader.object()
+    }
+
     fn eval_binary(
         &mut self,
         operator: BinaryOp,
@@ -1708,7 +2165,7 @@ impl Worker {
     ) -> Result<EvalValue, String> {
         match operator {
             BinaryOp::Add => {
-                if matches!(left, EvalValue::String(_)) || matches!(right, EvalValue::String(_)) {
+                if self.eval_text(&left).is_some() || self.eval_text(&right).is_some() {
                     let left = self.display_eval_value(&left);
                     let right = self.display_eval_value(&right);
                     return Ok(EvalValue::String(format!("{left}{right}")));
@@ -1799,12 +2256,27 @@ impl Worker {
             (EvalValue::Null, _) | (_, EvalValue::Null) => false,
             (EvalValue::Bool(left), EvalValue::Bool(right)) => left == right,
             (EvalValue::Char(left), EvalValue::Char(right)) => left == right,
-            (EvalValue::String(left), EvalValue::String(right)) => left == right,
             (EvalValue::Object { id: left }, EvalValue::Object { id: right }) => left == right,
-            _ => match (self.numeric_value(left), self.numeric_value(right)) {
+            (
+                EvalValue::StringObject { id: left, .. },
+                EvalValue::StringObject { id: right, .. },
+            ) => left == right,
+            _ => match (self.eval_text(left), self.eval_text(right)) {
                 (Some(left), Some(right)) => left == right,
-                _ => false,
+                _ => match (self.numeric_value(left), self.numeric_value(right)) {
+                    (Some(left), Some(right)) => left == right,
+                    _ => false,
+                },
             },
+        }
+    }
+
+    /// Text of string values (literals and debuggee `String` objects).
+    fn eval_text<'a>(&self, value: &'a EvalValue) -> Option<&'a str> {
+        match value {
+            EvalValue::String(value) => Some(value),
+            EvalValue::StringObject { value, .. } => Some(value),
+            _ => None,
         }
     }
 
@@ -1815,7 +2287,9 @@ impl Worker {
             EvalValue::Int(value) => value.to_string(),
             EvalValue::Float(value) => value.to_string(),
             EvalValue::Char(value) => format!("'{value}'"),
-            EvalValue::String(value) => format!("\"{}\"", truncate(value, 200)),
+            EvalValue::String(value) | EvalValue::StringObject { value, .. } => {
+                format!("\"{}\"", truncate(value, 200))
+            }
             EvalValue::Object { id } => self.format_object(b'L', *id),
         }
     }
@@ -1925,6 +2399,64 @@ impl Drop for Worker {
 
 fn signature_for_class(class_name: &str) -> String {
     format!("L{};", class_name.replace('.', "/"))
+}
+
+/// Parameter descriptors of a JDWP method signature, e.g. `(ILjava/lang/String;)V`.
+fn parse_sig_params(signature: &str) -> Vec<String> {
+    let Some(inner) = signature
+        .strip_prefix('(')
+        .and_then(|rest| rest.split(')').next())
+    else {
+        return Vec::new();
+    };
+    let bytes = inner.as_bytes();
+    let mut params = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let start = index;
+        // Array prefix (`[[I`, `[Ljava/lang/String;`).
+        while index < bytes.len() && bytes[index] == b'[' {
+            index += 1;
+        }
+        if index < bytes.len() && bytes[index] == b'L' {
+            while index < bytes.len() && bytes[index] != b';' {
+                index += 1;
+            }
+            index += 1; // consume `;`
+        } else {
+            index += 1; // primitive tag
+        }
+        if start < index && index <= bytes.len() {
+            params.push(inner[start..index].to_owned());
+        }
+    }
+    params
+}
+
+/// Compatibility cost of passing `arg` where `param` (a descriptor) is expected.
+fn arg_score(arg: &EvalValue, param: &str) -> Option<u32> {
+    let tag = param.as_bytes().first().copied().unwrap_or(b'L');
+    match (arg, tag) {
+        (EvalValue::Int(_), b'B' | b'S' | b'C' | b'I') => Some(0),
+        (EvalValue::Int(_), b'J' | b'F' | b'D') => Some(1),
+        (EvalValue::Float(_), b'D') => Some(0),
+        (EvalValue::Float(_), b'F') => Some(1),
+        (EvalValue::Bool(_), b'Z') => Some(0),
+        (EvalValue::Char(_), b'C') => Some(0),
+        (EvalValue::Char(_), b'I') => Some(1),
+        (EvalValue::Char(_), b'J' | b'F' | b'D') => Some(2),
+        (EvalValue::String(_), b'L') | (EvalValue::StringObject { .. }, b'L') => {
+            if param == "Ljava/lang/String;" {
+                Some(0)
+            } else {
+                // e.g. `println(Object)`: a String instance is assignable.
+                Some(3)
+            }
+        }
+        (EvalValue::Object { .. }, b'L' | b'[') => Some(2),
+        (EvalValue::Null, b'L' | b'[') => Some(1),
+        _ => None,
+    }
 }
 
 fn source_name_for_path(path: &std::path::Path) -> String {

@@ -23,7 +23,8 @@ Atualizado após a validação com Spring Boot e os refinamentos do M2.
 - Debugger JDWP nativo:
   - launch/attach, breakpoints de linha e condicionais;
   - stepping (`F5`/`F6`/`F7`/`F8`), pausa e encerramento;
-  - call stack, threads, variáveis, campos de `this`, watches e evaluator;
+  - call stack, threads, variáveis, campos de `this`, watches e evaluator
+    (índices de array e chamadas de método via JDWP);
   - hot swap básico e pausa em exceções;
   - breakpoints por arquivo-fonte para classes anônimas/lambdas e tipos aninhados.
 
@@ -43,7 +44,9 @@ Atualizado após a validação com Spring Boot e os refinamentos do M2.
 - Download de sources/Javadoc no Gradle.
 - Empacotamento do JDT LS e matriz com projetos Maven multi-módulo/Gradle reais.
 - Adaptador DAP externo e attach remoto com TLS/reconexão.
-- Avaliação de chamadas de método/índices de array no debugger.
+- Avaliação de chamadas de método/índices de array no debugger (entregue:
+  `arr[i]` via ArrayReference, `obj.m()`/`Classe.stat()` via InvokeMethod,
+  overloads por compatibilidade, rejeição em condições).
 - Debugger 100% validado em projetos multi-módulo.
 
 ## Como verificar
