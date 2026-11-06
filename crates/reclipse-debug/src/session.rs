@@ -24,10 +24,10 @@ const EVENT_SINGLE_STEP: u8 = 1;
 const EVENT_BREAKPOINT: u8 = 2;
 const EVENT_EXCEPTION: u8 = 4;
 const EVENT_CLASS_PREPARE: u8 = 8;
-const MOD_CLASS_MATCH: u8 = 5;
 const MOD_LOCATION_ONLY: u8 = 7;
 const MOD_EXCEPTION_ONLY: u8 = 8;
 const MOD_STEP: u8 = 10;
+const MOD_SOURCE_NAME_MATCH: u8 = 12;
 const STEP_LINE: u32 = 1;
 const STEP_INTO: u32 = 0;
 const STEP_OVER: u32 = 1;
@@ -258,7 +258,7 @@ struct Worker {
     requests: HashMap<(PathBuf, usize), Vec<u32>>,
     /// Optional condition keyed by the JDWP breakpoint request ID.
     request_conditions: HashMap<u32, Option<String>>,
-    /// ClassPrepare request IDs keyed by binary class name.
+    /// ClassPrepare request IDs keyed by source file name.
     class_prepare: HashMap<String, u32>,
     exception_request: Option<u32>,
     pause_on_exceptions: bool,
@@ -621,25 +621,25 @@ impl Worker {
         Ok(())
     }
 
-    fn ensure_class_prepare(&mut self, class_name: &str) -> Result<(), String> {
-        if self.class_prepare.contains_key(class_name) {
+    fn ensure_class_prepare(&mut self, source_name: &str) -> Result<(), String> {
+        if self.class_prepare.contains_key(source_name) {
             return Ok(());
         }
         let mut writer = Writer::default();
         writer.u8(EVENT_CLASS_PREPARE);
         writer.u8(SUSPEND_ALL);
         writer.u32(1);
-        writer.u8(MOD_CLASS_MATCH);
-        writer.string(class_name);
+        writer.u8(MOD_SOURCE_NAME_MATCH);
+        writer.string(source_name);
         let data = self.client.request(15, 1, &writer.data)?;
         let mut reader = Reader::new(&data, self.client.sizes);
         self.class_prepare
-            .insert(class_name.to_owned(), reader.u32()?);
+            .insert(source_name.to_owned(), reader.u32()?);
         Ok(())
     }
 
-    fn clear_class_prepare(&mut self, class_name: &str) {
-        if let Some(request_id) = self.class_prepare.remove(class_name) {
+    fn clear_class_prepare(&mut self, source_name: &str) {
+        if let Some(request_id) = self.class_prepare.remove(source_name) {
             let mut writer = Writer::default();
             writer.u8(EVENT_CLASS_PREPARE);
             writer.u32(request_id);
@@ -655,21 +655,30 @@ impl Worker {
         }) {
             return Ok(());
         }
+        let source_name = source_name_for_path(&spec.path);
+        if source_name.is_empty() {
+            return Err("arquivo de origem sem nome".to_owned());
+        }
         self.pending.push(spec.clone());
-        // Register the class prepare hook first so a class that loads between
-        // the loaded-class query and the request cannot be missed.
-        self.ensure_class_prepare(&spec.class_name)?;
+        // SourceNameMatch catches the named class, nested classes, anonymous
+        // classes and lambda hosts that share this source file.
+        self.ensure_class_prepare(&source_name)?;
         let signature = signature_for_class(&spec.class_name);
         let classes = self.classes_by_signature(&signature)?;
         for (tag, type_id) in classes {
-            self.resolve_breakpoints_for_type(type_id, tag, &spec.class_name)?;
+            self.resolve_breakpoints_for_type(type_id, tag, &spec.class_name, &source_name)?;
+        }
+        if let Ok(loaded) = self.classes_by_source_prefix(&spec.class_name, &source_name) {
+            for (tag, type_id) in loaded {
+                self.resolve_breakpoints_for_type(type_id, tag, &spec.class_name, &source_name)?;
+            }
         }
         if !self
             .pending
             .iter()
-            .any(|pending| pending.class_name == spec.class_name)
+            .any(|pending| source_name_for_path(&pending.path) == source_name)
         {
-            self.clear_class_prepare(&spec.class_name);
+            self.clear_class_prepare(&source_name);
         }
         Ok(())
     }
@@ -686,19 +695,19 @@ impl Worker {
                 let _ = self.client.request(15, 2, &writer.data);
             }
         }
-        let classes: HashSet<&str> = self
+        let sources: HashSet<String> = self
             .pending
             .iter()
-            .map(|pending| pending.class_name.as_str())
+            .map(|pending| source_name_for_path(&pending.path))
             .collect();
         let stale: Vec<String> = self
             .class_prepare
             .keys()
-            .filter(|class_name| !classes.contains(class_name.as_str()))
+            .filter(|source_name| !sources.contains(source_name.as_str()))
             .cloned()
             .collect();
-        for class_name in stale {
-            self.clear_class_prepare(&class_name);
+        for source_name in stale {
+            self.clear_class_prepare(&source_name);
         }
         Ok(())
     }
@@ -723,11 +732,16 @@ impl Worker {
         type_id: u64,
         type_tag: u8,
         class_name: &str,
+        source_name: &str,
     ) -> Result<(), String> {
+        let package = package_prefix(class_name);
         let targets: Vec<BreakpointSpec> = self
             .pending
             .iter()
-            .filter(|pending| pending.class_name == class_name)
+            .filter(|pending| {
+                source_name_for_path(&pending.path) == source_name
+                    && package_prefix(&pending.class_name) == package
+            })
             .cloned()
             .collect();
         if targets.is_empty() {
@@ -773,15 +787,9 @@ impl Worker {
                 }
             }
         }
-        let mut resolved_lines = Vec::new();
+        let mut resolved = Vec::new();
         for target in &targets {
             let Some(locations) = line_map.get(&(target.line as u32)) else {
-                let _ = self.events.send(DebugEvent::BreakpointError {
-                    path: target.path.clone(),
-                    line: target.line,
-                    message: "linha sem código executável (mova o breakpoint)".to_owned(),
-                });
-                resolved_lines.push(target.line);
                 continue;
             };
             let mut seen = HashSet::new();
@@ -809,12 +817,55 @@ impl Worker {
                     }
                 }
             }
-            resolved_lines.push(target.line);
+            resolved.push((target.path.clone(), target.line));
         }
         self.pending.retain(|pending| {
-            !(pending.class_name == class_name && resolved_lines.contains(&pending.line))
+            !resolved
+                .iter()
+                .any(|(path, line)| pending.path == *path && pending.line == *line)
         });
         Ok(())
+    }
+
+    fn classes_by_source_prefix(
+        &mut self,
+        class_name: &str,
+        source_name: &str,
+    ) -> Result<Vec<(u8, u64)>, String> {
+        let prefix = class_name.replace('.', "/");
+        let data = self.client.request(1, 3, &[])?;
+        let mut reader = Reader::new(&data, self.client.sizes);
+        let count = reader.u32()? as usize;
+        let mut classes = Vec::new();
+        for _ in 0..count {
+            let tag = reader.u8()?;
+            let type_id = reader.reference_type()?;
+            let signature = reader.string()?;
+            let _status = reader.u32()?;
+            let Some(rest) = signature.strip_prefix('L') else {
+                continue;
+            };
+            let Some(rest) = rest.strip_suffix(';') else {
+                continue;
+            };
+            let matches = rest == prefix
+                || rest
+                    .strip_prefix(&prefix)
+                    .is_some_and(|suffix| suffix.starts_with('$'));
+            if !matches {
+                continue;
+            }
+            if self
+                .source_file(type_id)
+                .ok()
+                .flatten()
+                .as_deref()
+                .is_some_and(|source| source == source_name)
+            {
+                classes.push((tag, type_id));
+            }
+        }
+        Ok(classes)
     }
 
     fn set_location_breakpoint(
@@ -858,14 +909,20 @@ impl Worker {
                     let type_id = reader.reference_type()?;
                     let signature = reader.string()?;
                     let _status = reader.u32()?;
-                    if let Some(class_name) = class_name_from_signature(&signature) {
-                        let _ = self.resolve_breakpoints_for_type(type_id, type_tag, &class_name);
+                    let class_name = class_name_from_signature(&signature).unwrap_or_default();
+                    if let Some(source_name) = self.source_file(type_id).ok().flatten() {
+                        let _ = self.resolve_breakpoints_for_type(
+                            type_id,
+                            type_tag,
+                            &class_name,
+                            &source_name,
+                        );
                         if !self
                             .pending
                             .iter()
-                            .any(|pending| pending.class_name == class_name)
+                            .any(|pending| source_name_for_path(&pending.path) == source_name)
                         {
-                            self.clear_class_prepare(&class_name);
+                            self.clear_class_prepare(&source_name);
                         }
                     }
                     class_prepared = true;
@@ -1868,6 +1925,19 @@ impl Drop for Worker {
 
 fn signature_for_class(class_name: &str) -> String {
     format!("L{};", class_name.replace('.', "/"))
+}
+
+fn source_name_for_path(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn package_prefix(class_name: &str) -> &str {
+    class_name
+        .rsplit_once('.')
+        .map(|(package, _)| package)
+        .unwrap_or("")
 }
 
 fn class_name_from_signature(signature: &str) -> Option<String> {

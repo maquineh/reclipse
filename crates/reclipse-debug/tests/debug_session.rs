@@ -650,6 +650,109 @@ fn wait_for_watches(session: &DebugSession, count: usize) -> Vec<WatchValue> {
     panic!("watches did not return");
 }
 
+#[test]
+fn breakpoints_inside_anonymous_class() {
+    if Command::new("javac").arg("-version").output().is_err() {
+        eprintln!("javac unavailable; skipping anonymous class test");
+        return;
+    }
+    let source = r#"
+public class AnonymousTarget {
+    public static void main(String[] args) {
+        Runnable runnable = new Runnable() {
+            @Override
+            public void run() {
+                int value = 7;
+                System.out.println("value=" + value);
+            }
+        };
+        runnable.run();
+    }
+}
+"#;
+    let source = source.trim_start();
+    let breakpoint_line = source
+        .lines()
+        .position(|line| line.contains("int value = 7"))
+        .map(|line| line + 1)
+        .expect("breakpoint line");
+    let (directory, source_file) = compile_target(source, "AnonymousTarget");
+    let session = DebugSession::launch(
+        launch_spec(&directory, "AnonymousTarget"),
+        vec![BreakpointSpec {
+            path: source_file,
+            line: breakpoint_line,
+            class_name: "AnonymousTarget".to_owned(),
+            condition: None,
+        }],
+        false,
+    )
+    .expect("session");
+    let stopped = wait_for_stop(&session, StopReason::Breakpoint);
+    assert!(
+        stopped.location.as_ref().is_some_and(|location| {
+            location.line == breakpoint_line && location.signature.contains("AnonymousTarget$")
+        }),
+        "location: {:?}",
+        stopped.location
+    );
+    session.send(DebugCommand::Disconnect);
+    drop(session);
+    thread::sleep(Duration::from_millis(100));
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn breakpoints_after_nested_type_still_resolve() {
+    if Command::new("javac").arg("-version").output().is_err() {
+        eprintln!("javac unavailable; skipping nested order test");
+        return;
+    }
+    let source = r#"
+public class NestedOrderTarget {
+    public static void main(String[] args) {
+        int before = 1;
+        class Inner {
+            void run() { System.out.println("inner"); }
+        }
+        new Inner().run();
+        int after = before + 1;
+        System.out.println(after);
+    }
+}
+"#;
+    let source = source.trim_start();
+    let breakpoint_line = source
+        .lines()
+        .position(|line| line.contains("int after"))
+        .map(|line| line + 1)
+        .expect("breakpoint line");
+    let (directory, source_file) = compile_target(source, "NestedOrderTarget");
+    let session = DebugSession::launch(
+        launch_spec(&directory, "NestedOrderTarget"),
+        vec![BreakpointSpec {
+            path: source_file,
+            line: breakpoint_line,
+            // Simulates the old heuristic choosing the inner local type.
+            class_name: "NestedOrderTarget$1Inner".to_owned(),
+            condition: None,
+        }],
+        false,
+    )
+    .expect("session");
+    let stopped = wait_for_stop(&session, StopReason::Breakpoint);
+    assert_eq!(
+        stopped.location.as_ref().map(|location| location.line),
+        Some(breakpoint_line),
+        "location: {:?}",
+        stopped.location
+    );
+    session.send(DebugCommand::Disconnect);
+    drop(session);
+    thread::sleep(Duration::from_millis(100));
+    let _ = fs::remove_dir_all(directory);
+}
+
 fn compile_target(source: &str, class_name: &str) -> (PathBuf, PathBuf) {
     let directory = unique_temp_dir();
     fs::create_dir_all(directory.join("classes")).unwrap();

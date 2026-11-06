@@ -122,7 +122,7 @@ Debugger JDWP pausado em um breakpoint, com call stack e variáveis:
 
 Este MVP é deliberadamente honesto sobre o escopo:
 
-- O debugger usa JDWP nativo e entrega launch/attach, breakpoints de linha e condicionais, stepping, call stack, variáveis, campos de `this`, watches, evaluator de expressões e hot swap; ainda faltam DAP externo, mapeamento preciso de classes anônimas/lambdas e attach remoto com TLS.
+- O debugger usa JDWP nativo e entrega launch/attach, breakpoints de linha e condicionais, stepping, call stack, variáveis, campos de `this`, watches, evaluator de expressões, hot swap e mapeamento de anônimas/lambdas por arquivo-fonte; ainda faltam DAP externo e attach remoto com TLS.
 - Compila e executa `main` via `javac`/`java` com launch config, roda `mvn test`/`gradle test` com parser e JUnit inline por classe/método, e depura via JDWP; ainda não executa ciclos de build Maven/Gradle completos.
 - O formatter é externo e opt-in (`RECLIPSE_FORMATTER`/`RECLIPSE_FORMATTER_JAR`); organize imports é nativo e conservador.
 - A semântica Java cobre imports/tipos, completion de membros, hover, referências semânticas de tipos/membros, rename conservador, overloads por tipo, type variables com substituição e diagnósticos nativos (tipos/membros não resolvidos, `@Override`, static ambíguo) além do `javac` em fundo; faltam apenas refinamentos (overloads finos por subtipo, Javadoc, modo JDT opt-in). Tipos locais são detectados; tipos anônimos ainda não são modelados.

@@ -1193,6 +1193,7 @@ impl ReclipseApp {
     fn class_name_for_line(&self, path: &Path, line: usize) -> Option<String> {
         if let Some(index) = &self.index {
             if let Some(file) = index.symbols_for(path) {
+                let source = fs::read_to_string(path).ok();
                 let mut best: Option<&reclipse_java::JavaSymbol> = None;
                 for symbol in &file.symbols {
                     if !symbol.kind.is_type()
@@ -1201,6 +1202,11 @@ impl ReclipseApp {
                         || symbol.line > line
                     {
                         continue;
+                    }
+                    if let Some(source) = &source {
+                        if !type_encloses_line(source, symbol.line, line) {
+                            continue;
+                        }
                     }
                     let better = match best {
                         None => true,
@@ -9683,6 +9689,79 @@ fn path_for_location(
     })
 }
 
+fn type_encloses_line(source: &str, start_line: usize, target_line: usize) -> bool {
+    if target_line < start_line {
+        return false;
+    }
+    if target_line == start_line {
+        return true;
+    }
+    let mut state = BraceScanState::default();
+    let mut depth = 0_i32;
+    for line in source
+        .lines()
+        .skip(start_line.saturating_sub(1))
+        .take(target_line - start_line + 1)
+    {
+        scan_braces(line, &mut state, &mut depth);
+    }
+    depth > 0
+}
+
+#[derive(Default)]
+struct BraceScanState {
+    block_comment: bool,
+    in_string: bool,
+    in_char: bool,
+    escaped: bool,
+}
+
+fn scan_braces(line: &str, state: &mut BraceScanState, depth: &mut i32) {
+    let characters: Vec<char> = line.chars().collect();
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters[index];
+        if state.block_comment {
+            if character == '*' && characters.get(index + 1) == Some(&'/') {
+                state.block_comment = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if state.in_string || state.in_char {
+            if state.escaped {
+                state.escaped = false;
+            } else if character == '\\' {
+                state.escaped = true;
+            } else if state.in_string && character == '"' {
+                state.in_string = false;
+            } else if state.in_char && character == '\'' {
+                state.in_char = false;
+            }
+            index += 1;
+            continue;
+        }
+        if character == '/' && characters.get(index + 1) == Some(&'/') {
+            break;
+        }
+        if character == '/' && characters.get(index + 1) == Some(&'*') {
+            state.block_comment = true;
+            index += 2;
+            continue;
+        }
+        match character {
+            '"' => state.in_string = true,
+            '\'' => state.in_char = true,
+            '{' => *depth += 1,
+            '}' => *depth -= 1,
+            _ => {}
+        }
+        index += 1;
+    }
+}
+
 fn truncate_text(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_owned();
@@ -10113,6 +10192,19 @@ mod tests {
             "project/gradle/libs.versions.toml"
         )));
         assert!(!is_classpath_config(Path::new("project/App.java")));
+    }
+
+    #[test]
+    fn detects_enclosing_type_braces() {
+        let source = "class Outer {\n    class Inner {\n        void run() {}\n    }\n    void after() {}\n}\n";
+        assert!(type_encloses_line(source, 1, 2));
+        assert!(type_encloses_line(source, 2, 3));
+        assert!(type_encloses_line(source, 1, 5));
+        assert!(!type_encloses_line(source, 2, 5));
+        assert!(!type_encloses_line(source, 1, 7));
+        let strings = "class A {\n    String text = \"}{\";\n    void run() {}\n}\n";
+        assert!(type_encloses_line(strings, 1, 3));
+        assert!(!type_encloses_line(strings, 1, 5));
     }
 
     #[test]

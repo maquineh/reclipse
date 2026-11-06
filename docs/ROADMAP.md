@@ -141,7 +141,6 @@ Pendente:
 
 - adaptador DAP para clientes externos;
 - evaluator com chamadas de método, índices de array e campos estáticos;
-- mapeamento preciso de classes anônimas/lambdas e de linhas após tipos aninhados;
 - attach remoto com TLS/autenticação e reconexão;
 - validação com Spring Boot real.
 
