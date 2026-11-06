@@ -144,7 +144,7 @@ Este MVP é deliberadamente honesto sobre o escopo:
 - Plugins Eclipse/OSGi/SWT **não** são carregados ainda. A compatibilidade headless está no roadmap.
 - Há **JDT LS opt-in** via `RECLIPSE_JDTLS` (diagnósticos extras), com status na toolbar e reinício pela palette; empacotamento do servidor e uma matriz de testes de projetos reais ainda faltam.
 
-Veja [docs/M1.md](docs/M1.md) para o detalhamento do editor, [docs/M2.md](docs/M2.md) para o classpath/semântica, [docs/M3.md](docs/M3.md) para build/testes e [docs/M4.md](docs/M4.md) para o debugger. O [docs/ROADMAP.md](docs/ROADMAP.md) lista os próximos marcos.
+Veja [docs/STATUS.md](docs/STATUS.md) para o estado consolidado, [docs/M1.md](docs/M1.md) para o editor, [docs/M2.md](docs/M2.md) para classpath/semântica, [docs/M3.md](docs/M3.md) para build/testes e [docs/M4.md](docs/M4.md) para o debugger. O [docs/ROADMAP.md](docs/ROADMAP.md) lista os próximos marcos.
 
 ---
 
