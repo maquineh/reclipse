@@ -108,15 +108,15 @@ Entregue:
 - JUnit 4/5 inline: descoberta, árvore classe → método, execução por classe/método e falhas clicáveis;
 - formatter externo opt-in e organize imports nativo;
 - console com ANSI, histórico persistido e limites explícitos;
-- split editor com abas arrastáveis entre dois painéis.
+- split editor com abas arrastáveis entre dois painéis;
+- diálogo **Build Path → Configure Build Path…** (estilo WTP) para projetos Eclipse, com reindexação automática; Maven/Gradle somente leitura.
 
 Pendente:
 
-- Debugger JDWP/JDI entregue no M4 (breakpoints condicionais, watches e hot swap incluídos; DAP externo pendente).
 - JUnit independente do runner Maven/Gradle (execução direta via launcher/JUnit Platform).
 - Configurações de execução múltiplas e variáveis por plataforma.
 - Formatter embutido (sem dependência externa).
-- Problemas de compilação em tempo real durante a digitação (javac em fundo já existe).
+- Debugger JDWP/JDI em andamento no M4 (núcleo, evaluator, exceções e remoto entregues; DAP externo pendente).
 
 Aceite:
 
@@ -132,18 +132,20 @@ Entregue:
 - breakpoints de linha e condicionais pela gutter, persistidos na sessão e resolvidos via `ClassPrepare`;
 - stepping (`F5`/`F6`/`F7`/`F8`), pausa (`F12`) e encerramento (`Ctrl+F2`);
 - call stack, threads, variáveis locais, campos de `this`, strings/arrays e objetos formatados;
-- evaluator de expressões (`this.campo`, `obj.campo`, aritmética, comparações e booleanos);
+- evaluator de expressões (`this.campo`, `obj.campo`, `arr[i]`, `obj.m()`/`Classe.stat()`, aritmética, comparações e booleanos);
 - watches persistidos e reavaliados a cada parada;
 - hot swap básico via `VirtualMachine.RedefineClasses`;
-- pausa em exceções não capturadas;
+- pausa em exceções com filtro por tipo (capturadas/não capturadas, subclasses);
+- attach local e remoto estilo JBoss/WildFly/Spring Boot, com retry e reconexão (`docs/REMOTE_DEBUG.md`);
+- matriz de validação por projeto em `docs/VALIDATION.md` (demo, multi-módulo Maven, Spring Boot);
 - abertura automática do arquivo/linha ao parar e destaque da linha atual no editor.
 
 Pendente:
 
 - adaptador DAP para clientes externos;
-- evaluator com chamadas de método, índices de array e campos estáticos;
-- attach remoto com TLS/autenticação e reconexão;
-- validação com projetos multi-módulo.
+- campos estáticos, `new`, casts e lambdas no evaluator (sem chamadas em condições);
+- TLS/autenticação no attach remoto;
+- Gradle real e matriz de JVMs na validação.
 
 Aceite:
 

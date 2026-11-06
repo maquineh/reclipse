@@ -2,7 +2,7 @@
 
 **Uma IDE Java nativa em Rust.** O objetivo é ser a IDE Java mais rápida de todos os tempos: cold start baixo, memória previsível, indexação paralela e uma UI que não depende de SWT nem de um GC.
 
-Este repositório contém o **MVP 0.1.0**, o **M1** do editor e a **fundação do M2** (classpath + semântica Java), funcionais e executáveis, além do plano técnico para chegar a uma IDE completa e a uma camada de compatibilidade com o ecossistema Eclipse.
+Este repositório contém o **MVP 0.1.0**, o **M1** do editor, o **M2** (classpath + semântica Java), o **M3** (build/testes) e o **M4** (debugger JDWP), funcionais e executáveis, além do plano técnico para chegar a uma IDE completa e a uma camada de compatibilidade com o ecossistema Eclipse.
 
 > Projeto independente. Não é afiliado à Eclipse Foundation. Eclipse e JDT são marcas dos seus respectivos titulares.
 
@@ -42,10 +42,11 @@ Este repositório contém o **MVP 0.1.0**, o **M1** do editor e a **fundação d
   - aplica edits em lote e um único passo de undo para rename local.
 - **Mover tipo top-level** para outro pacote (`Código → Mover tipo para pacote…`), atualizando `package`, imports, referências qualificadas, Javadoc e `module-info`.
 - **Compilação e execução**: **Compilar** com `javac` (classpath do projeto + `--release` do target), **Build compile/package/clean** do Maven/Gradle com saída incremental, diagnósticos no painel Problemas e **Executar** a classe `main` com `java` (`Ctrl+F11`).
-- **Debugger JDWP nativo**: breakpoints de linha com condição, launch ou attach, stepping (`F5`/`F6`/`F7`/`F8`), call stack, threads, variáveis locais e campos de `this`, watches, evaluator de expressões, hot swap e pausa em exceções não capturadas (`F11`).
+- **Debugger JDWP nativo**: breakpoints de linha com condição e filtro por tipo de exceção (capturadas/não capturadas), launch ou **attach local/remoto** (estilo JBoss/WildFly/Spring Boot, com reconexão), stepping (`F5`/`F6`/`F7`/`F8`), call stack, threads, variáveis locais e campos de `this`, watches, evaluator de expressões (inclui `arr[i]` e chamadas `obj.m()`/`Classe.stat()`), hot swap e matriz de validação em `docs/VALIDATION.md` (`F11`).
 - **Javadoc completo** (`F2`) em uma janela com parágrafos, listas, tags HTML básicas e `{@link}`/`{@code}`; o hover continua mostrando a primeira frase.
 - **Download de sources/Javadoc** via Maven (`dependency:sources` + `dependency:resolve -Dclassifier=javadoc`), com reindexação automática; o hover de tipos externos passa a mostrar a primeira frase do source baixado.
 - **Toolbar e painel DEBUG com ícones vetoriais próprios** para compilar, build, testar, launch e debug (play, besouro, prancheta, frasco, step over/into/return, pause/stop), inspirados nas metáforas do Eclipse/WTP sem copiar assets EPL-2.0.
+- **Build Path estilo WTP**: menu de contexto **Build Path → Configure Build Path…** no explorer, com diálogo para sources, JARs, containers JRE e output (projetos Eclipse); Maven/Gradle aparecem somente leitura.
 - **JUnit inline**: descoberta de testes JUnit 4/5, árvore classe → método no right dock, execução por classe ou método e falhas clicáveis com stack frame.
 - **Editor dividido** com dois painéis e **abas arrastáveis** (drag-and-drop) entre eles.
 - **Organizar imports** (`Ctrl+Shift+I`) e **formatar arquivo** via formatter externo opt-in (`Ctrl+Alt+F`).
@@ -138,10 +139,10 @@ Visualizador de Javadoc completo (`F2`) com parágrafos e inline tags:
 
 Este MVP é deliberadamente honesto sobre o escopo:
 
-- O debugger usa JDWP nativo e entrega launch/attach, breakpoints de linha e condicionais, stepping, call stack, variáveis, campos de `this`, watches, evaluator de expressões, hot swap e mapeamento de anônimas/lambdas por arquivo-fonte; ainda faltam DAP externo e attach remoto com TLS.
+- O debugger usa JDWP nativo e entrega launch/attach local e remoto (com retry e reconexão; receitas para JBoss/WildFly/Spring Boot em `docs/REMOTE_DEBUG.md`), breakpoints de linha, condicionais e por tipo de exceção, stepping, call stack, variáveis, campos de `this`, watches, evaluator com chamadas e índices, hot swap e mapeamento de anônimas/lambdas por arquivo-fonte; ainda faltam DAP externo e TLS.
 - Compila e executa `main` via `javac`/`java` com launch config, roda `mvn test`/`gradle test` com parser e JUnit inline por classe/método, e depura via JDWP; ainda não executa ciclos de build Maven/Gradle completos.
 - O formatter é externo e opt-in (`RECLIPSE_FORMATTER`/`RECLIPSE_FORMATTER_JAR`); organize imports é nativo e conservador.
-- A semântica Java cobre imports/tipos, completion de membros, hover, referências semânticas de tipos/membros, rename conservador, overloads por tipo, type variables com substituição e diagnósticos nativos (tipos/membros não resolvidos, `@Override`, static ambíguo) além do `javac` em fundo; faltam apenas refinamentos (overloads finos por subtipo, Javadoc, modo JDT opt-in). Tipos locais são detectados; tipos anônimos ainda não são modelados.
+- A semântica Java cobre imports/tipos, completion de membros, hover, referências semânticas de tipos/membros, rename conservador, overloads em 3 fases JLS, type variables com bounds, wildcards, diagnósticos nativos (tipos/membros não resolvidos, `@Override`, static ambíguo) além do `javac` em fundo, e JDT LS opt-in. Tipos locais são detectados; tipos anônimos ainda não são modelados como tipos de projeto.
 - Rename atualiza Javadoc e diretivas `module-info`; não reescreve strings, configuração por reflexão ou nomes em arquivos de recursos. Overrides/implementações e locais sombreados são recusados por segurança, e o rename de workspace exige buffers Java salvos.
 - Maven/Gradle resolvem dependências transitivas do repositório local e têm download sob demanda e perfis Maven; não há Tooling API nem bundles avançados do Gradle.
 - Multi-cursor agrupa undo de digitação, mas backspace/delete multi ainda são por tecla.
@@ -221,7 +222,7 @@ A IDE salva projeto, abas, cursor, visibilidade dos painéis (incluindo o consol
 
 O campo `theme` aceita `rust-oxide` (padrão), `eclipse-cosmic` ou `cyber-solar`. Também é possível iniciar com `RECLIPSE_THEME=cyber-solar`.
 
-Para depurar, clique na gutter para criar breakpoints e pressione `F11`; a IDE compila com `-g`, inicia a JVM com JDWP e abre a sessão. Em **Launch…**, o campo **Attach de debug** aceita `host:porta` para conectar a uma JVM já em execução (vazio = lançar uma nova JVM).
+Para depurar, clique na gutter para criar breakpoints e pressione `F11`; a IDE compila com `-g`, inicia a JVM com JDWP e abre a sessão. Em **Launch…**, o campo **Attach de debug** aceita `host:porta` para conectar a uma JVM já em execução — local ou remota, como servidores JBoss/WildFly/Spring Boot (veja `docs/REMOTE_DEBUG.md`) — com tentativas automáticas e botão **Reconectar**; vazio = lançar uma nova JVM.
 
 No painel **DEBUG**, o botão **cond** de cada breakpoint edita uma condição booleana (ex.: `i == 3`); **Watches** avalia expressões a cada parada; **Hot swap** recompila o projeto e redefine as classes já carregadas (mudanças de corpo de método).
 

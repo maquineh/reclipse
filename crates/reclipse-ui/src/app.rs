@@ -256,6 +256,9 @@ struct DebugUi {
     session: DebugSession,
     status: DebugUiStatus,
     detail: String,
+    /// Set when the session is an attach (local or remote server): enables
+    /// the Reconnect button after the connection drops.
+    attach_address: Option<String>,
     threads: Vec<ThreadInfo>,
     frames: Vec<FrameInfo>,
     variables: Vec<VariableInfo>,
@@ -1501,6 +1504,62 @@ impl ReclipseApp {
     /// Schedule background `javac` diagnostics (debounced). Called on save;
     /// the actual compile runs in `poll_javac_diagnostics` without blocking
     /// manual builds or the UI thread.
+    fn attach_debug(&mut self, address: String) {
+        if self
+            .debug
+            .as_ref()
+            .is_some_and(|debug| debug.status.is_active())
+        {
+            self.toast("Debugger já está ativo");
+            return;
+        }
+        self.debug = None;
+        self.debug_classes = None;
+        let breakpoints = self.breakpoint_specs();
+        let pause = self.debug_pause_exceptions;
+        self.show_console = true;
+        match DebugSession::attach(address.clone(), breakpoints, pause) {
+            Ok(session) => {
+                self.log(LogLevel::Info, format!("Debug: conectando em {address}…"));
+                self.debug = Some(DebugUi {
+                    session,
+                    status: DebugUiStatus::Starting,
+                    detail: format!("attach {address}"),
+                    threads: Vec::new(),
+                    frames: Vec::new(),
+                    variables: Vec::new(),
+                    selected_frame: 0,
+                    location: None,
+                    paused_thread: None,
+                    eval_input: String::new(),
+                    eval_result: None,
+                    exceptions: pause,
+                    attach_address: Some(address.clone()),
+                    breakpoint_errors: Vec::new(),
+                });
+                self.toast(format!("Conectando o debugger em {address}"));
+                self.send_exception_config();
+            }
+            Err(error) => {
+                self.log(LogLevel::Error, format!("Debug: {error}"));
+                self.toast(error);
+            }
+        }
+    }
+
+    fn reconnect_debug(&mut self) {
+        let address = self
+            .debug
+            .as_ref()
+            .and_then(|debug| debug.attach_address.clone());
+        let Some(address) = address else {
+            self.toast("Nada para reconectar");
+            return;
+        };
+        self.log(LogLevel::Info, format!("Debug: reconectando em {address}…"));
+        self.attach_debug(address);
+    }
+
     fn start_debug(&mut self) {
         if self.build_running {
             self.toast("Build já em andamento (cancele para recomeçar)");
@@ -1521,32 +1580,7 @@ impl ReclipseApp {
         self.show_console = true;
         if !self.launch.debug_attach.trim().is_empty() {
             let address = self.launch.debug_attach.trim().to_owned();
-            match DebugSession::attach(address.clone(), breakpoints, pause) {
-                Ok(session) => {
-                    self.log(LogLevel::Info, format!("Debug: conectando em {address}…"));
-                    self.debug = Some(DebugUi {
-                        session,
-                        status: DebugUiStatus::Starting,
-                        detail: format!("attach {address}"),
-                        threads: Vec::new(),
-                        frames: Vec::new(),
-                        variables: Vec::new(),
-                        selected_frame: 0,
-                        location: None,
-                        paused_thread: None,
-                        eval_input: String::new(),
-                        eval_result: None,
-                        exceptions: pause,
-                        breakpoint_errors: Vec::new(),
-                    });
-                    self.toast(format!("Conectando o debugger em {address}"));
-                    self.send_exception_config();
-                }
-                Err(error) => {
-                    self.log(LogLevel::Error, format!("Debug: {error}"));
-                    self.toast(error);
-                }
-            }
+            self.attach_debug(address);
             return;
         }
         let Some(project) = self.project.clone() else {
@@ -2491,6 +2525,7 @@ impl ReclipseApp {
                         eval_input: String::new(),
                         eval_result: None,
                         exceptions: self.debug_pause_exceptions,
+                        attach_address: None,
                         breakpoint_errors: Vec::new(),
                     });
                     self.show_console = true;
@@ -7444,6 +7479,7 @@ impl ReclipseApp {
         let mut remove_breakpoint: Option<(PathBuf, usize)> = None;
         let mut edit_condition: Option<(PathBuf, usize, String)> = None;
         let mut hot_swap = false;
+        let mut reconnect = false;
         let mut pause_exceptions = debug
             .as_ref()
             .map_or(self.debug_pause_exceptions, |debug| debug.exceptions);
@@ -7468,6 +7504,14 @@ impl ReclipseApp {
                     }
                 } else if icons::icon_button(ui, ActionIcon::Clear, "Limpar sessão").clicked() {
                     close = true;
+                }
+                if !debug.status.is_active()
+                    && debug.attach_address.is_some()
+                    && icons::icon_button(ui, ActionIcon::Debug, "Reconectar ao servidor")
+                        .on_hover_text("Reconectar attach (servidor JBoss/WildFly/Spring Boot)")
+                        .clicked()
+                {
+                    reconnect = true;
                 }
             });
             ui.label(RichText::new(&debug.detail).small().color(theme::muted()));
@@ -7844,6 +7888,9 @@ impl ReclipseApp {
         }
         if start {
             self.start_debug();
+        }
+        if reconnect {
+            self.reconnect_debug();
         }
     }
 

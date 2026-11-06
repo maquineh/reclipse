@@ -43,7 +43,7 @@ Atualizado após a validação com Spring Boot e os refinamentos do M2.
 - Rename/move atualizando strings, recursos e referências por reflexão.
 - Download de sources/Javadoc no Gradle.
 - Empacotamento do JDT LS e matriz com projetos Maven multi-módulo/Gradle reais.
-- Adaptador DAP externo e attach remoto com TLS/reconexão.
+- Adaptador DAP externo e TLS no attach remoto (retry + reconexão entregues, com receitas JBoss/WildFly/Spring Boot em `docs/REMOTE_DEBUG.md`).
 - Avaliação de chamadas de método/índices de array no debugger (entregue:
   `arr[i]` via ArrayReference, `obj.m()`/`Classe.stat()` via InvokeMethod,
   overloads por compatibilidade, rejeição em condições).

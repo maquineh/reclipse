@@ -153,27 +153,42 @@ pub(crate) fn run_attach(
     events: Sender<DebugEvent>,
 ) -> Result<(), String> {
     let address = normalize_address(&address);
-    let mut last_error = None;
+    // Servidores (JBoss/WildFly/Spring Boot) podem subir depois da IDE:
+    // tenta por ~30 s antes de desistir, avisando no painel.
     let mut stream = None;
-    for socket in address
-        .to_socket_addrs()
-        .map_err(|error| format!("endereço de debug inválido ({address}): {error}"))?
-    {
-        match TcpStream::connect_timeout(&socket, Duration::from_secs(5)) {
-            Ok(connected) => {
-                stream = Some(connected);
-                break;
+    let mut last_error = String::from("nenhum endereço resolvido");
+    for attempt in 1..=15 {
+        let mut resolved = false;
+        match address.to_socket_addrs() {
+            Ok(sockets) => {
+                for socket in sockets {
+                    resolved = true;
+                    match TcpStream::connect_timeout(&socket, Duration::from_secs(2)) {
+                        Ok(connected) => {
+                            stream = Some(connected);
+                            break;
+                        }
+                        Err(error) => last_error = error.to_string(),
+                    }
+                }
             }
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                return Err(format!("endereço de debug inválido ({address}): {error}"));
+            }
         }
+        if stream.is_some() {
+            break;
+        }
+        if !resolved {
+            return Err(format!("nenhum endereço resolvido para {address}"));
+        }
+        let _ = events.send(DebugEvent::Status(format!(
+            "tentando conectar em {address} ({attempt}/15)…"
+        )));
+        thread::sleep(Duration::from_secs(2));
     }
     let Some(stream) = stream else {
-        return Err(format!(
-            "falha ao conectar em {address}: {}",
-            last_error
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| "nenhum endereço resolvido".to_owned())
-        ));
+        return Err(format!("falha ao conectar em {address}: {last_error}"));
     };
     let client = JdwpClient::connect(stream)?;
     let mut worker = Worker {
